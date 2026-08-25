@@ -1,0 +1,15 @@
+{
+  "name": "linux-test",
+  "description": "An Arch Linux box (omarchy's own base) for /dev/ai testing: exec in for a shell, chat to drive the resident Claude Code agent.",
+  "image": "foom/linux-test:latest",
+  "family": "claude",
+  "chat": true,
+  "attach": true,
+  "command": ["agent"],
+  "passEnv": ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+  "runArgs": [
+    "--volume",
+    "${WORKSPACE}:/workspace"
+  ],
+  "defaultPane": "chat"
+}
