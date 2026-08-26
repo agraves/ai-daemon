@@ -277,6 +277,12 @@ fn install(args: &[String]) -> Result<(), String> {
               [--format gguf] [--backend NAME] [--license SPDX]
               [--capability generate] [--capability embed] ...
 
+Capabilities are checked twice and both are refusals, not warnings: at
+install, a capability no configured backend serves for this format is
+refused rather than recorded; at request, a model is refused a capability
+it did not claim even when its backend offers it. Default is
+--capability generate, so a model that should also embed needs it named.
+
 Sources: https://…, file:///…, oci://registry/repo@sha256:…, remote:MODEL-ID
 The digest is mandatory except for a remote: source. The download runs in
 ai-daemon-fetch, which has a network and no access to the model store; the
@@ -535,6 +541,10 @@ With no PROMPT, reads one from stdin."
             "session {} on {} (identity {}, local={}, context {})",
             info.session, info.model, info.identity, info.local, info.max_context
         );
+        // What this session can actually be asked for — the model's claims
+        // intersected with its backend's. Printed because the alternative is
+        // finding out one refusal at a time.
+        eprintln!("capabilities: {}", info.capabilities.join(", "));
     }
 
     let mut messages = Vec::new();

@@ -219,6 +219,15 @@ impl Manager {
             model: resolved.manifest.name.clone(),
             digest: resolved.manifest.digest.clone(),
             backend: backend.name.clone(),
+            // The intersection, computed once. Order follows the manifest so
+            // a client reading the hello sees the model's own vocabulary.
+            capabilities: resolved
+                .manifest
+                .capabilities
+                .iter()
+                .filter(|claim| backend.can(claim))
+                .cloned()
+                .collect(),
             local: backend.info.local,
             class,
             max_context,
@@ -1006,6 +1015,7 @@ mod tests {
             model: "none".into(),
             digest: "sha256:0".into(),
             backend: "none".into(),
+            capabilities: vec!["generate".into()],
             local: true,
             class: sched::Class::Interactive,
             max_context: 1024,

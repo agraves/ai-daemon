@@ -218,10 +218,17 @@ refute "a model without a digest is refused" \
 refute "a file declared gguf that is not gguf is refused" \
   aidctl install --name bad --source file:///tmp/weights.bin --digest "$DIGEST" --format gguf
 
+# Everything this fixture is asked for below, named. It used to say only
+# generate and embed and was nonetheless handed screenshots and asked for
+# pictures, because the manifest was decoration — six checks in this file
+# broke the moment section 19's enforcement went in, which is the blast
+# radius of that change measured rather than estimated.
 check "a model with a correct digest installs" \
   aidctl install --name mock-small --source file:///tmp/weights.bin \
     --digest "$DIGEST" --format mock --backend mock \
-    --capability generate --capability embed
+    --capability generate --capability embed \
+    --capability vision --capability audio-in \
+    --capability image-out --capability audio-out
 run aidctl models
 
 note "The same bytes under a second name share one blob — that is the whole"
@@ -615,7 +622,8 @@ refute "a user outside the group cannot reach the remote backend" \
 note "Registering a model that has no weights on this machine. Nothing is"
 note "downloaded, so there is nothing to hash and no digest is asked for."
 check "a remote model registers" \
-  aidctl install --name cloud-small --source remote:stub-model-1 --backend remote
+  aidctl install --name cloud-small --source remote:stub-model-1 --backend remote \
+  --capability generate --capability embed
 refute "and offering a digest for it is refused, not ignored" \
   aidctl install --name cloud-2 --source remote:stub-model-1 --digest "sha256:$(printf 0%.0s $(seq 64))"
 note "A digest on a remote install would look like verification that is not"
@@ -911,6 +919,84 @@ contains "and the interactive request it was yielding to produced all of its" \
 note "The window still fires for a backend that is genuinely quiet while free"
 note "to speak, which is the whole reason it exists — covered by unit tests"
 note "over wait_for_event, where a fake clock beats a twenty-second wait."
+
+# ---------------------------------------------------------------------------
+section "19. A model's capabilities are what it can be asked for"
+# ---------------------------------------------------------------------------
+note "manifest.capabilities was written at install, shown in ListModels,"
+note "documented as intersected with the backend's own claims — and consulted"
+note "nowhere. The mock backend embeds, so every model installed against it"
+note "embedded, whatever its manifest said. Both halves of that documented"
+note "promise are enforced now, and both are refusals rather than warnings."
+
+note "Half one: a model cannot grant what the backend cannot do. Refused at"
+note "install, where the person who typed it is still watching."
+refute "a capability no configured backend serves is refused at install" \
+  aidctl install --name impossible --source file:///tmp/weights.bin \
+  --digest "$DIGEST" --format mock --backend mock \
+  --capability generate --capability video-in
+run cat /tmp/check.out
+check "and nothing was installed under that name" \
+  bash -c "! aidctl models | grep -q '^impossible '"
+note "Refused rather than silently narrowed: an administrator who asked for a"
+note "capability and got a model without it would have no way to tell."
+
+note "Half two: a backend cannot grant what the model is not. The mock embeds;"
+note "this model does not claim to."
+check "a generate-only model installs" \
+  aidctl install --name text-only --source file:///tmp/weights.bin \
+  --digest "$DIGEST" --format mock --backend mock --capability generate
+check "and it generates" runas alice aidctl generate --model text-only --max-tokens 8 "hello"
+runas alice aidctl embed --model text-only "embed me" >/tmp/cap-embed.txt 2>&1
+run cat /tmp/cap-embed.txt
+refute "but embedding it is refused, though the backend would oblige" \
+  runas alice aidctl embed --model text-only "embed me"
+contains "the refusal names the model, not the machine" /tmp/cap-embed.txt 'model text-only does not offer embed'
+contains "and says what it does offer" /tmp/cap-embed.txt 'it offers: generate'
+contains "and carries the remedy, which is not guessable" /tmp/cap-embed.txt 'aidctl install --capability embed'
+note "Without the remedy a client reads 'cannot embed' and concludes the"
+note "machine cannot, when the fix is one administrator command."
+
+note "The same model installed with the capability named works, which is what"
+note "makes the refusal above a policy rather than an outage."
+check "a model that claims embed installs" \
+  aidctl install --name text-and-embed --source file:///tmp/weights.bin \
+  --digest "$DIGEST" --format mock --backend mock --capability generate --capability embed
+runas alice aidctl embed --model text-and-embed "embed me" >/tmp/cap-embed2.txt 2>&1
+run cat /tmp/cap-embed2.txt
+contains "and embeds" /tmp/cap-embed2.txt 'dim='
+
+note "The session's hello reports the intersection, so a client can ask before"
+note "it tries rather than finding out per request."
+runas alice aidctl generate --model text-only --max-tokens 4 "what can you do" \
+  >/tmp/cap-hello.txt 2>&1
+run head -2 /tmp/cap-hello.txt
+contains "the hello lists what this session can be asked for" /tmp/cap-hello.txt '^capabilities: generate$'
+runas alice aidctl generate --model text-and-embed --max-tokens 4 "and you" \
+  >/tmp/cap-hello2.txt 2>&1
+contains "a model that claims more reports more" /tmp/cap-hello2.txt '^capabilities: generate, embed$'
+note "It used to report the backend's whole list — ten entries, including"
+note "image-out — which told a client what the machine could do and left the"
+note "model to disagree at request time."
+note "It used to report the backend's whole list, which told a client what the"
+note "machine could do and left the model to disagree at request time."
+
+note "The compatibility break this represents, measured rather than estimated:"
+note "aidctl install has always defaulted to --capability generate, so every"
+note "model installed before this commit does today whatever its backend can"
+note "and will refuse tomorrow whatever its manifest omits."
+note ""
+note "This suite is the evidence. Turning the enforcement on broke six checks"
+note "in sections 7, 8 and 16 — media output, raw pixels, and embeddings on"
+note "the remote model — none of which had anything to do with capabilities."
+note "They broke because the fixtures declared generate and embed and were"
+note "then handed screenshots and asked for pictures, and the manifest was"
+note "decoration so nobody noticed. The fixtures now name what they use."
+note ""
+note "That is the shape of the break for a real install too: it lands where"
+note "somebody has been relying on a capability their model never claimed,"
+note "which is everywhere the field was decoration. The decision to take it"
+note "is in the review attached to this branch."
 
 # ---------------------------------------------------------------------------
 printf '\n\033[1m=== Result ===\033[0m\n'

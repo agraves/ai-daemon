@@ -164,6 +164,10 @@ pub struct Session {
     pub model: String,
     pub digest: String,
     pub backend: String,
+    /// What this session can actually be asked for: the model's claims
+    /// intersected with the backend's, computed once at CreateSession.
+    /// Reported in the hello and checked before every request that needs one.
+    pub capabilities: Vec<String>,
     pub local: bool,
     pub class: Class,
     pub max_context: u32,

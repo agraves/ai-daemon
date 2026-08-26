@@ -128,8 +128,42 @@ pub fn install(
         capabilities: options.capabilities.unwrap_or_else(|| vec!["generate".into()]),
         source: source.to_string(),
     };
+    if let Err(e) = servable(daemon, &manifest) {
+        let _ = std::fs::remove_file(&landed);
+        return Err(e);
+    }
     let installed = daemon.registry.accept_staged(&landed, manifest, digest)?;
     Ok(installed.name)
+}
+
+/// A model cannot grant what its backend cannot do.
+///
+/// Half of what `Manifest::capabilities` has always been documented to mean,
+/// enforced at the moment the claim is written down rather than discovered per
+/// request afterwards. An install that would have produced a model claiming
+/// `vision` against a backend that cannot see is refused here, where the
+/// person who typed it is still watching, instead of at 3am by whoever sent
+/// the first screenshot.
+///
+/// Refusing rather than silently narrowing the list: an administrator who
+/// asked for `--capability vision` and got a text model would have no way to
+/// tell, and the manifest would then quietly disagree with what they believe
+/// they installed.
+fn servable(daemon: &Daemon, manifest: &Manifest) -> Result<(), String> {
+    for capability in &manifest.capabilities {
+        // for_manifest resolves the same way a session will, so what is
+        // checked here is what will actually serve it — including a named
+        // backend that does not exist, which is worth catching at install too.
+        if let Err(e) = daemon.backends.for_manifest(manifest, capability) {
+            return Err(format!(
+                "{} was declared {capability:?} and no configured backend serves that for a \
+                 {} model ({e}). Install it without that capability, or configure a backend \
+                 that has it.",
+                manifest.name, manifest.format
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Register a model served by a remote provider.
@@ -186,6 +220,7 @@ fn install_remote(
         capabilities: options.capabilities.unwrap_or_else(|| vec!["generate".into()]),
         source: format!("remote:{endpoint_model}"),
     };
+    servable(daemon, &manifest)?;
     warn!(
         "install: {name} is served by {serving} and is NOT local — prompts sent to it leave this machine"
     );
