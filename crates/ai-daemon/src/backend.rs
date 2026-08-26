@@ -21,7 +21,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ai_daemon_proto::backend::{BackendEvent, BackendInfo, BackendRequest};
 use ai_daemon_proto::frame;
@@ -45,8 +45,12 @@ pub struct LoadedModel {
 pub struct Backend {
     pub name: String,
     pub info: BackendInfo,
-    child: Mutex<Child>,
+    child: Mutex<Option<Child>>,
     writer: Mutex<BufWriter<UnixStream>>,
+    /// Held across send-and-wait for load and unload. Deliberately not the
+    /// writer lock: that one is taken by every token-path send, and holding it
+    /// for the five minutes a load may take would stop the backend dead.
+    control_op: Mutex<()>,
     inflight: Arc<Mutex<HashMap<u64, Sender<BackendEvent>>>>,
     control: Mutex<Receiver<BackendEvent>>,
     loaded: Mutex<HashMap<String, LoadedModel>>,
@@ -159,8 +163,9 @@ impl Backend {
         Ok(Backend {
             name: spec.name.clone(),
             info,
-            child: Mutex::new(child),
+            child: Mutex::new(Some(child)),
             writer: Mutex::new(writer),
+            control_op: Mutex::new(()),
             inflight,
             control: Mutex::new(control_rx),
             loaded: Mutex::new(HashMap::new()),
@@ -188,7 +193,33 @@ impl Backend {
     pub fn loaded_models(&self) -> Vec<LoadedModel> {
         self.loaded.lock().unwrap().values().cloned().collect()
     }
-
+    /// Make a model resident.
+    ///
+    /// Serialised against every other control operation on this backend, and
+    /// the reply is checked against what was asked for. Both halves are load
+    /// bearing.
+    ///
+    /// `Loaded`, `Unloaded` and `Hello` carry no request id — they are the one
+    /// part of the protocol that is not correlated — so they all arrive on the
+    /// single control channel and there is nothing in a reply that says which
+    /// send it answers. `send` takes the writer lock and the wait takes the
+    /// control lock, so without this mutex two threads interleave as A.send,
+    /// B.send, A.wait, B.wait and each takes whichever reply lands first.
+    /// `load(m1)` then returns the `kv_bytes_per_token` and `n_ctx` of m2, and
+    /// every KV reservation for that session is wrong by the ratio between two
+    /// models; worse, a load crossing an unload leaves `loaded` naming a model
+    /// the backend has dropped, and the fast path below turns that one crossed
+    /// reply into every later session on that model failing until restart.
+    ///
+    /// The alternative fix is a request id on the control operations, which is
+    /// the better protocol and a breaking change to a surface documented as
+    /// frozen at v1 and implemented by two shipped backends. Serialising costs
+    /// throughput nobody is using — a desktop loads one or two models, and a
+    /// second load waiting behind a first is the honest cost of the first.
+    ///
+    /// The checking is not redundant with the serialising. A control operation
+    /// that times out leaves its reply to arrive later, and the next operation
+    /// would otherwise take it.
     pub fn load(
         &self,
         model_id: &str,
@@ -199,6 +230,14 @@ impl Backend {
         if let Some(existing) = self.loaded_model(model_id) {
             return Ok(existing);
         }
+        let _serialised = self.control_op.lock().unwrap();
+        // Again under the lock: two sessions opening the same model race here,
+        // and the one that waited should find the other's work rather than ask
+        // for it twice.
+        if let Some(existing) = self.loaded_model(model_id) {
+            return Ok(existing);
+        }
+
         self.send(&BackendRequest::Load {
             model_id: model_id.to_string(),
             path: path.display().to_string(),
@@ -207,27 +246,69 @@ impl Backend {
         })?;
         // Loading multi-gigabyte weights from cold cache is genuinely slow;
         // five minutes is "the disk is broken", not "the model is big".
-        match self.await_control(Duration::from_secs(300))? {
-            BackendEvent::Loaded { model_id, kv_bytes_per_token, n_ctx } => {
-                let loaded = LoadedModel { model_id: model_id.clone(), kv_bytes_per_token, n_ctx };
-                self.loaded.lock().unwrap().insert(model_id, loaded.clone());
-                Ok(loaded)
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            match self.await_until(deadline)? {
+                BackendEvent::Loaded { model_id: answered, kv_bytes_per_token, n_ctx } => {
+                    if answered != model_id {
+                        warn!(
+                            "backend {}: discarding a stale reply about {answered} while loading {model_id}",
+                            self.name
+                        );
+                        continue;
+                    }
+                    let loaded = LoadedModel {
+                        model_id: answered.clone(),
+                        kv_bytes_per_token,
+                        n_ctx,
+                    };
+                    self.loaded.lock().unwrap().insert(answered, loaded.clone());
+                    return Ok(loaded);
+                }
+                BackendEvent::Error { code, message, .. } => {
+                    return Err(format!("{code}: {message}"))
+                }
+                other => {
+                    warn!("backend {}: discarding {other:?} while loading {model_id}", self.name);
+                    continue;
+                }
             }
-            BackendEvent::Error { code, message, .. } => Err(format!("{code}: {message}")),
-            other => Err(format!("unexpected reply to load: {other:?}")),
         }
     }
 
     pub fn unload(&self, model_id: &str) -> Result<(), String> {
+        let _serialised = self.control_op.lock().unwrap();
         self.send(&BackendRequest::Unload { model_id: model_id.to_string() })?;
-        match self.await_control(Duration::from_secs(60))? {
-            BackendEvent::Unloaded { model_id } => {
-                self.loaded.lock().unwrap().remove(&model_id);
-                Ok(())
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let outcome = loop {
+            match self.await_until(deadline) {
+                Ok(BackendEvent::Unloaded { model_id: answered }) => {
+                    if answered != model_id {
+                        warn!(
+                            "backend {}: discarding a stale reply about {answered} while unloading {model_id}",
+                            self.name
+                        );
+                        continue;
+                    }
+                    break Ok(());
+                }
+                Ok(BackendEvent::Error { code, message, .. }) => {
+                    break Err(format!("{code}: {message}"))
+                }
+                Ok(other) => {
+                    warn!("backend {}: discarding {other:?} while unloading {model_id}", self.name);
+                    continue;
+                }
+                Err(e) => break Err(e),
             }
-            BackendEvent::Error { code, message, .. } => Err(format!("{code}: {message}")),
-            other => Err(format!("unexpected reply to unload: {other:?}")),
-        }
+        };
+        // Forgotten either way. After a failed or timed-out unload the backend's
+        // state is exactly what we do not know, and of the two guesses only one
+        // is safe: a redundant load costs a round trip, while a `loaded` entry
+        // for a model the backend has dropped is served straight back out of
+        // the fast path above and generates against a model that is not there.
+        self.loaded.lock().unwrap().remove(model_id);
+        outcome
     }
 
     /// Start a request and get the stream of events belonging to it.
@@ -275,17 +356,24 @@ impl Backend {
             .map_err(|e| format!("writing to backend {}: {e}", self.name))
     }
 
-    fn await_control(&self, timeout: Duration) -> Result<BackendEvent, String> {
+    /// Wait for a control event, but never past `deadline` — so a loop that
+    /// discards a stale reply cannot restart the clock each time round.
+    fn await_until(&self, deadline: Instant) -> Result<BackendEvent, String> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("backend {} did not answer in time", self.name));
+        }
         self.control
             .lock()
             .unwrap()
-            .recv_timeout(timeout)
-            .map_err(|_| format!("backend {} did not answer within {timeout:?}", self.name))
+            .recv_timeout(remaining)
+            .map_err(|_| format!("backend {} did not answer in time", self.name))
     }
 
     pub fn shutdown(&self) {
         let _ = self.send(&BackendRequest::Shutdown);
-        let mut child = self.child.lock().unwrap();
+        let mut guard = self.child.lock().unwrap();
+        let Some(child) = guard.as_mut() else { return };
         for _ in 0..50 {
             match child.try_wait() {
                 Ok(Some(_)) => return,
@@ -356,4 +444,197 @@ fn reader_loop(
     // Dropping every sender wakes each waiting session with a disconnect,
     // which they report as `backend-failed` rather than hanging forever.
     inflight.lock().unwrap().clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ai_daemon_proto::frame;
+
+    /// A Backend wired to a socketpair instead of a child process, so a test
+    /// can script exactly what the far end says and when. Everything except
+    /// the spawn is the real thing: the same reader thread, the same channels,
+    /// the same locks.
+    fn backend_on(socket: UnixStream) -> Backend {
+        let read_half = socket.try_clone().unwrap();
+        let alive = Arc::new(AtomicBool::new(true));
+        let inflight: Arc<Mutex<HashMap<u64, Sender<BackendEvent>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (control_tx, control_rx) = channel();
+        {
+            let alive = alive.clone();
+            let inflight = inflight.clone();
+            std::thread::spawn(move || {
+                reader_loop("test".into(), read_half, inflight, control_tx, alive)
+            });
+        }
+        Backend {
+            name: "test".into(),
+            info: BackendInfo {
+                name: "test".into(),
+                version: "0".into(),
+                formats: vec!["mock".into()],
+                quantizations: Vec::new(),
+                devices: Vec::new(),
+                device_memory: None,
+                capabilities: vec!["generate".into()],
+                local: true,
+            },
+            child: Mutex::new(None),
+            writer: Mutex::new(BufWriter::new(socket)),
+            control_op: Mutex::new(()),
+            inflight,
+            control: Mutex::new(control_rx),
+            loaded: Mutex::new(HashMap::new()),
+            next_req: AtomicU64::new(1),
+            alive,
+        }
+    }
+
+    /// The scripted far end: read one request, send the given replies.
+    fn peer(socket: UnixStream, replies: Vec<BackendEvent>) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let _request: Option<BackendRequest> = frame::read_typed(&mut reader).unwrap();
+            let mut writer = socket;
+            for reply in replies {
+                frame::write_cbor(&mut writer, &reply).unwrap();
+            }
+        })
+    }
+
+    /// The crossed reply, made deterministic. `Loaded` carries no request id,
+    /// so a reply about another model is indistinguishable from ours except by
+    /// the name inside it — and taking it means the session runs with another
+    /// model's kv_bytes_per_token and context window.
+    #[test]
+    fn a_reply_about_another_model_is_not_taken_as_ours() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let backend = backend_on(ours);
+        let scripted = peer(
+            theirs,
+            vec![
+                BackendEvent::Loaded {
+                    model_id: "other-model".into(),
+                    kv_bytes_per_token: 999_999,
+                    n_ctx: 128,
+                },
+                BackendEvent::Loaded {
+                    model_id: "wanted".into(),
+                    kv_bytes_per_token: 4096,
+                    n_ctx: 8192,
+                },
+            ],
+        );
+
+        let loaded = backend
+            .load("wanted", std::path::Path::new("/dev/null"), "sha256:0", 8192)
+            .unwrap();
+        assert_eq!(loaded.model_id, "wanted");
+        assert_eq!(loaded.kv_bytes_per_token, 4096, "another model's budget would mis-charge every reservation");
+        assert_eq!(loaded.n_ctx, 8192);
+        assert!(backend.loaded_model("other-model").is_none(), "and it must not be cached under the wrong name");
+        scripted.join().unwrap();
+    }
+
+    #[test]
+    fn an_unload_reply_about_another_model_is_not_taken_as_ours() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let backend = backend_on(ours);
+        backend.loaded.lock().unwrap().insert(
+            "keep".into(),
+            LoadedModel { model_id: "keep".into(), kv_bytes_per_token: 1, n_ctx: 1 },
+        );
+        let scripted = peer(
+            theirs,
+            vec![
+                BackendEvent::Unloaded { model_id: "keep".into() },
+                BackendEvent::Unloaded { model_id: "drop".into() },
+            ],
+        );
+
+        backend.unload("drop").unwrap();
+        assert!(
+            backend.loaded_model("keep").is_some(),
+            "a stale reply naming another model must not evict it"
+        );
+        scripted.join().unwrap();
+    }
+
+    /// The amplifier. A failed unload leaves the backend's state unknown, and
+    /// the load fast path will hand out whatever `loaded` still says — so an
+    /// entry that survives a failed unload becomes every later session on that
+    /// model generating against a model the backend does not have.
+    #[test]
+    fn a_failed_unload_still_forgets_the_model() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let backend = backend_on(ours);
+        backend.loaded.lock().unwrap().insert(
+            "doomed".into(),
+            LoadedModel { model_id: "doomed".into(), kv_bytes_per_token: 1, n_ctx: 1 },
+        );
+        let scripted = peer(
+            theirs,
+            vec![BackendEvent::Error {
+                req_id: None,
+                code: "backend-failed".into(),
+                message: "no".into(),
+            }],
+        );
+
+        assert!(backend.unload("doomed").is_err());
+        assert!(
+            backend.loaded_model("doomed").is_none(),
+            "the fast path would serve this straight back out"
+        );
+        scripted.join().unwrap();
+    }
+
+    /// Two threads asking for the same model must not both ask the backend.
+    #[test]
+    fn a_concurrent_load_of_one_model_is_asked_for_once() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let backend = Arc::new(backend_on(ours));
+        let requests = Arc::new(AtomicU64::new(0));
+
+        let counter = requests.clone();
+        let scripted = std::thread::spawn(move || {
+            let mut reader = BufReader::new(theirs.try_clone().unwrap());
+            let mut writer = theirs;
+            // Answer only the first request; a second would hang the test,
+            // which is the point being made.
+            let _first: Option<BackendRequest> = frame::read_typed(&mut reader).unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(100));
+            frame::write_cbor(
+                &mut writer,
+                &BackendEvent::Loaded {
+                    model_id: "shared".into(),
+                    kv_bytes_per_token: 64,
+                    n_ctx: 2048,
+                },
+            )
+            .unwrap();
+        });
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let backend = backend.clone();
+                    scope.spawn(move || {
+                        backend
+                            .load("shared", std::path::Path::new("/dev/null"), "sha256:0", 2048)
+                            .unwrap()
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let loaded = handle.join().unwrap();
+                assert_eq!(loaded.model_id, "shared");
+                assert_eq!(loaded.kv_bytes_per_token, 64);
+            }
+        });
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "the second caller should find the first's work");
+        scripted.join().unwrap();
+    }
 }
