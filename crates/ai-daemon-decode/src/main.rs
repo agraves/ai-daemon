@@ -252,6 +252,21 @@ mod confine {
             libc::SYS_exit_group,
         ];
 
+        // The filter itself: check the architecture (a mismatched one means
+        // the process is making calls through a compat entry point whose
+        // numbers mean something else, so refuse), then compare the syscall
+        // number against the list, then kill.
+        let mut program: Vec<SockFilter> = Vec::with_capacity(allowed.len() * 2 + 4);
+        program.push(SockFilter { code: LD_W_ABS, jt: 0, jf: 0, k: ARCH_OFFSET });
+        program.push(SockFilter { code: JMP_JEQ_K, jt: 1, jf: 0, k: AUDIT_ARCH });
+        program.push(SockFilter { code: RET_K, jt: 0, jf: 0, k: KILL_PROCESS });
+        program.push(SockFilter { code: LD_W_ABS, jt: 0, jf: 0, k: NR_OFFSET });
+        for nr in allowed {
+            program.push(SockFilter { code: JMP_JEQ_K, jt: 0, jf: 1, k: *nr as u32 });
+            program.push(SockFilter { code: RET_K, jt: 0, jf: 0, k: ALLOW });
+        }
+        program.push(SockFilter { code: RET_K, jt: 0, jf: 0, k: KILL_PROCESS });
+
         let prog = SockFprog {
             len: u16::try_from(program.len()).map_err(|_| "filter too long")?,
             filter: program.as_ptr(),
@@ -267,12 +282,18 @@ mod confine {
         //
         // SAFETY: `prog` points at a filter that outlives the call, and both
         // interfaces copy it into the kernel.
+        // Every argument is widened explicitly. `syscall` and `prctl` are
+        // variadic, so an untyped literal is passed as a 32-bit int with the
+        // top half of the register left undefined — which the kernel reads as
+        // part of the value and rejects with EINVAL, intermittently and
+        // confusingly.
+        const SECCOMP_SET_MODE_FILTER: libc::c_ulong = 1;
         let via_seccomp = unsafe {
             libc::syscall(
                 libc::SYS_seccomp,
-                1, // SECCOMP_SET_MODE_FILTER
-                0,
-                &prog as *const SockFprog,
+                SECCOMP_SET_MODE_FILTER,
+                0 as libc::c_ulong,
+                &prog as *const SockFprog as *const libc::c_void,
             )
         };
         if via_seccomp == 0 {
@@ -283,14 +304,23 @@ mod confine {
         let via_prctl = unsafe {
             libc::prctl(
                 libc::PR_SET_SECCOMP,
-                libc::SECCOMP_MODE_FILTER,
-                &prog as *const SockFprog,
+                libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                &prog as *const SockFprog as *const libc::c_void,
             )
         };
         if via_prctl != 0 {
+            let second = std::io::Error::last_os_error();
+            let hint = if first.raw_os_error() == Some(libc::EINVAL)
+                && second.raw_os_error() == Some(libc::EINVAL)
+            {
+                "; EINVAL from both usually means this kernel has no CONFIG_SECCOMP_FILTER, \
+                 or the process is running under a userspace emulator that cannot pass a \
+                 filter through — a translated x86-64 container on an arm64 host, typically"
+            } else {
+                ""
+            };
             return Err(format!(
-                "seccomp filter rejected: seccomp() said {first}, prctl() said {}",
-                std::io::Error::last_os_error()
+                "seccomp filter rejected: seccomp() said {first}, prctl() said {second}{hint}"
             ));
         }
         Ok(())

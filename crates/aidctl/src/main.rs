@@ -355,6 +355,7 @@ fn generate(args: &[String]) -> Result<(), String> {
     let mut max_tokens: u32 = 64;
     let mut tool: Option<String> = None;
     let mut image: Option<String> = None;
+    let mut raw_image: Option<String> = None;
     let mut show_usage = false;
 
     let mut iter = args.iter();
@@ -368,6 +369,7 @@ fn generate(args: &[String]) -> Result<(), String> {
             }
             "--tool" => tool = iter.next().cloned(),
             "--image" => image = iter.next().cloned(),
+            "--image-raw" => raw_image = iter.next().cloned(),
             "--usage" => show_usage = true,
             "--help" => {
                 println!(
@@ -379,6 +381,8 @@ fn generate(args: &[String]) -> Result<(), String> {
       --max-tokens N    cap the completion
       --tool FILE       JSON array of tool schemas; enables tool calling
       --image FILE      attach a PNG, decoded by ai-daemon-decode
+      --image-raw WxH:FILE
+                        attach raw RGBA8 pixels, decoded by nobody
       --usage           print the usage record when the turn ends
 
 With no PROMPT, reads one from stdin."
@@ -441,6 +445,35 @@ With no PROMPT, reads one from stdin."
         frame::write_blob(&mut socket, &bytes).map_err(|e| format!("attach blob: {e}"))?;
         attachments.push("img1".to_string());
     }
+    if let Some(spec) = &raw_image {
+        // "WIDTHxHEIGHT:path". Raw is the form that needs no codec anywhere:
+        // the client decoded it, and the daemon parses nothing.
+        let (dimensions, path) = spec
+            .split_once(':')
+            .ok_or("--image-raw takes WIDTHxHEIGHT:PATH")?;
+        let (width, height) = dimensions
+            .split_once('x')
+            .ok_or("--image-raw takes WIDTHxHEIGHT:PATH")?;
+        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        frame::write_cbor(
+            &mut socket,
+            &Request::Attach {
+                id: "raw1".into(),
+                kind: frame::AttachKind::Image,
+                meta: frame::AttachMeta {
+                    w: Some(width.parse().map_err(|_| "width")?),
+                    h: Some(height.parse().map_err(|_| "height")?),
+                    fmt: Some("rgba8".into()),
+                    ..Default::default()
+                },
+                len: bytes.len() as u64,
+            },
+        )
+        .map_err(|e| format!("attach: {e}"))?;
+        frame::write_blob(&mut socket, &bytes).map_err(|e| format!("attach blob: {e}"))?;
+        attachments.push("raw1".to_string());
+    }
+
     messages.push(Message {
         role: "user".into(),
         content: prompt,

@@ -115,6 +115,33 @@ argument. The declared format is checked against the file's four-byte magic —
 a magic check, not a header parse; reading weight headers stays a backend's
 job.
 
+## Three things the container found that reading could not
+
+**A D-Bus handler must never block on D-Bus.** zbus dispatches every incoming
+method call on one internal executor thread, so `InstallModel` — which asked
+polkit whether the caller may install anything — was waiting for a reply that
+only the thread it was blocking could deliver. Not a slow daemon: a dead one,
+from the first administrative call. Anything that can take longer than a
+message round trip now goes through `unblock()` and awaits a thread.
+
+**polkit will not take details from a daemon that is not root.** Details reach
+the authentication dialog, so polkit accepts them only from uid 0 or from an
+action's declared owner — a mechanism that could set them freely could put
+words in front of somebody about to type their password. The actions now
+declare `unix-user:ai-daemon` as their owner, which is the mechanism polkit
+provides for exactly this, and the daemon retries without details if an older
+polkit refuses them anyway.
+
+**Native identity is coarser than §5 implies.** Reading `/proc/<pid>/exe` needs
+ptrace-level access to the target, so a daemon running as its own system user
+gets nothing for any process belonging to a human. What is readable across uids
+is `/proc/<pid>/cgroup`, which on a systemd machine names the app's scope and
+is the identity grants are keyed on — and in a container, where there are no
+units, the honest answer is the bare uid, which is what the verification shows.
+`/proc/<pid>/comm` would fill the gap and is deliberately not used: a process
+can set its own `comm`, so an identity built on it would be chosen by the
+thing being identified.
+
 ## What is not implemented
 
 Stated plainly rather than left to be discovered:
@@ -148,9 +175,20 @@ OpenAI shim. It is deliberately adversarial — a wrong digest, an oversized
 image, a truncated PNG, a user outside the gate, a remote `image_url` — because
 "it generated some text" is the easy half and the refusals are the project.
 
-There is no systemd in a container, so the run stands in for the init system
-and only for that: the daemon still runs as the packaged user under the
-packaged bus policy consulting the packaged polkit actions. What a container
-cannot demonstrate is the sandboxing systemd applies — `PrivateNetwork=yes`
-most of all — so those claims are checked by asserting on the shipped unit
-files rather than by observing them hold.
+Ninety-one checks, all passing. Two of them are honest about their limits
+rather than quietly weaker:
+
+- **systemd is absent**, so the run stands in for the init system and only for
+  that: the daemon still runs as the packaged user, under the packaged bus
+  policy, consulting the packaged polkit actions. What a container cannot show
+  is the sandboxing systemd applies — `PrivateNetwork=yes` most of all — so
+  those claims are checked by asserting on the shipped unit files instead of by
+  observing them hold.
+- **seccomp is unavailable**, because the box is a translated x86-64 container
+  on an arm64 host and the emulator cannot pass a filter to the kernel. So
+  `ai-daemon-decode` refuses to decode, which is the designed behaviour — a
+  helper that could not build its cage must not parse hostile bytes — and the
+  verification asserts that refusal rather than skipping the case. The encoded
+  path is therefore *not* demonstrated end to end here; the codecs are covered
+  by unit tests that `makepkg`'s `check()` runs, and the raw attachment form,
+  which needs no decoder anywhere, is demonstrated in full.

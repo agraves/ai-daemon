@@ -51,11 +51,9 @@ pub fn check_authorization(
     details.insert("application", &display);
     details.insert("identity.class", identity.class.as_str());
 
-    match ask(conn, &subject, action_id, details) {
+    match ask(conn, subject.clone(), action_id, details) {
         Ok(authorized) => Ok(authorized),
-        Err(e) if e.contains("pass details") => {
-            ask(conn, &subject, action_id, HashMap::new())
-        }
+        Err(e) if e.contains("pass details") => ask(conn, subject, action_id, HashMap::new()),
         Err(e) => Err(e),
     }
 }
@@ -64,7 +62,7 @@ type Subject<'a> = (&'a str, HashMap<&'a str, Value<'a>>);
 
 fn ask(
     conn: &zbus::blocking::Connection,
-    subject: &Subject<'_>,
+    subject: Subject<'_>,
     action_id: &str,
     details: HashMap<&str, &str>,
 ) -> Result<bool, String> {

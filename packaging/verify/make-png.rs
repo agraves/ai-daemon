@@ -44,6 +44,15 @@ fn main() {
 
     let mut file = std::fs::File::create(path).expect("create");
     file.write_all(&png).expect("write");
+
+    // The same pixels, undecoded, so the verification can send either form and
+    // compare what the daemon says about them.
+    let mut raw_out = Vec::with_capacity(stride * height as usize);
+    for row in raw.chunks(stride + 1) {
+        raw_out.extend_from_slice(&row[1..]);
+    }
+    let mut raw_file = std::fs::File::create(format!("{path}.rgba")).expect("create raw");
+    raw_file.write_all(&raw_out).expect("write raw");
 }
 
 fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], payload: &[u8]) {
