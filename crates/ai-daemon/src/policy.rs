@@ -228,7 +228,21 @@ impl PolicyEngine {
         if let Some(grant) = self.state.lock().unwrap().grants.get(&key) {
             return match grant.decision {
                 Decision::Allow => Ok(()),
-                Decision::Deny => Err(format!("{} was denied {capability}", identity.key())),
+                // Say that this came out of the table rather than out of
+                // polkit, because the two are indistinguishable from the
+                // caller's side and the difference decides what to do next.
+                // A remembered refusal is consulted *before* polkit and
+                // short-circuits it, so an administrator who reads this as a
+                // live answer will write a polkit rule, watch it change
+                // nothing, and have no reason to suspect a cache.
+                Decision::Deny => Err(format!(
+                    "{} was denied {capability} by a decision remembered from {} — \
+                     `aidctl grants` lists it and `aidctl revoke {}` clears it; \
+                     until then it is answered here and polkit is not consulted",
+                    identity.key(),
+                    grant.via,
+                    identity.key()
+                )),
             };
         }
 

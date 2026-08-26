@@ -76,9 +76,46 @@ fn ask(
         )
         .map_err(|e| e.to_string())?;
 
-    let ((authorized, _challenge, _details),): ((bool, bool, HashMap<String, String>),) =
+    let ((authorized, challenge, _details),): ((bool, bool, HashMap<String, String>),) =
         reply.body().deserialize().map_err(|e| e.to_string())?;
-    Ok(authorized)
+    interpret(authorized, challenge)
+}
+
+/// polkit's answer, read the way the caller in `policy.rs` needs it.
+///
+/// The `is_challenge` half of the reply is the difference between a refusal
+/// and a question nobody was there to answer, and dropping it is not a
+/// rounding error: `auth_admin` on a machine with no authentication agent —
+/// a headless box, a container, an ssh session, the state every `.policy`
+/// action here defaults to — comes back `(false, true)`, and reading that as
+/// a plain `false` records a permanent deny for a user who was never asked.
+/// The grant table then short-circuits every later attempt, so fixing the
+/// polkit configuration afterwards changes nothing, and the documented way
+/// out (`aidctl revoke`) needs the capability that is now denied.
+///
+/// So the three cases are three cases:
+///   - `(true, _)`      the subject may proceed.
+///   - `(false, false)` a real refusal: no rule permits this subject, and no
+///                      authentication would change that. Worth remembering.
+///   - `(false, true)`  authentication was required and none arrived. Nobody
+///                      answered, so there is nothing to remember — `Err` puts
+///                      this on the caller's "no authority could be reached"
+///                      path, which refuses without writing a decision down.
+///
+/// A user who dismisses the dialog lands in the third case too, and that is
+/// the right home for it: closing a prompt is not a decision to be held to
+/// for the life of the install.
+fn interpret(authorized: bool, challenge: bool) -> Result<bool, String> {
+    match (authorized, challenge) {
+        (true, _) => Ok(true),
+        (false, false) => Ok(false),
+        (false, true) => Err(
+            "polkit requires authentication for this action and no authentication \
+             agent answered; run an agent (pkttyagent works on a terminal) or grant \
+             the action in a polkit rule"
+                .into(),
+        ),
+    }
 }
 
 /// Field 22 of `/proc/<pid>/stat`, in clock ticks since boot.
@@ -89,4 +126,36 @@ pub fn process_start_time(pid: i32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let tail = &stat[stat.rfind(')')? + 1..];
     tail.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_authorized_subject_proceeds() {
+        assert_eq!(interpret(true, false), Ok(true));
+        assert_eq!(interpret(true, true), Ok(true), "authorized wins over a stale challenge bit");
+    }
+
+    #[test]
+    fn a_refusal_no_authentication_could_change_is_an_answer() {
+        assert_eq!(
+            interpret(false, false),
+            Ok(false),
+            "allow_any=no with no matching rule is a decision, and remembering it is correct"
+        );
+    }
+
+    /// The regression this function exists for. `auth_admin` with no agent
+    /// running is the default state of every headless install, and it must
+    /// not reach the grant table — `Err` is what routes it to the caller's
+    /// refuse-without-recording path.
+    #[test]
+    fn an_unanswered_challenge_is_not_a_denial() {
+        assert!(
+            interpret(false, true).is_err(),
+            "nobody was asked, so there is no decision to persist"
+        );
+    }
 }
