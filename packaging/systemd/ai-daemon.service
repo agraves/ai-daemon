@@ -55,6 +55,18 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
+
+# The one line here that loosens rather than tightens, so it owes the longest
+# explanation. Backends are this unit's children and inherit its seccomp
+# filter, and GPU userspace generates code at runtime: Mesa compiles shaders,
+# and the CUDA and ROCm stacks JIT. Denying write-execute would break every
+# accelerated backend, and the only way to keep the restriction would be to put
+# backends in their own units — which is a real design, and a bigger one than a
+# line in this file.
+#
+# What limits the damage is that it is scoped to this unit rather than granted
+# generally: ai-daemon-shim.service, which is the least trusted code in the
+# project and touches no GPU, sets it to yes.
 MemoryDenyWriteExecute=no
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
@@ -71,9 +83,22 @@ DeviceAllow=char-drm rw
 DeviceAllow=char-accel rw
 
 # ProtectProc=default rather than invisible: identifying a caller means reading
-# /proc/<pid>/cgroup and /proc/<pid>/exe for processes owned by other users
-# (§5). Hiding them would make every native identity "uid:N" and quietly
-# destroy the policy model.
+# /proc/<pid>/cgroup for processes owned by other users (§5), which is
+# world-readable and is what the identity actually rests on. The exe read
+# beside it needs ptrace-level access and so returns nothing for anybody else's
+# process — see identity.rs, which says the same thing from the other side.
+# Hiding /proc would take the cgroup too, and every native identity would
+# collapse to "uid:N".
 
-[Install]
-Also=ai-daemon.socket
+# No [Install] section, deliberately.
+#
+# This unit is D-Bus activated: dbus-1/system-services starts it on first use,
+# which is the whole point of a service that should not be holding a GPU
+# context for a desktop nobody has asked anything yet. There is nothing to
+# enable, so there is no WantedBy.
+#
+# It previously carried "Also=ai-daemon.socket", naming a unit that has never
+# existed in this repository — nothing in the daemon listens on a socket, since
+# sessions arrive as descriptors passed over D-Bus. systemd refuses to enable a
+# unit whose Also= target is missing, so the one command an admin reflexively
+# runs failed pointing at a file that was never shipped.

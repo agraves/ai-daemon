@@ -97,6 +97,26 @@ check "the fetch template unit shipped" test -f /usr/lib/systemd/system/ai-daemo
 check "the D-Bus activation file shipped" test -f /usr/share/dbus-1/system-services/io.github.agraves.AIDaemon1.service
 check "the polkit actions shipped" test -f /usr/share/polkit-1/actions/io.github.agraves.aidaemon.policy
 
+note "Every hard reference between units must name a unit that exists."
+note "systemd refuses to enable a unit whose Also= target is missing, and the"
+note "one command an admin reflexively runs is the one that finds out."
+DANGLING=""
+for unit in /usr/lib/systemd/system/ai-daemon*.service; do
+  # Ordering (After=, Before=) and Wants= are soft and may legitimately name
+  # units that are not installed. These are the ones that must resolve.
+  refs=$(sed -n 's/^\(Also\|Requires\|BindsTo\|PartOf\|WantedBy\|RequiredBy\)=//p' "$unit" | tr ' ' '\n')
+  for ref in $refs; do
+    [ -n "$ref" ] || continue
+    if [ ! -e "/usr/lib/systemd/system/$ref" ] && [ ! -e "/etc/systemd/system/$ref" ]; then
+      DANGLING="$DANGLING $(basename "$unit")->$ref"
+    fi
+  done
+done
+if [ -n "$DANGLING" ]; then
+  note "dangling:$DANGLING"
+fi
+check "no unit references a unit that was never shipped" test -z "$DANGLING"
+
 note "The unit's network posture, section 9:"
 grep -E 'PrivateNetwork|IPAddress|RestrictAddressFamilies|DeviceAllow' /usr/lib/systemd/system/ai-daemon.service | sed 's/^/    /'
 contains "the daemon unit denies the daemon a network" /usr/lib/systemd/system/ai-daemon.service '^PrivateNetwork=yes'
