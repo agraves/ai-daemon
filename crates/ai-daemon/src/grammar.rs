@@ -137,10 +137,6 @@ impl SubCompiler<'_> {
             .map(|r| r.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
 
-        // Required first, in schema order, then optionals as a suffix chain.
-        // Fixing key order is a real restriction on the model and a real
-        // simplification of the grammar; JSON object order is not semantic, so
-        // nothing a client can observe is lost.
         let mut required_parts: Vec<String> = Vec::new();
         let mut optional_parts: Vec<String> = Vec::new();
         for (key, subschema) in properties {
@@ -154,33 +150,72 @@ impl SubCompiler<'_> {
         }
 
         let rule = self.fresh("obj");
-        let mut body = String::from("\"{\" ws ");
-        let mut first = true;
-        for part in &required_parts {
-            if !first {
-                body.push_str(" ws \",\" ws ");
-            }
-            body.push_str(part);
-            first = false;
-        }
-        for part in &optional_parts {
-            if first {
-                body.push_str(&format!("({part} "));
-                first = false;
-            } else {
-                body.push_str(&format!(" (ws \",\" ws {part}"));
-            }
-        }
-        for _ in &optional_parts {
-            body.push_str(")?");
-        }
-        if required_parts.is_empty() && optional_parts.is_empty() {
-            body = String::from("\"{\" ws ");
-        }
-        body.push_str(" ws \"}\"");
-        self.rules.push(format!("{rule} ::= {body}"));
+        self.rules.push(format!("{rule} ::= {}", object_body(&required_parts, &optional_parts)));
         rule
     }
+}
+
+/// The body of an object rule: required properties in schema order, then each
+/// optional one independently present or absent.
+///
+/// "Independently" is the whole of it. This used to emit the optionals as a
+/// nested chain — each one opening a group that closed only at the end — so
+/// `{query, tags}` was not a sentence the grammar could produce: reaching a
+/// later optional required every earlier optional to be there too. For a tool
+/// like `search(query; limit, sort, tags)` a model that wanted
+/// `search(query="x", tags=["a"])` had two legal paths, dropping the argument
+/// it meant or inventing values for `limit` and `sort`, and constrained
+/// decoding exists to prevent exactly that. It was silent as well as wrong:
+/// `widened` discloses a schema being *loosened* and nothing disclosed one
+/// being tightened.
+///
+/// Two tightenings remain, both deliberate, and they are written down here
+/// rather than left to be discovered:
+///
+/// * **Key order is fixed.** JSON object order is not semantic, so no client
+///   can tell. Presence is not order, which is what the old construction got
+///   wrong.
+/// * **No properties beyond the declared ones.** JSON Schema permits extras by
+///   default; a tool call carrying arguments the client never declared is not
+///   something the client can act on, so the grammar does not offer them.
+fn object_body(required: &[String], optional: &[String]) -> String {
+    if required.is_empty() && optional.is_empty() {
+        return "\"{\" ws \"}\"".to_string();
+    }
+
+    let mut body = String::from("\"{\" ws");
+    if required.is_empty() {
+        // Nothing mandatory to hang a leading comma on, so the alternation is
+        // over which optional comes first; everything after it is independent
+        // again. One alternative per optional, each a suffix of the list.
+        let alternatives: Vec<String> = optional
+            .iter()
+            .enumerate()
+            .map(|(index, first)| {
+                let mut alternative = first.clone();
+                for later in &optional[index + 1..] {
+                    alternative.push_str(&format!(" (ws \",\" ws {later})?"));
+                }
+                alternative
+            })
+            .collect();
+        body.push_str(&format!(" ({})?", alternatives.join(" | ")));
+    } else {
+        for (index, part) in required.iter().enumerate() {
+            if index == 0 {
+                body.push_str(&format!(" {part}"));
+            } else {
+                body.push_str(&format!(" ws \",\" ws {part}"));
+            }
+        }
+        // A required pair always precedes these, so each comma is legal on its
+        // own and no optional has to nest inside another.
+        for part in optional {
+            body.push_str(&format!(" (ws \",\" ws {part})?"));
+        }
+    }
+    body.push_str(" ws \"}\"");
+    body
 }
 
 fn escape_gbnf(text: &str) -> String {
@@ -243,6 +278,158 @@ mod tests {
         let root = compiled.gbnf.lines().next().unwrap();
         assert_eq!(root, "root ::= call-0 | call-1", "{}", compiled.gbnf);
         assert_eq!(compiled.names, vec!["a", "b"]);
+    }
+
+    /// Extract the property names that sit in their own top-level `( … )?`
+    /// group — the optionals a model can reach without producing any other.
+    fn independently_optional(body: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut depth = 0usize;
+        let mut group = String::new();
+        let mut chars = body.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '(' => {
+                    depth += 1;
+                    if depth == 1 {
+                        group.clear();
+                        continue;
+                    }
+                }
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 && chars.peek() == Some(&'?') {
+                        // First quoted name in the group is the property.
+                        if let Some(start) = group.find("\\\"") {
+                            let rest = &group[start + 2..];
+                            if let Some(end) = rest.find("\\\"") {
+                                names.push(rest[..end].to_string());
+                            }
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            if depth >= 1 {
+                group.push(c);
+            }
+        }
+        names
+    }
+
+    fn body_of(compiled: &Compiled, rule_prefix: &str) -> String {
+        compiled
+            .gbnf
+            .lines()
+            .find(|l| l.trim_start().starts_with(rule_prefix))
+            .unwrap_or_else(|| panic!("no rule starting {rule_prefix} in\n{}", compiled.gbnf))
+            .split_once("::=")
+            .unwrap()
+            .1
+            .trim()
+            .to_string()
+    }
+
+    /// The regression, in the exact shape it was reported. Optionals used to
+    /// nest, so reaching `tags` forced `limit` and `sort` to appear first: a
+    /// model that meant `search(query, tags)` could only drop the argument it
+    /// wanted or invent two it did not.
+    #[test]
+    fn any_optional_can_be_set_without_the_ones_before_it() {
+        let compiled = compile(&[tool(
+            "search",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "sort":  {"type": "string"},
+                    "tags":  {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["query"],
+            }),
+        )])
+        .unwrap();
+        let body = body_of(&compiled, "t0-obj-");
+
+        assert_eq!(
+            independently_optional(&body),
+            vec!["limit", "sort", "tags"],
+            "each optional must be skippable on its own:\n{body}"
+        );
+        assert!(
+            !compiled.widened,
+            "nothing here is loosened, and nothing is silently tightened either"
+        );
+    }
+
+    /// Nesting is the defect, so pin the absence of it directly: no group may
+    /// open inside another.
+    #[test]
+    fn optional_groups_do_not_nest() {
+        let compiled = compile(&[tool(
+            "many",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "r": {"type": "string"},
+                    "a": {"type": "string"},
+                    "b": {"type": "string"},
+                    "c": {"type": "string"},
+                },
+                "required": ["r"],
+            }),
+        )])
+        .unwrap();
+        let body = body_of(&compiled, "t0-obj-");
+        let mut depth = 0i32;
+        let mut deepest = 0i32;
+        for c in body.chars() {
+            match c {
+                '(' => {
+                    depth += 1;
+                    deepest = deepest.max(depth);
+                }
+                ')' => depth -= 1,
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "unbalanced:\n{body}");
+        assert_eq!(deepest, 1, "an optional nested inside another:\n{body}");
+    }
+
+    /// With nothing required there is no pair to hang a leading comma on, so
+    /// the grammar alternates over which optional comes first — and every
+    /// single-property call, and the empty object, stays reachable.
+    #[test]
+    fn an_all_optional_object_can_start_with_any_of_them() {
+        let compiled = compile(&[tool(
+            "opt",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+            }),
+        )])
+        .unwrap();
+        let body = body_of(&compiled, "t0-obj-");
+        // Either may be first, and the whole group is skippable for `{}`.
+        assert!(body.contains(" | "), "no alternation over the first key:\n{body}");
+        assert!(body.contains("\\\"a\\\""), "{body}");
+        assert!(body.contains("\\\"b\\\""), "{body}");
+        assert!(body.ends_with("ws \"}\""), "{body}");
+        assert!(!compiled.widened);
+    }
+
+    #[test]
+    fn an_object_with_no_properties_is_just_braces() {
+        assert_eq!(object_body(&[], &[]), "\"{\" ws \"}\"");
+    }
+
+    #[test]
+    fn required_properties_are_all_mandatory_and_comma_joined() {
+        let body = object_body(&["A".into(), "B".into()], &[]);
+        assert_eq!(body, "\"{\" ws A ws \",\" ws B ws \"}\"");
     }
 
     #[test]
