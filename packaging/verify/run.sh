@@ -101,13 +101,25 @@ note "Every hard reference between units must name a unit that exists."
 note "systemd refuses to enable a unit whose Also= target is missing, and the"
 note "one command an admin reflexively runs is the one that finds out."
 DANGLING=""
-for unit in /usr/lib/systemd/system/ai-daemon*.service; do
+# User units too, against the *user* search path: a user unit referring to a
+# system target resolves no better than a reference to nothing, and the portal
+# is a user unit.
+for unit in /usr/lib/systemd/system/ai-daemon*.service /usr/lib/systemd/user/ai-daemon*.service; do
+  [ -e "$unit" ] || continue
+  case "$unit" in
+    */user/*) SEARCH="/usr/lib/systemd/user /etc/systemd/user" ;;
+    *)        SEARCH="/usr/lib/systemd/system /etc/systemd/system" ;;
+  esac
   # Ordering (After=, Before=) and Wants= are soft and may legitimately name
   # units that are not installed. These are the ones that must resolve.
   refs=$(sed -n 's/^\(Also\|Requires\|BindsTo\|PartOf\|WantedBy\|RequiredBy\)=//p' "$unit" | tr ' ' '\n')
   for ref in $refs; do
     [ -n "$ref" ] || continue
-    if [ ! -e "/usr/lib/systemd/system/$ref" ] && [ ! -e "/etc/systemd/system/$ref" ]; then
+    FOUND=""
+    for dir in $SEARCH; do
+      [ -e "$dir/$ref" ] && FOUND=yes
+    done
+    if [ -z "$FOUND" ]; then
       DANGLING="$DANGLING $(basename "$unit")->$ref"
     fi
   done
@@ -120,7 +132,17 @@ check "no unit references a unit that was never shipped" test -z "$DANGLING"
 note "The unit's network posture, section 9:"
 grep -E 'PrivateNetwork|IPAddress|RestrictAddressFamilies|DeviceAllow' /usr/lib/systemd/system/ai-daemon.service | sed 's/^/    /'
 contains "the daemon unit denies the daemon a network" /usr/lib/systemd/system/ai-daemon.service '^PrivateNetwork=yes'
-contains "the fetch unit is the one with a network" /usr/lib/systemd/system/ai-daemon-fetch@.service '^PrivateNetwork=no'
+contains "the fetch unit is one of the two with a network" /usr/lib/systemd/system/ai-daemon-fetch@.service '^PrivateNetwork=no'
+note "The other is the remote provider, and it is the only other one. A count"
+note "rather than a spot check: the claim is about the whole set of units."
+NETWORKED=$(grep -l '^PrivateNetwork=no' /usr/lib/systemd/system/ai-daemon*.service /usr/lib/systemd/user/ai-daemon*.service 2>/dev/null | xargs -r -n1 basename | sort | tr '\n' ' ')
+note "units with a network: ${NETWORKED:-none}"
+check "exactly the fetch helper and the remote provider have a network" \
+  test "$NETWORKED" = "ai-daemon-backend-remote.service ai-daemon-fetch@.service "
+contains "and the remote provider cannot read the daemon's state either" \
+  /usr/lib/systemd/system/ai-daemon-backend-remote.service '^TemporaryFileSystem=/var/lib/ai-daemon$'
+refute "with nothing bound back in for it" \
+  grep -qE '^Bind(ReadOnly)?Paths=.*/var/lib/ai-daemon' /usr/lib/systemd/system/ai-daemon-backend-remote.service
 contains "the fetch unit can write only the staging directory" /usr/lib/systemd/system/ai-daemon-fetch@.service '^ReadWritePaths=/var/lib/ai-daemon/models/staging$'
 note "The unit with a network must not be able to *read* the daemon's state"
 note "either. Read-only is not absent, and it runs as the daemon's own uid, so"
@@ -547,6 +569,348 @@ check "a model can be removed" aidctl remove mock-small-copy
 run aidctl models
 BLOBS=$(find /var/lib/ai-daemon/models/blobs -type f | wc -l)
 check "the shared blob survives removing one of its two names" test "$BLOBS" = 1
+
+# ---------------------------------------------------------------------------
+section "16. A provider that is not on this machine"
+# ---------------------------------------------------------------------------
+note "The daemon has PrivateNetwork=yes, so a backend it forks has no route"
+note "anywhere. A remote provider therefore runs as its own unit with its own"
+note "network, and the daemon connects to it. That is the thing being tested:"
+note "the transport, the labelling, and that nothing about it is on by default."
+
+check "the remote backend shipped" test -x /usr/lib/ai-daemon/backends/ai-daemon-backend-remote
+check "its unit shipped" test -f /usr/lib/systemd/system/ai-daemon-backend-remote.service
+check "sysusers.d created its own separate user" getent passwd ai-daemon-remote
+note "Separate uid because it is the one process here with a network: the"
+note "daemon's files must not be readable by it."
+check "it is not the daemon's user" \
+  test "$(id -u ai-daemon-remote)" != "$(id -u ai-daemon)"
+
+note "Nothing the package installs turns it on. Its unit will not even start:"
+run grep -n 'ConditionPathExists' /usr/lib/systemd/system/ai-daemon-backend-remote.service
+lacks "the shipped config names no endpoint" /etc/ai-daemon/config.toml 'connect *='
+check "and the file its unit is conditional on is not packaged" \
+  test -z "$(pacman -Qlq ai-daemon | grep -x '/etc/ai-daemon/remote.toml')"
+# Asked of the package rather than of the filesystem, deliberately: the
+# archlinux container image sets NoExtract for usr/share/doc, so a file that
+# ships correctly is absent here. What is being claimed is that the package
+# carries it, and the package's own file list is where that is true or false.
+check "the example ships as documentation, not as configuration" \
+  bash -c "pacman -Qlq ai-daemon | grep -qx /usr/share/doc/ai-daemon/remote.toml.example"
+
+note "The socket the daemon dials. Its ownership is the whole access control:"
+note "an API key anyone could spend is an API key anyone will."
+run ls -ld /run/ai-daemon-remote /run/ai-daemon-remote/remote.sock
+check "the socket is group-readable and not world-readable" \
+  test "$(stat -c %a /run/ai-daemon-remote/remote.sock)" = 660
+check "and shared with the daemon's group, not with everyone" \
+  test "$(stat -c %G /run/ai-daemon-remote/remote.sock)" = ai-daemon
+check "it is not in the daemon's own runtime directory" \
+  test ! -e /run/ai-daemon/remote.sock
+note "Because that one holds the live session sockets, and a uid that can"
+note "create files there can unlink them."
+refute "a user outside the group cannot reach the remote backend" \
+  runas mallory test -r /run/ai-daemon-remote/remote.sock
+
+note "Registering a model that has no weights on this machine. Nothing is"
+note "downloaded, so there is nothing to hash and no digest is asked for."
+check "a remote model registers" \
+  aidctl install --name cloud-small --source remote:stub-model-1 --backend remote
+refute "and offering a digest for it is refused, not ignored" \
+  aidctl install --name cloud-2 --source remote:stub-model-1 --digest "sha256:$(printf 0%.0s $(seq 64))"
+note "A digest on a remote install would look like verification that is not"
+note "happening."
+refute "a remote model naming a backend that is not a remote provider is refused" \
+  aidctl install --name cloud-3 --source remote:stub-model-1 --backend mock
+
+aidctl models > /tmp/models-remote.txt 2>&1
+run cat /tmp/models-remote.txt
+contains "it is listed with format remote" /tmp/models-remote.txt 'cloud-small +remote'
+contains "and marked as not local where a person will see it" /tmp/models-remote.txt 'not local'
+contains "its identifier says what it is instead of pretending to be a hash" \
+  /tmp/models-remote.txt 'remote:stub-model-1'
+note "Section 15 left exactly one blob in the store. A model with no weights"
+note "must not have added another."
+check "no blob was created for a model that has none" \
+  test "$(find /var/lib/ai-daemon/models/blobs -type f | wc -l)" = 1
+
+note "Generating through it. The bytes leave this process, cross a socket to a"
+note "unit with a network, and come back."
+runas alice aidctl generate --model cloud-small --max-tokens 8 --usage \
+  "hello from the other side" > /tmp/remote-gen.txt 2>&1
+run cat /tmp/remote-gen.txt
+contains "a remote model generates" /tmp/remote-gen.txt 'remote-0'
+contains "and the prompt reached the far end, which counted it" \
+  /tmp/remote-gen.txt 'prompt=11'
+
+note "The label. This is the part that matters: a user must be able to find"
+note "out that a prompt left the machine, and not by reading a config file."
+runas alice aidctl generate --model cloud-small --max-tokens 4 \
+  "am I local" > /tmp/remote-info.txt 2>&1
+run cat /tmp/remote-info.txt
+contains "the session itself says it is not local" /tmp/remote-info.txt 'local=false'
+runas alice aidctl generate --max-tokens 4 "and now" > /tmp/local-info.txt 2>&1
+contains "while a session on a local model says it is" /tmp/local-info.txt 'local=true'
+note "Negative side included deliberately: a property that reads false for"
+note "everything is not evidence of anything."
+
+note "And so does the audit log, which is where somebody looks afterwards."
+tail -12 /var/lib/ai-daemon/audit.jsonl | sed 's/^/    /'
+contains "the audit record for a remote session says it was not local" \
+  /var/lib/ai-daemon/audit.jsonl '"model":"cloud-small"[^}]*"local":false|"local":false[^}]*"model":"cloud-small"'
+
+note "Tools over the remote transport, and the parallel batch from §12 with"
+note "them: two calls in one turn, from a service, through the daemon."
+# /tmp/tools2.json is the two-tool schema section 7 built.
+runas alice aidctl generate --model cloud-small --max-tokens 32 \
+  --tool /tmp/tools2.json "call the tools" > /tmp/remote-tools.txt 2>&1
+run cat /tmp/remote-tools.txt
+contains "both calls arrived from the remote endpoint" /tmp/remote-tools.txt 'tool_calls 2'
+contains "the first one" /tmp/remote-tools.txt 'get_weather'
+contains "the second one" /tmp/remote-tools.txt 'get_time'
+
+note "Logprobs, from an endpoint rather than from a local model."
+runas alice aidctl generate --model cloud-small --max-tokens 4 --logprobs 2 \
+  "alternatives please" > /tmp/remote-logprobs.txt 2>&1
+run cat /tmp/remote-logprobs.txt
+contains "alternatives came back over HTTP" /tmp/remote-logprobs.txt '=-0\.25'
+
+note "Embeddings."
+runas alice aidctl embed --model cloud-small "some text" > /tmp/remote-embed.txt 2>&1
+run cat /tmp/remote-embed.txt
+contains "a vector came back from the endpoint" /tmp/remote-embed.txt '0\.25'
+
+note "Cancellation. A remote endpoint can be silent for a long time and the"
+note "meter usually keeps running while it is, so a cancel has to reach the"
+note "transport rather than wait for the next token. The stand-in sends for a"
+note "minute if nobody stops it."
+START=$(date +%s%N)
+runas alice aidctl generate --model cloud-small --max-tokens 2000 --cancel-after 500 --usage \
+  "keep going" > /tmp/remote-cancel.txt 2>&1
+ELAPSED=$(( ($(date +%s%N) - START) / 1000000 ))
+run cat /tmp/remote-cancel.txt
+note "took ${ELAPSED}ms of a possible 60000"
+# Ordered so a request that was refused outright cannot pass as a fast
+# cancellation: it has to have generated, and then stopped because we said so.
+contains "the request really ran and then stopped on the cancel" \
+  /tmp/remote-cancel.txt 'finish=cancelled'
+contains "with tokens already received from the endpoint" /tmp/remote-cancel.txt 'remote-0'
+check "the transfer was torn down rather than run out" test "$ELAPSED" -lt 5000
+# The far end is mid-sleep between tokens when the transfer dies, so it learns
+# about it on its next write rather than immediately.
+sleep 1
+contains "and the far end noticed, so it was the transfer that ended" \
+  /tmp/stub-endpoint.log 'peer went away'
+
+note "What it refuses. It has no weights, no tokeniser and no image model, and"
+note "says so by name rather than failing somewhere confusing."
+refute "it cannot tokenize, because the model is not here" \
+  runas alice aidctl tokenize --model cloud-small "count these"
+refute "and it does not generate images" \
+  runas alice aidctl generate-media --model cloud-small --image "a cat"
+
+note "Plaintext. The backend refuses http:// unless it is told to allow it, so"
+note "a typo in base_url cannot quietly put prompts on the wire in clear. A"
+note "second provider is running against the same http endpoint with the"
+note "setting left at its default, and its whole job is to be refused."
+check "a model on the strict provider registers fine" \
+  aidctl install --name cloud-strict --source remote:stub-model-1 --backend remote-strict
+refute "but generating through it will not send a prompt over http" \
+  runas alice aidctl generate --model cloud-strict --max-tokens 4 "should not leave"
+contains "and it announced the allowance on the one that has it" \
+  /tmp/remote-backend.log 'may travel to http://127.0.0.1:8099/v1 unencrypted'
+lacks "while the strict one announced nothing of the kind" /tmp/remote-strict.log 'may travel'
+note "Same binary, same endpoint, same prompt: the only difference is one line"
+note "of configuration, which is what makes this a test of that line."
+
+note "And the config the daemon itself refuses: a backend that is both, or"
+note "neither, or one that sets an environment for a process it does not start."
+for BAD in 'name = "x"' 'name = "x"
+exec = "/bin/true"
+connect = "/tmp/s"' 'name = "x"
+connect = "/tmp/s"
+env = { CUDA_VISIBLE_DEVICES = "1" }'; do
+  printf '[[backend]]\n%s\n' "$BAD" > /etc/ai-daemon/config.toml.d/82-bad.conf
+  refute "a contradictory backend spec is refused: $(printf '%s' "$BAD" | tr '\n' ' ')" \
+    /usr/bin/ai-daemon --check-config
+  rm -f /etc/ai-daemon/config.toml.d/82-bad.conf
+done
+
+# ---------------------------------------------------------------------------
+section "17. The portal: the one app identity an app cannot choose"
+# ---------------------------------------------------------------------------
+note "Peer credentials give the daemon a uid and a cgroup. That tells it which"
+note "*person* is calling and usually which unit, and the daemon calls that"
+note "class 'native' because a process in the same session can arrange to look"
+note "like another one. A sandboxed app is different: its confinement wrote"
+note "down what it is, in a file the app did not write and cannot reach out of."
+note "Reading that from outside, for a pid the bus vouched for, is the only"
+note "strong application identity Linux offers — and it can only be read by"
+note "something running as the user, which the daemon is not."
+
+check "the portal shipped" test -x /usr/lib/ai-daemon/ai-daemon-portal
+check "as a user unit, not a system one" test -f /usr/lib/systemd/user/ai-daemon-portal.service
+check "with session-bus activation" \
+  test -f /usr/share/dbus-1/services/io.github.agraves.AIPortal1.service
+check "it is not on PATH: apps reach it over the bus, people do not run it" \
+  test ! -e /usr/bin/ai-daemon-portal
+note "It serves the interface proposed in §13, under its own name until"
+note "org.freedesktop.portal.AI is accepted upstream. Squatting on the desktop"
+note "portal's name would be worse than an interim one:"
+run grep -h '^Name=' /usr/share/dbus-1/services/io.github.agraves.AIPortal1.service
+check "the proposal it implements ships alongside it" \
+  bash -c "pacman -Qlq ai-daemon | grep -qx /usr/share/doc/ai-daemon/org.freedesktop.portal.AI.xml"
+
+run cat /tmp/portal.log
+contains "the portal took its name on alice's session bus" /tmp/portal.log \
+  'io\.github\.agraves\.AIPortal1 at /io/github/agraves/AIPortal1'
+
+note "First, the refusal. alice's shell is not in a sandbox, so there is no"
+note "strong identity to carry and the portal will not invent one."
+refute "an unsandboxed caller is refused rather than given the portal's own id" \
+  env DBUS_SESSION_BUS_ADDRESS="$ALICE_BUS" runas alice aidctl portal
+note "That matters more than it looks: passing an unidentifiable caller through"
+note "would label every unsandboxed app on the machine as the portal itself,"
+note "and they would all silently share one grant."
+
+note "Now a caller with a sandbox. Flatpak writes .flatpak-info into the"
+note "sandbox root, so /proc/<pid>/root/.flatpak-info reads it from outside."
+note "There is no mount namespace here, so the file goes at the real root and"
+note "every process looks confined — enough to prove the read path and the"
+note "parse, not enough to prove the isolation, which is flatpak's to provide."
+note "Which section of that file counts, and which labels are refused, is"
+note "covered by unit tests in the portal itself."
+cat > /.flatpak-info <<'INFO'
+[Instance]
+name=decoy.not.the.app
+[Application]
+name=org.example.Notes
+runtime=org.freedesktop.Platform
+INFO
+env DBUS_SESSION_BUS_ADDRESS="$ALICE_BUS" runas alice aidctl portal >/tmp/portal-id.txt 2>&1
+run cat /tmp/portal-id.txt
+contains "the portal reports the application id" /tmp/portal-id.txt 'org\.example\.Notes'
+contains "and says which sandbox said so" /tmp/portal-id.txt 'flatpak'
+lacks "the decoy in another section was not taken" /tmp/portal-id.txt 'decoy'
+
+note "End to end: a session opened through the portal, on the app's behalf."
+env DBUS_SESSION_BUS_ADDRESS="$ALICE_BUS" runas alice \
+  aidctl generate --via-portal --max-tokens 8 "who am I" >/tmp/portal-gen.txt 2>&1
+run cat /tmp/portal-gen.txt
+
+if [ "$(cat /tmp/portal-cgroup)" = yes ]; then
+  contains "a session opened through the portal generates" /tmp/portal-gen.txt \
+    'identity portal:org\.example\.Notes'
+  lacks "and it did not fall back to a uid" /tmp/portal-gen.txt 'identity uid:'
+  note "The daemon recorded it as the strong class, not as a guess:"
+  tail -4 /var/lib/ai-daemon/audit.jsonl | sed 's/^/    /'
+  contains "the audit log carries the application id" /var/lib/ai-daemon/audit.jsonl \
+    '"identity":"portal:org\.example\.Notes"'
+  contains "in the portal trust class" /var/lib/ai-daemon/audit.jsonl '"class":"portal"'
+  note "And the grant is keyed on the app, so it survives a relaunch — which is"
+  note "the practical point of all this. A key that changes every launch turns"
+  note "a consent dialog into something people click through."
+  run aidctl grants
+  check "the grant is keyed on the application id" \
+    bash -c "aidctl grants | grep -q 'portal:org.example.Notes'"
+else
+  note "STOPS HERE, and the reason is the container rather than the code."
+  note ""
+  note "The daemon identifies a portal by the caller's systemd unit, read from"
+  note "/proc/<pid>/cgroup — world-readable, and not something a process can"
+  note "choose for itself, which is exactly why it is what gets checked. This"
+  note "container has no systemd and a read-only cgroupfs:"
+  sed 's/^/    /' /tmp/portal-cgroup.err
+  note "so nothing can be put in a cgroup named after a unit, and the daemon"
+  note "sees a caller with no unit at all. The other two ways it could have"
+  note "recognised the portal are closed for good reasons: /proc/<pid>/exe is"
+  note "unreadable across uids and the portal must run as the user, and a uid"
+  note "check cannot work for the same reason. The same limitation as seccomp"
+  note "in section 8 — environmental, named, and not routed around."
+  note ""
+  note "What is proven above: the portal reads a real sandbox correctly,"
+  note "refuses what it cannot vouch for, and refuses a caller-chosen id."
+  note "What is proven below: the daemon refuses an unrecognised introducer."
+  note "What the daemon *accepts* is covered by unit tests over the same"
+  note "function the D-Bus path calls (dbusapi::tests::introducers)."
+  contains "the daemon refused, because it could not see a unit to trust" \
+    /tmp/portal-gen.txt 'only xdg-desktop-portal may assert an application identity'
+  contains "and said so in its log, naming the id it would not take" /tmp/daemon.log \
+    'asserted portal_app_id=org\.example\.Notes without being a portal'
+fi
+
+note "What stops an app asserting its own identity. Two separate refusals,"
+note "because either one alone would be a bypass."
+note "One: the portal will not let a caller choose the id it forwards."
+refute "an app that sets portal_app_id itself is refused by the portal" \
+  runas alice busctl --address="$ALICE_BUS" call \
+  io.github.agraves.AIPortal1 /io/github/agraves/AIPortal1 \
+  org.freedesktop.portal.AI CreateSession 'sa{sv}' default 1 portal_app_id s org.evil.App
+note "Two: the daemon will not take the claim from a caller that is not on its"
+note "list of introducers, whatever the claim says."
+refute "and asserting it straight to the daemon is refused there too" \
+  runas alice busctl --system call io.github.agraves.AIDaemon1 \
+  /io/github/agraves/AIDaemon1/Manager io.github.agraves.AIDaemon1.Manager \
+  CreateSession 'sa{sv}' default 1 portal_app_id s org.evil.App
+contains "the daemon logged the attempt rather than only refusing it" /tmp/daemon.log \
+  'asserted portal_app_id=org.evil.App without being a portal'
+check "the list of who may introduce an app is configuration, not a constant" \
+  grep -q '^portal_units' /etc/ai-daemon/config.toml
+
+rm -f /.flatpak-info
+
+# ---------------------------------------------------------------------------
+section "18. Being preempted is not the same as being dead"
+# ---------------------------------------------------------------------------
+note "The daemon gives up on a backend that says nothing for a long time,"
+note "because a backend can stop answering without closing its socket and the"
+note "session would otherwise wait for ever holding a decode slot. But §8's"
+note "preemption makes the daemon itself silence background work: every"
+note "background request is paused whenever an interactive one is running, and"
+note "a paused backend emits nothing — that is what pausing is."
+note ""
+note "So the two look identical from the waiting end, and the question is"
+note "whether the daemon can tell them apart. This box's silence window is"
+note "eight seconds; the interactive request below runs for about twelve."
+
+SILENCE=$(sed -n 's/^backend_silence_seconds = //p' /etc/ai-daemon/config.toml.d/70-container.conf)
+note "configured silence window: ${SILENCE}s"
+check "the window is short enough for this test to reach it" test "$SILENCE" -lt 10
+
+# Both counts sit inside the session's 4096-token context; an earlier draft
+# asked for 8000 and was refused before any of this was exercised.
+runas alice aidctl generate --priority background --max-tokens 1500 --usage \
+  "a batch job that will be held still" >/tmp/preempted.txt 2>&1 &
+BG=$!
+# Let it be admitted, attached and actually generating before the interactive
+# request arrives — a request that has not started yet is not a preempted one.
+sleep 1
+START=$(date +%s%N)
+runas alice aidctl generate --max-tokens 3000 --usage \
+  "one long interactive turn, held down the whole time" >/tmp/holder.txt 2>&1
+HELD=$(( ($(date +%s%N) - START) / 1000000 ))
+wait $BG
+note "the interactive request ran for ${HELD}ms, and the background one was"
+note "paused for all of it"
+check "the interactive request really did outlast the silence window" \
+  test "$HELD" -gt $(( SILENCE * 1000 ))
+
+run cat /tmp/preempted.txt
+# Every token it asked for, which is what the mock's finish=length means —
+# a stronger claim than "it ended somehow": nothing was lost to the pause.
+contains "the preempted request produced all 1500 of its tokens" /tmp/preempted.txt \
+  'completion=1500 attachment=0 finish=length'
+lacks "and was not killed as a silent backend" /tmp/preempted.txt 'went silent'
+lacks "nor reported as any other backend failure" /tmp/preempted.txt 'backend-failed'
+note "Without the paused clock this fails as backend-failed at eight seconds, on"
+note "a request the daemon itself had silenced, throwing away the tokens"
+note "already generated — on exactly the workload preemption exists to protect."
+contains "and the interactive request it was yielding to produced all of its" \
+  /tmp/holder.txt 'completion=3000 attachment=0 finish=length'
+
+note "The window still fires for a backend that is genuinely quiet while free"
+note "to speak, which is the whole reason it exists — covered by unit tests"
+note "over wait_for_event, where a fake clock beats a twenty-second wait."
 
 # ---------------------------------------------------------------------------
 printf '\n\033[1m=== Result ===\033[0m\n'

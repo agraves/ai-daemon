@@ -28,6 +28,12 @@ const BUS_NAME: &str = "io.github.agraves.AIDaemon1";
 const MANAGER_PATH: &str = "/io/github/agraves/AIDaemon1/Manager";
 const MANAGER_IFACE: &str = "io.github.agraves.AIDaemon1.Manager";
 const SESSION_IFACE: &str = "io.github.agraves.AIDaemon1.Session";
+// The portal, on the session bus. An interim name until
+// org.freedesktop.portal.AI is accepted into xdg-desktop-portal, at which
+// point an app changes this string and nothing else.
+const PORTAL_NAME: &str = "io.github.agraves.AIPortal1";
+const PORTAL_PATH: &str = "/io/github/agraves/AIPortal1";
+const PORTAL_IFACE: &str = "org.freedesktop.portal.AI";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -53,6 +59,7 @@ fn main() {
         "deny" => grant(rest, false),
         "revoke" => revoke(rest),
         "install" => install(rest),
+        "portal" => portal(rest),
         "remove" => remove(rest),
         "alias" => set_alias(rest),
         "pin" => pin(rest, true),
@@ -134,7 +141,15 @@ fn models() -> Result<(), String> {
             get("store"),
             human_bytes(bytes),
             get("digest"),
-            if get("pinned") == "true" { "  (pinned)" } else { "" }
+            // Worth a word in the one place a person lists what is installed.
+            // The format column already says `remote`, but that is jargon and
+            // "not local" is the fact.
+            match (get("format") == "remote", get("pinned") == "true") {
+                (true, true) => "  (not local, pinned)",
+                (true, false) => "  (not local)",
+                (false, true) => "  (pinned)",
+                (false, false) => "",
+            }
         );
     }
     Ok(())
@@ -262,18 +277,33 @@ fn install(args: &[String]) -> Result<(), String> {
               [--format gguf] [--backend NAME] [--license SPDX]
               [--capability generate] [--capability embed] ...
 
-Sources: https://…, file:///…, oci://registry/repo@sha256:…
-The digest is mandatory. The download runs in ai-daemon-fetch, which has a
-network and no access to the model store; the daemon verifies the bytes and
-moves them in. --format gguf (the default) is checked against the file's
-magic, so a mislabelled file is refused rather than handed to a backend."
+Sources: https://…, file:///…, oci://registry/repo@sha256:…, remote:MODEL-ID
+The digest is mandatory except for a remote: source. The download runs in
+ai-daemon-fetch, which has a network and no access to the model store; the
+daemon verifies the bytes and moves them in. --format gguf (the default) is
+checked against the file's magic, so a mislabelled file is refused rather
+than handed to a backend.
+
+  remote:MODEL-ID registers a model that lives on somebody else's machine
+  and is served by the configured remote provider. Nothing is downloaded
+  and there is nothing to verify, so no digest is asked for: the integrity
+  of a remote model is the endpoint's promise, not this machine's
+  measurement. Every session on it reports local=false, and the consent
+  prompt says so before the first prompt goes anywhere."
                 );
                 return Ok(());
             }
             other => return Err(format!("unknown option {other:?}")),
         }
     }
-    if source.is_empty() || digest.is_empty() || name.is_empty() {
+    // A remote model has no bytes here, so there is no digest to demand.
+    // Refusing one that was supplied anyway rather than ignoring it: a digest
+    // on a remote install would look like verification that is not happening.
+    let remote = source.starts_with("remote:");
+    if remote && !digest.is_empty() {
+        return Err("a remote: source takes no --digest; nothing is downloaded to verify".into());
+    }
+    if source.is_empty() || name.is_empty() || (digest.is_empty() && !remote) {
         return Err("--name, --source and --digest are all required".into());
     }
     let installed: String =
@@ -316,21 +346,88 @@ struct SessionHandle {
     connection: Connection,
 }
 
-fn open_session(model: &str, options: HashMap<String, OwnedValue>) -> Result<SessionHandle, String> {
-    let connection = connect()?;
-    let reply = connection
-        .call_method(
-            Some(BUS_NAME),
-            MANAGER_PATH,
-            Some(MANAGER_IFACE),
-            "CreateSession",
-            &(model, options),
-        )
-        .map_err(|e| format!("CreateSession: {e}"))?;
-    let (path, fd): (OwnedObjectPath, zbus::zvariant::OwnedFd) = reply
+/// Ask the session portal who it thinks we are.
+///
+/// Useful on its own — an app that wants to show the user which identity its
+/// prompts will be attributed to should not have to open a session to find out
+/// — and it is the smallest possible check that a machine's portal is working.
+fn portal(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|a| a == "--help") {
+        println!(
+            "usage: aidctl portal
+
+Asks {PORTAL_NAME} on the session bus what application identity it would
+assert for this process. Fails if there is no portal, or if this process is
+not in a sandbox the portal can vouch for — an unsandboxed program has no
+strong identity to carry and should call the daemon directly."
+        );
+        return Ok(());
+    }
+    let session = Connection::session()
+        .map_err(|e| format!("cannot reach the session bus: {e}"))?;
+    let (kind, app_id): (String, String) = session
+        .call_method(Some(PORTAL_NAME), PORTAL_PATH, Some(PORTAL_IFACE), "Identify", &())
+        .map_err(|e| format!("Identify: {e}"))?
         .body()
         .deserialize()
-        .map_err(|e| format!("CreateSession reply: {e}"))?;
+        .map_err(|e| format!("Identify reply: {e}"))?;
+    println!("{kind} application {app_id}");
+    println!("the daemon will see this as identity portal:{app_id}");
+    Ok(())
+}
+
+fn open_session(model: &str, options: HashMap<String, OwnedValue>) -> Result<SessionHandle, String> {
+    open_session_by(model, options, false)
+}
+
+fn open_session_by(
+    model: &str,
+    options: HashMap<String, OwnedValue>,
+    via_portal: bool,
+) -> Result<SessionHandle, String> {
+    // Close always goes to the daemon on the system bus, whichever route
+    // opened the session: the object path in the reply is the daemon's, and
+    // the portal does not proxy it. An app that genuinely cannot reach the
+    // system bus simply drops the descriptor, which the daemon treats as a
+    // closed session anyway.
+    let connection = connect()?;
+    let reply = if via_portal {
+        let session = Connection::session()
+            .map_err(|e| format!("cannot reach the session bus: {e}"))?;
+        session
+            .call_method(
+                Some(PORTAL_NAME),
+                PORTAL_PATH,
+                Some(PORTAL_IFACE),
+                "CreateSession",
+                &(model, options),
+            )
+            .map_err(|e| format!("portal CreateSession: {e}"))?
+    } else {
+        connection
+            .call_method(
+                Some(BUS_NAME),
+                MANAGER_PATH,
+                Some(MANAGER_IFACE),
+                "CreateSession",
+                &(model, options),
+            )
+            .map_err(|e| format!("CreateSession: {e}"))?
+    };
+    // The portal returns the descriptor first, because that is the thing the
+    // app actually needs; the daemon returns the path first. Same two values.
+    let (path, fd): (OwnedObjectPath, zbus::zvariant::OwnedFd) = if via_portal {
+        let (fd, path): (zbus::zvariant::OwnedFd, OwnedObjectPath) = reply
+            .body()
+            .deserialize()
+            .map_err(|e| format!("portal CreateSession reply: {e}"))?;
+        (path, fd)
+    } else {
+        reply
+            .body()
+            .deserialize()
+            .map_err(|e| format!("CreateSession reply: {e}"))?
+    };
     let raw = std::os::fd::OwnedFd::from(fd);
     // SAFETY: the bus handed us an owned descriptor for our end of the
     // socketpair; nothing else in this process holds it.
@@ -365,6 +462,7 @@ fn generate(args: &[String]) -> Result<(), String> {
     // So a v1 client can be impersonated on purpose. Without it, "we still
     // serve the old protocol" is a claim with nothing behind it.
     let mut proto = DATA_PROTO;
+    let mut via_portal = false;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -382,6 +480,7 @@ fn generate(args: &[String]) -> Result<(), String> {
             "--logprobs" => logprobs = iter.next().and_then(|v| v.parse().ok()),
             "--proto" => proto = iter.next().and_then(|v| v.parse().ok()).unwrap_or(DATA_PROTO),
             "--cancel-after" => cancel_after = iter.next().and_then(|v| v.parse().ok()),
+            "--via-portal" => via_portal = true,
             "--help" => {
                 println!(
                     "usage: aidctl generate [options] [PROMPT]
@@ -391,6 +490,9 @@ fn generate(args: &[String]) -> Result<(), String> {
       --priority CLASS interactive (default) or background
       --max-tokens N    cap the completion
       --tool FILE       JSON array of tool schemas; enables tool calling
+      --via-portal      open the session through the session-bus portal, so
+                        the daemon identifies this process by application id
+                        rather than by unit. Only works inside a sandbox.
       --image FILE      attach a PNG, decoded by ai-daemon-decode
       --image-raw WxH:FILE
                         attach raw RGBA8 pixels, decoded by nobody
@@ -422,7 +524,7 @@ With no PROMPT, reads one from stdin."
         "priority".into(),
         Value::Str(priority.as_str().into()).try_into().map_err(|_| "priority")?,
     );
-    let session = open_session(&model, options)?;
+    let session = open_session_by(&model, options, via_portal)?;
     let mut socket = session.socket.try_clone().map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(session.socket.try_clone().map_err(|e| e.to_string())?);
 
@@ -903,6 +1005,8 @@ using it
 
 administration (polkit action io.github.agraves.aidaemon.model-admin)
   install --name N --source URL --digest sha256:HEX
+  install --name N --source remote:MODEL-ID   a model on somebody else's machine
+  portal                      what app identity the session portal would assert
   remove NAME
   alias ALIAS MODEL
   pin MODEL | unpin MODEL

@@ -43,6 +43,19 @@ impl Backends {
         self.specs.iter().map(|s| s.name.clone()).collect()
     }
 
+    /// The configured remote provider, by name or the first one there is.
+    ///
+    /// "Remote" here means `connect`, not a claim in the backend's hello: a
+    /// backend the daemon spawns inherits `PrivateNetwork=yes` and could not
+    /// reach an endpoint even if it said it would. The transport is the fact;
+    /// the hello's `local: false` is what the user is then told.
+    pub fn remote_provider(&self, named: &str) -> Option<String> {
+        self.specs
+            .iter()
+            .find(|spec| (named.is_empty() || spec.name == named) && spec.connect.is_some())
+            .map(|spec| spec.name.clone())
+    }
+
     pub fn get(&self, name: &str) -> Result<Arc<Backend>, String> {
         {
             let live = self.live.lock().unwrap();

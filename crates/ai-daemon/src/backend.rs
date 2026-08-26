@@ -65,6 +65,22 @@ impl Backend {
     /// not stream tokens either; failing here keeps a broken plugin from
     /// looking like a slow model.
     pub fn spawn(spec: &config::Backend) -> Result<Backend, String> {
+        // A backend the daemon connects to rather than owns.
+        //
+        // This exists for the one case a child process cannot serve: a
+        // provider that needs a network. The daemon runs with
+        // PrivateNetwork=yes, and anything it forks inherits that namespace,
+        // so a remote backend spawned here would have no network at all. It
+        // runs as its own unit instead, with its own user, and this end is
+        // just a socket — which also means it survives the daemon's idle exit
+        // and is there again when the bus reactivates us.
+        if let Some(path) = &spec.connect {
+            let socket = UnixStream::connect(path).map_err(|e| {
+                format!("connecting to backend {} at {}: {e}", spec.name, path.display())
+            })?;
+            return Backend::over(spec, socket, None);
+        }
+
         if !spec.exec.exists() {
             return Err(format!("{} does not exist", spec.exec.display()));
         }
@@ -107,6 +123,16 @@ impl Backend {
             libc::close(their_fd);
         }
 
+        Backend::over(spec, ours, Some(child))
+    }
+
+    /// The half that is the same however the socket was obtained: the reader
+    /// thread, the channels, and the handshake.
+    fn over(
+        spec: &config::Backend,
+        ours: UnixStream,
+        child: Option<Child>,
+    ) -> Result<Backend, String> {
         let read_half = ours.try_clone().map_err(|e| format!("dup socket: {e}"))?;
         let alive = Arc::new(AtomicBool::new(true));
         let inflight: Arc<Mutex<HashMap<u64, Sender<BackendEvent>>>> =
@@ -163,7 +189,7 @@ impl Backend {
         Ok(Backend {
             name: spec.name.clone(),
             info,
-            child: Mutex::new(Some(child)),
+            child: Mutex::new(child),
             writer: Mutex::new(writer),
             control_op: Mutex::new(()),
             inflight,
@@ -371,6 +397,17 @@ impl Backend {
     }
 
     pub fn shutdown(&self) {
+        // A backend we merely dialled is not ours to stop.
+        //
+        // It is another unit, with its own lifecycle, and it may be serving
+        // something else the moment after this daemon idles out. Sending it
+        // `Shutdown` would be asking a service we do not own to die, and the
+        // daemon exiting is not a reason for it to. Closing our end is the
+        // whole of our side of the goodbye: the peer sees EOF and forgets the
+        // connection, which is what it should do either way.
+        if self.child.lock().unwrap().is_none() {
+            return;
+        }
         let _ = self.send(&BackendRequest::Shutdown);
         let mut guard = self.child.lock().unwrap();
         let Some(child) = guard.as_mut() else { return };
@@ -650,5 +687,78 @@ mod tests {
         });
         assert_eq!(requests.load(Ordering::SeqCst), 1, "the second caller should find the first's work");
         scripted.join().unwrap();
+    }
+
+    /// A backend the daemon connected to is a service it does not own, and
+    /// telling it to shut down when this daemon idles out would take it away
+    /// from whoever else is using it. The distinction is `child`: spawned
+    /// backends have one, dialled ones do not.
+    ///
+    /// Asserted by *absence of a frame*, not by EOF. The fixture's reader
+    /// thread holds a dup of the same socket, so dropping the Backend never
+    /// closes the far end and waiting for EOF would time out whatever the
+    /// code did — a test that fails for its own reasons proves nothing about
+    /// the code, and this one nearly did.
+    fn nothing_was_sent(peer: UnixStream) -> Result<(), String> {
+        peer.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let mut peer = peer;
+        let mut buffer = [0u8; 64];
+        loop {
+            return match std::io::Read::read(&mut peer, &mut buffer) {
+                Ok(0) => Ok(()),
+                Ok(n) => Err(format!("{n} bytes arrived: {:?}", &buffer[..n])),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    Ok(())
+                }
+                // The test harness's own timer signal lands here and is not
+                // the backend saying anything. Reported as a failure once,
+                // which is the double being wrong about the code again.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => Err(format!("reading the peer end: {e}")),
+            };
+        }
+    }
+
+    #[test]
+    fn a_backend_we_did_not_spawn_is_not_told_to_shut_down() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let backend = backend_on(ours);
+        assert!(backend.child.lock().unwrap().is_none(), "the fixture is a dialled backend");
+
+        backend.shutdown();
+
+        if let Err(what) = nothing_was_sent(theirs) {
+            panic!("a daemon that did not start this backend sent it something: {what}");
+        }
+    }
+
+    /// The other direction, so the test above cannot pass by the daemon never
+    /// sending `Shutdown` to anything. A backend with a child is one this
+    /// daemon started, and stopping it politely before killing it is the whole
+    /// point of the frame.
+    #[test]
+    fn a_backend_we_did_spawn_is_told_to_shut_down() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let mut backend = backend_on(ours);
+        // Any process will do: shutdown only reaps it. `true` has already
+        // exited by the time we wait, which is the fast path through the loop.
+        let child = std::process::Command::new("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn true");
+        *backend.child.get_mut().unwrap() = Some(child);
+
+        backend.shutdown();
+
+        theirs.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut reader = BufReader::new(theirs);
+        match frame::read_typed::<_, BackendRequest>(&mut reader) {
+            Ok(Some(BackendRequest::Shutdown)) => {}
+            other => panic!("expected a Shutdown frame, got {other:?}"),
+        }
     }
 }

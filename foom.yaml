@@ -74,6 +74,31 @@ software:
       reference implementation of the provider protocol and the fixture the
       daemon's own behaviour is tested against.
 
+  - name: ai-daemon-backend-remote
+    path: crates/ai-daemon-backend-remote
+    type: service
+    language: rust
+    description: >
+      Provider backend for an OpenAI-compatible endpoint on another machine.
+      The only backend the daemon connects to rather than spawns, and the
+      second unit in the project with a network: the daemon runs with
+      PrivateNetwork=yes, so a backend it forks could not reach an endpoint.
+      Its own uid, its own runtime directory, and off unless
+      /etc/ai-daemon/remote.toml exists. Everything it serves is reported
+      local=false, in the consent prompt, the session and the audit log.
+
+  - name: ai-daemon-portal
+    path: crates/ai-daemon-portal
+    type: service
+    language: rust
+    description: >
+      Session-bus portal serving the proposed org.freedesktop.portal.AI under
+      an interim name. Runs as the user, reads a caller's Flatpak or Snap
+      confinement from outside the sandbox, and asserts the resulting
+      application id to the daemon — the only app identity on Linux the app
+      itself cannot choose. Refuses callers it cannot identify rather than
+      lending them its own.
+
   - name: aidctl
     path: crates/aidctl
     type: cli

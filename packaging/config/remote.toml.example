@@ -1,0 +1,53 @@
+# ai-daemon remote provider — not installed, on purpose.
+#
+# Copy this to /etc/ai-daemon/remote.toml to turn it on. Until that file
+# exists the unit does not start, the backend declares no models, and the
+# daemon routes around it. Nothing this project ships points at any endpoint.
+#
+# What turning it on means, in one sentence: prompts routed to a model listed
+# below leave this machine. The daemon says so — the session's `local` property
+# is false, the consent prompt says so before the first one is granted, and
+# every audit record carries it — but the decision is yours and it is made
+# here.
+#
+# After editing:
+#     systemctl enable --now ai-daemon-backend-remote
+#     aidctl install --name gpt-4o-mini --source remote:gpt-4o-mini
+#
+# and add
+#
+#     [[backend]]
+#     name = "remote"
+#     connect = "/run/ai-daemon-remote/remote.sock"
+#
+# to a file in /etc/ai-daemon/config.toml.d/ so the daemon knows where to find
+# it. `connect` rather than `exec`: the daemon cannot fork a backend that has
+# a network, so it dials this one instead.
+
+# Any OpenAI-compatible base. Vendor-neutral deliberately: that is the
+# interoperability protocol the shim already speaks, it works against several
+# services and against a local vLLM or llama-server on another host, and a
+# project trying to standardise an interface should not bless one company's API
+# in its reference backend.
+base_url = "https://api.example.com/v1"
+
+# Keep the key out of this file, which is world-readable so the admin can read
+# it back. Give the key file mode 0400 and owner ai-daemon-remote.
+api_key_file = "/etc/ai-daemon/remote.key"
+
+# What each local model name means over there. The left side is what apps ask
+# for and what `aidctl install --name` registered; the right side is the
+# endpoint's own identifier.
+[models]
+"gpt-4o-mini" = "gpt-4o-mini"
+
+# What this endpoint can actually do, written down rather than discovered.
+# Asking a service what it supports and believing the answer turns a capability
+# into a guess; you know what you are paying for.
+capabilities = ["generate", "tools", "parallel-tools", "logprobs", "embed"]
+
+# Permit http://. Off, so a typo in base_url cannot quietly put prompts on the
+# wire in clear — curl refuses the request rather than downgrading. Turn it on
+# only for an endpoint on a network you own, such as a vLLM on the machine next
+# to this one; it is not a thing to set for a service on the internet.
+# allow_plaintext = false

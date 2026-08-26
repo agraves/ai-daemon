@@ -34,6 +34,8 @@ COPY --chown=builder crates/ai-daemon-proto/Cargo.toml crates/ai-daemon-proto/
 COPY --chown=builder crates/ai-daemon/Cargo.toml crates/ai-daemon/
 COPY --chown=builder crates/ai-daemon-backend-mock/Cargo.toml crates/ai-daemon-backend-mock/
 COPY --chown=builder crates/ai-daemon-backend-llamacpp/Cargo.toml crates/ai-daemon-backend-llamacpp/
+COPY --chown=builder crates/ai-daemon-backend-remote/Cargo.toml crates/ai-daemon-backend-remote/
+COPY --chown=builder crates/ai-daemon-portal/Cargo.toml crates/ai-daemon-portal/
 COPY --chown=builder crates/ai-daemon-fetch/Cargo.toml crates/ai-daemon-fetch/
 COPY --chown=builder crates/ai-daemon-decode/Cargo.toml crates/ai-daemon-decode/
 COPY --chown=builder crates/ai-daemon-shim/Cargo.toml crates/ai-daemon-shim/
@@ -41,7 +43,8 @@ COPY --chown=builder crates/aidctl/Cargo.toml crates/aidctl/
 RUN set -eu; \
     for d in crates/*/; do mkdir -p "$d/src"; done; \
     echo 'pub fn placeholder() {}' > crates/ai-daemon-proto/src/lib.rs; \
-    for c in ai-daemon ai-daemon-backend-mock ai-daemon-backend-llamacpp \
+    for c in ai-daemon ai-daemon-backend-mock ai-daemon-backend-llamacpp ai-daemon-backend-remote \
+             ai-daemon-portal \
              ai-daemon-fetch ai-daemon-decode ai-daemon-shim aidctl; do \
         echo 'fn main() {}' > "crates/$c/src/main.rs"; \
     done; \
@@ -122,7 +125,12 @@ RUN getent passwd ai-daemon && getent group ai
 # a test tool, and shipping one in the daemon's package would be shipping a
 # thing nobody asked for.
 COPY packaging/verify/make-png.rs /tmp/make-png.rs
+# And a stand-in for somebody else's inference service, so the remote provider
+# has something to be remote *to*. Nothing in this build has a network, and a
+# test that spends money on a real endpoint is not a test.
+COPY packaging/verify/stub-endpoint.rs /tmp/stub-endpoint.rs
 RUN rustc -O -o /usr/local/bin/make-png /tmp/make-png.rs && rm /tmp/make-png.rs \
+ && rustc -O -o /usr/local/bin/stub-endpoint /tmp/stub-endpoint.rs && rm /tmp/stub-endpoint.rs \
  && pacman -Rns --noconfirm rust && pacman -Scc --noconfirm
 
 COPY packaging/verify/run.sh /usr/local/bin/verify

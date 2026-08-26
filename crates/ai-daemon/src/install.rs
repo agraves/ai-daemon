@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use ai_daemon_proto::manifest::{Manifest, Requirements};
+use ai_daemon_proto::manifest::{Manifest, Requirements, REMOTE_FORMAT};
 use serde::Deserialize;
 
 use crate::state::Daemon;
@@ -60,6 +60,12 @@ pub fn install(
 ) -> Result<String, String> {
     if name.is_empty() || !name.chars().all(is_name_char) || name.starts_with('.') {
         return Err(format!("{name:?} is not usable as a model name"));
+    }
+    // A model that lives on somebody else's machine. Handled before anything
+    // else because every step below — fetch, hash, verify, move into the
+    // content-addressed store — is about bytes, and there are none.
+    if let Some(endpoint_model) = source.strip_prefix("remote:") {
+        return install_remote(daemon, endpoint_model, name, options);
     }
     if !digest.starts_with("sha256:") {
         return Err("a sha256 digest is required; installing unverified weights is not offered".into());
@@ -123,6 +129,67 @@ pub fn install(
         source: source.to_string(),
     };
     let installed = daemon.registry.accept_staged(&landed, manifest, digest)?;
+    Ok(installed.name)
+}
+
+/// Register a model served by a remote provider.
+///
+/// Nothing is downloaded and nothing is verified, because there is nothing
+/// here to verify — the integrity of a remote model is the endpoint's promise,
+/// not this machine's measurement, and pretending otherwise by manufacturing a
+/// digest would be worse than saying so. What the daemon *can* guarantee is
+/// that the user is told: the backend serving this declares `local: false`,
+/// which reaches the consent prompt, `GetInfo`, and every audit record.
+fn install_remote(
+    daemon: &Daemon,
+    endpoint_model: &str,
+    name: &str,
+    options: Options,
+) -> Result<String, String> {
+    if endpoint_model.is_empty() || !endpoint_model.chars().all(|c| is_name_char(c) || c == '/' || c == ':') {
+        return Err(format!("{endpoint_model:?} is not usable as a remote model identifier"));
+    }
+    if let Some(format) = &options.format {
+        if format != REMOTE_FORMAT {
+            return Err(format!(
+                "a remote: source is format {REMOTE_FORMAT:?}, not {format:?}"
+            ));
+        }
+    }
+    // Must resolve to a backend that is actually configured, and it must be a
+    // remote one. Otherwise the model installs cleanly and fails at first use,
+    // which is the worst place to learn the endpoint was never wired up.
+    let asked = options.backend.clone().unwrap_or_default();
+    let serving = daemon.backends.remote_provider(&asked).ok_or_else(|| {
+        if asked.is_empty() {
+            "no remote provider is configured; a remote: model needs a backend with a connect \
+             socket (see /etc/ai-daemon/remote.toml)"
+                .to_string()
+        } else {
+            format!("backend {asked:?} is not a configured remote provider")
+        }
+    })?;
+
+    let manifest = Manifest {
+        name: name.to_string(),
+        // Not a hash and not shaped like one. See Manifest::digest.
+        digest: format!("remote:{endpoint_model}"),
+        format: REMOTE_FORMAT.to_string(),
+        quantization: String::new(),
+        license: options.license.unwrap_or_default(),
+        // No weights, so no weight bytes and no VRAM on this machine. Leaving
+        // these zero is what keeps the scheduler from reserving budget for a
+        // model that occupies none of it.
+        requirements: Requirements::default(),
+        template: Default::default(),
+        backend: serving.clone(),
+        capabilities: options.capabilities.unwrap_or_else(|| vec!["generate".into()]),
+        source: format!("remote:{endpoint_model}"),
+    };
+    warn!(
+        "install: {name} is served by {serving} and is NOT local — prompts sent to it leave this machine"
+    );
+    let installed = daemon.registry.register_remote(manifest)?;
     Ok(installed.name)
 }
 

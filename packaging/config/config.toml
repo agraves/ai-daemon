@@ -16,6 +16,18 @@ libexec_dir = "/usr/lib/ai-daemon"
 idle_exit_seconds = 900
 model_idle_unload_seconds = 600
 
+# How long a backend may say nothing at all before the daemon gives up on the
+# request and tells the client the backend failed. The outer net for a backend
+# that has stopped answering without closing its socket — a session waiting on
+# one of those waits for ever, holding a decode slot nobody can reclaim.
+#
+# Time the daemon spent holding the request *paused* does not count against
+# this: preemption silences background work by design, and treating that as a
+# dead backend would kill the workload preemption exists to protect. Raise it
+# if a first token on a cold, large model on a slow disk legitimately takes
+# longer than this.
+backend_silence_seconds = 900
+
 [policy]
 # polkit | deny | allow
 #
@@ -39,6 +51,31 @@ gate_group = "ai"
 # the executable, because a daemon running as its own user cannot read
 # another user's /proc/<pid>/exe — an exe check would never pass.
 shim_user = "ai-daemon-shim"
+
+# Who may say "I am calling on behalf of application X". Matched as a prefix
+# against the caller's systemd unit, and against its executable name where
+# that can be read. Only a sandboxed app has a forgeable-by-nobody identity,
+# and only a process outside the sandbox can read it, so somebody has to be
+# trusted to carry it — this is the list of who.
+#
+# Adding a name here grants that process the right to name any application it
+# likes. Emptying the list turns portal identity off, which is the right
+# setting for a machine with no desktop session.
+# Exact unit names, never prefixes. A prefix would be tidier — the desktop
+# variants below differ only by a suffix — and it would also mean any user
+# could write ~/.config/systemd/user/xdg-desktop-portal-anything.service and
+# be believed about every application on the machine.
+portal_units = [
+  "xdg-desktop-portal",
+  "xdg-desktop-portal-gtk",
+  "xdg-desktop-portal-gnome",
+  "xdg-desktop-portal-kde",
+  "xdg-desktop-portal-lxqt",
+  "xdg-desktop-portal-wlr",
+  "xdg-desktop-portal-hyprland",
+  "ai-daemon-portal",
+]
+
 max_context = 8192
 max_sessions = 4
 tokens_per_minute = 12000
@@ -95,3 +132,10 @@ enabled = true
 # max_context = 4096
 # tokens_per_minute = 3000
 # allowed_models = ["default", "fast"]
+
+# There is no [[backend]] here for the remote provider, deliberately.
+#
+# Adding one is how prompts start leaving this machine, so it is an act an
+# administrator performs rather than a line a package ships commented out and
+# somebody uncomments without reading. /usr/share/doc/ai-daemon/remote.toml.example
+# has the two lines and what they mean.

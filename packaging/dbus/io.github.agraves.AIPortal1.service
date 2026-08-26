@@ -1,0 +1,6 @@
+# Session-bus activation. An app's first call starts the portal; there is no
+# reason for it to be running on a machine where nothing has asked.
+[D-BUS Service]
+Name=io.github.agraves.AIPortal1
+Exec=/usr/lib/ai-daemon/ai-daemon-portal
+SystemdService=ai-daemon-portal.service

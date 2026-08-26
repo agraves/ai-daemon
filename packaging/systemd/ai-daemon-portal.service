@@ -1,0 +1,50 @@
+# The portal, in the user's session.
+#
+# A *user* unit, not a system one, and that is the whole architecture in one
+# line: it has to run as the person whose apps it speaks for, because
+# /proc/<pid>/root for their processes is readable by them and by root and by
+# nobody else. The daemon runs as its own uid and therefore cannot do this
+# itself — it has to be told, and then decide whether to believe the teller.
+#
+# What makes it believable from the daemon's side is this unit's name. The
+# daemon reads the caller's cgroup, which is world-readable and is not
+# something a process can choose for itself, and checks it against
+# policy.portal_units. Rename this unit and the daemon stops trusting it,
+# which is the correct direction for that mistake to fail in.
+
+[Unit]
+Description=ai-daemon portal (app identity for sandboxed apps)
+Documentation=https://github.com/agraves/ai-daemon
+PartOf=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/ai-daemon/ai-daemon-portal
+Restart=on-failure
+RestartSec=5
+# It reads other processes' /proc entries in this user's session, and needs
+# nothing else at all: no state, no network, no devices.
+PrivateNetwork=yes
+PrivateDevices=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectHome=read-only
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# ProcSubset=pid is deliberately NOT set, and ProtectProc is left alone: the
+# entire job of this process is reading other processes' /proc entries. It is
+# the one place in this project where hiding /proc would break the feature
+# rather than protect anything — it runs as the user whose processes they are,
+# so it can see nothing they could not already see.
+
+[Install]
+WantedBy=graphical-session.target

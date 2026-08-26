@@ -1,0 +1,94 @@
+# A provider that is not on this machine, and the second unit with a network.
+#
+# Every other backend is a child of the daemon, spawned over a socketpair and
+# gone when the daemon is. This one cannot be, and the reason is the same
+# setting that makes §9's claim worth anything: `ai-daemon` runs with
+# `PrivateNetwork=yes`, so a backend it forks lands in a namespace with no
+# route to anywhere. There is no flag that lets a child opt back out — that is
+# the point of a namespace.
+#
+# So it is its own unit, with its own user and its own network, and the daemon
+# reaches it through a socket at /run/ai-daemon-remote/remote.sock. Read the trade
+# honestly:
+#
+#   * `ai-daemon` still has no network, and still holds every prompt. That
+#     claim is unchanged.
+#   * This process has a network AND sees the prompts it is asked to serve.
+#     That is not a weakening of the design, it is what a remote provider IS:
+#     sending the prompt to somebody else is the entire feature. It sees only
+#     what is routed to it — a session on a local model never comes near it.
+#   * It cannot read the model store, the grant table, or the audit log. Same
+#     `TemporaryFileSystem=` treatment as the fetch helper, for the same reason
+#     and after the same mistake: this unit runs as its own uid, but a
+#     read-only /var is no obstacle to reading, and the one process that can
+#     reach the internet is the last one that should be able to.
+#
+# Off unless configured. With no /etc/ai-daemon/remote.toml it declares no
+# models and no capabilities, and the daemon routes around it.
+
+[Unit]
+Description=ai-daemon remote provider backend
+Documentation=https://github.com/agraves/ai-daemon
+# Nothing to do without an endpoint, and starting anyway would leave a socket
+# that accepts connections and can serve none of them.
+ConditionPathExists=/etc/ai-daemon/remote.toml
+
+[Service]
+Type=exec
+# Its own uid, so a compromise here is not a compromise of the daemon. Group
+# ai-daemon because the socket has to be reachable by exactly one process on
+# this machine and a Unix group is how that is said: the socket is 0660
+# ai-daemon-remote:ai-daemon, so the daemon may connect and nobody else may.
+# An API key anyone could spend is an API key anyone will.
+User=ai-daemon-remote
+Group=ai-daemon
+UMask=0007
+# Its own directory rather than the daemon's /run/ai-daemon. That one holds
+# every live session's socket, and a uid that can create files there can
+# unlink them — which is a denial of service handed to the one process on the
+# machine with a route to the internet. systemd creates this 0750
+# ai-daemon-remote:ai-daemon: the daemon's group may traverse and connect, and
+# nothing else may look.
+RuntimeDirectory=ai-daemon-remote
+RuntimeDirectoryMode=0750
+ExecStart=/usr/lib/ai-daemon/backends/ai-daemon-backend-remote \
+    --config /etc/ai-daemon/remote.toml \
+    --socket /run/ai-daemon-remote/remote.sock
+Restart=on-failure
+RestartSec=5
+
+# The point of the unit.
+PrivateNetwork=no
+
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+# The state directory replaced by an empty tmpfs, and nothing bound back in:
+# unlike the fetch helper this unit has no directory under there to write, so
+# the model store, the grants and the audit log are simply not present. /run is
+# separate and is where the socket lives.
+TemporaryFileSystem=/var/lib/ai-daemon
+# The key is read at startup and held in memory. Nothing else here needs /etc.
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+# Excludes @debug, so this unit cannot ptrace the daemon even though the daemon
+# is the only thing it talks to locally.
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

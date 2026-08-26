@@ -1,0 +1,11 @@
+[package]
+name = "ai-daemon-portal"
+description = "Session-bus portal for ai-daemon: turns a sandboxed app's confinement into an app identity the daemon can trust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+zbus.workspace = true

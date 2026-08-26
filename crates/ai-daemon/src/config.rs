@@ -42,6 +42,18 @@ pub struct Daemon {
     /// Where `ai-daemon-fetch` and `ai-daemon-decode` live. Separate from
     /// `$PATH` on purpose: these are private helpers, not commands.
     pub libexec_dir: PathBuf,
+    /// How long a backend may say nothing at all before the daemon gives up on
+    /// the request (§7). The outer net for a backend that has stopped existing
+    /// in every way except closing its socket.
+    ///
+    /// Time the daemon itself spent holding the request paused does not count
+    /// against it — see `session::wait_for_event`, which is where that
+    /// distinction is made and where getting it wrong killed healthy work.
+    ///
+    /// Configurable because it is a number, not a law: a first token on a
+    /// cold, large model on a slow disk is a real reason to raise it, and the
+    /// verification lowers it so a test can reach it in seconds.
+    pub backend_silence_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,12 +86,50 @@ pub struct Policy {
     /// as its own user cannot read another user's `/proc/<pid>/exe`, so an
     /// exe check would be a check that quietly never passes.
     pub shim_user: String,
+    /// Which callers may assert an application identity for somebody else.
+    ///
+    /// Matched as a prefix against the caller's systemd unit, and against its
+    /// executable name where that is readable. A short list rather than a
+    /// single hardcoded name because there are two implementations of the same
+    /// job — xdg-desktop-portal once `org.freedesktop.portal.AI` is accepted
+    /// upstream, and `ai-daemon-portal` until then — and because a distro that
+    /// ships a third has somewhere to say so that is not a patch.
+    ///
+    /// Emptying this list turns portal identity off entirely, which is a
+    /// reasonable thing for a machine with no desktop to do. Adding to it is
+    /// granting a process the right to name any app it likes, so it is an
+    /// administrator's decision and lives beside `shim_user` for the same
+    /// reason.
+    pub portal_units: Vec<String>,
     pub max_context: u32,
     pub max_sessions: u32,
     pub tokens_per_minute: u64,
     /// Model names, or `*`. Checked after alias resolution, so a policy cannot
     /// be dodged by asking for `default`.
     pub allowed_models: Vec<String>,
+}
+
+/// Who may speak for an application, out of the box.
+///
+/// Exact unit names, not prefixes. A prefix would be tidier — the desktop
+/// variants differ only by a suffix — and it would also mean any user could
+/// write `~/.config/systemd/user/xdg-desktop-portal-anything.service` and be
+/// believed about every application on the machine. So the variants are
+/// listed one by one, and a distro that ships another says so in config.
+pub fn default_portal_units() -> Vec<String> {
+    [
+        "xdg-desktop-portal",
+        "xdg-desktop-portal-gtk",
+        "xdg-desktop-portal-gnome",
+        "xdg-desktop-portal-kde",
+        "xdg-desktop-portal-lxqt",
+        "xdg-desktop-portal-wlr",
+        "xdg-desktop-portal-hyprland",
+        "ai-daemon-portal",
+    ]
+    .iter()
+    .map(|name| name.to_string())
+    .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -119,7 +169,19 @@ pub struct Attachments {
 #[serde(deny_unknown_fields)]
 pub struct Backend {
     pub name: String,
+    /// Spawn this. The usual case: the backend is a child of the daemon and
+    /// dies with it.
+    #[serde(default)]
     pub exec: PathBuf,
+    /// Or connect here instead.
+    ///
+    /// A backend that needs a network cannot be a child of this daemon —
+    /// `PrivateNetwork=yes` means anything it forks has no network at all, by
+    /// design (§9). So a remote provider runs as its own unit, with its own
+    /// user and its own network, and the daemon reaches it over a socket
+    /// rather than owning it. Exactly one of `exec` and `connect` may be set.
+    #[serde(default)]
+    pub connect: Option<PathBuf>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default = "yes")]
@@ -157,6 +219,7 @@ impl Default for Daemon {
             idle_exit_seconds: 900,
             model_idle_unload_seconds: 600,
             libexec_dir: PathBuf::from("/usr/lib/ai-daemon"),
+            backend_silence_seconds: 900,
         }
     }
 }
@@ -167,6 +230,7 @@ impl Default for Policy {
             consent: Consent::Polkit,
             gate_group: "ai".to_string(),
             shim_user: "ai-daemon-shim".to_string(),
+            portal_units: default_portal_units(),
             max_context: 8192,
             max_sessions: 4,
             tokens_per_minute: 12_000,
@@ -250,6 +314,35 @@ impl Config {
         let ceiling = ai_daemon_proto::frame::MAX_ATTACHMENT_PAYLOAD;
         // Worst case per attachment: RGBA is four bytes a pixel, PCM is four
         // bytes a sample.
+        for backend in &self.backends {
+            let named = !backend.exec.as_os_str().is_empty();
+            match (named, backend.connect.is_some()) {
+                (false, false) => {
+                    return Err(format!(
+                        "backend {:?} says neither exec nor connect, so there is nothing to talk to",
+                        backend.name
+                    ))
+                }
+                (true, true) => {
+                    return Err(format!(
+                        "backend {:?} says both exec and connect; it is one or the other",
+                        backend.name
+                    ))
+                }
+                _ => {}
+            }
+            // Neither reaches a process the daemon did not start. Refused
+            // rather than ignored: a setting that silently does nothing is
+            // how an administrator comes to believe an environment variable
+            // selected a device.
+            if backend.connect.is_some() && (!backend.args.is_empty() || !backend.env.is_empty()) {
+                return Err(format!(
+                    "backend {:?} sets args or env alongside connect, and neither can apply to a \
+                     process this daemon does not start",
+                    backend.name
+                ));
+            }
+        }
         let widest_image = self.attachments.max_pixels.saturating_mul(4);
         if widest_image > ceiling {
             return Err(format!(
@@ -355,6 +448,45 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn backend_toml(body: &str) -> Result<Config, String> {
+        let text = format!("[[backend]]\nname = \"x\"\n{body}");
+        toml::from_str::<Config>(&text)
+            .map_err(|e| e.to_string())
+            .and_then(|config| config.validate().map(|()| config))
+    }
+
+    /// The two ways of reaching a backend are alternatives, not a pair. A spec
+    /// with both is a spec whose author expected one of them to matter and
+    /// cannot be told which.
+    #[test]
+    fn a_backend_says_exec_or_connect_and_not_both() {
+        assert!(backend_toml("exec = \"/bin/true\"\n").is_ok());
+        assert!(backend_toml("connect = \"/run/x.sock\"\n").is_ok());
+
+        let both = backend_toml("exec = \"/bin/true\"\nconnect = \"/run/x.sock\"\n")
+            .expect_err("both should be refused");
+        assert!(both.contains("one or the other"), "unhelpful: {both}");
+
+        let neither = backend_toml("").expect_err("neither should be refused");
+        assert!(neither.contains("nothing to talk to"), "unhelpful: {neither}");
+    }
+
+    /// Refused rather than ignored. A setting that silently does nothing is
+    /// how an administrator comes to believe an environment variable selected
+    /// a device.
+    #[test]
+    fn args_and_env_are_refused_beside_connect() {
+        let with_env = backend_toml(
+            "connect = \"/run/x.sock\"\nenv = { CUDA_VISIBLE_DEVICES = \"1\" }\n",
+        )
+        .expect_err("env should be refused");
+        assert!(with_env.contains("does not start"), "unhelpful: {with_env}");
+
+        let with_args = backend_toml("connect = \"/run/x.sock\"\nargs = [\"--gpu\"]\n")
+            .expect_err("args should be refused");
+        assert!(with_args.contains("does not start"), "unhelpful: {with_args}");
+    }
 
     #[test]
     fn an_absent_config_still_produces_a_closed_service() {

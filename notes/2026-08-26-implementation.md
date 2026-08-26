@@ -172,21 +172,136 @@ fix is not findable from the log at all. Anyone bisecting to `b35f10e` will
 read about decoders while looking at a scheduler diff. Search for
 `reserve_kv` or for this file instead.
 
+## The four that were deferred, and now are not
+
+The list below this one used to open with four items. They were built in two
+passes after the first landing; what follows is what each one turned out to
+cost, because in three of the four the interesting part was not the feature.
+
+**Media output, parallel tool calls, and logit control** needed somewhere on
+the wire to live, so the data plane and the provider protocol went to v2 —
+both still serving v1. A version is negotiated in the hello and the newer side
+sends nothing the older one cannot read: a v1 client offered two tool calls
+gets one, because it has no frame in which to answer two and dropping the rest
+silently is worse than not offering them.
+
+Building them found two bugs in code that was already landed, both mine:
+
+- `reader_loop` routed backend events by `req_id` with a `_ => None`
+  catch-all, so the two new event kinds compiled cleanly and went to the
+  *control* channel — neither delivered to the request that asked nor
+  recognised by the load waiting there. The match is exhaustive now, with the
+  reason written at it, so the next variant does not build until somebody has
+  decided which channel it is on. Same shape as the control-plane correlation
+  bug the monitor found earlier; the lesson did not generalise the first time
+  because the fix was to the *sending* side.
+- Three `events.recv()` calls had no timeout. A backend request thread that
+  dies without sending `done` leaves the process alive, so nothing closes the
+  channel and the session hangs for good holding a decode slot. All three are
+  bounded now and say which of silence or disconnection happened.
+
+The bound was then wrong in a way the monitor caught and I had not: it ran
+while the request was *paused*, and pausing is the daemon's own doing. §8
+pauses every background request whenever any interactive one is running and
+resumes only when none is left, so on a busy desktop a batch job sits silent
+past the whole window without a gap — and the net for a dead backend would
+kill the exact workload preemption exists to protect, throwing away the tokens
+already generated and making the retry re-spend the prompt. The window is
+accumulated in slices now and a paused slice does not count. It does not
+*reset* the count either: a backend that died while being paused and resumed
+around it would otherwise evade the net for ever, and the question being asked
+is how long it has been silent while free to speak. The slicing also means the
+cancel flag is re-read every few seconds instead of at the far end of a
+quarter-hour wait. The window is `daemon.backend_silence_seconds` because a
+test cannot wait out fifteen minutes.
+
+**The remote provider** is the one that changed an architectural assumption.
+Every other backend is a child of the daemon over a socketpair, and a remote
+one cannot be: `PrivateNetwork=yes` means anything the daemon forks has no
+route anywhere, and that is the setting the whole of §9 rests on. So backends
+gained a second transport — `connect` instead of `exec` — and the remote
+provider is its own unit with its own uid, its own runtime directory and a
+network the daemon does not have.
+
+Worth being exact about what that does to §9's claim. "The process that holds
+every prompt has no network" is still true of `ai-daemon`. It is not true of
+the machine once a remote provider is configured, because that process has
+both — which is what a remote provider *is*, and why turning one on is a
+deliberate act, why it sees only what is routed to it, and why every session
+it serves reports `local: false` in the consent prompt, the session and the
+audit record. Nothing the package installs turns it on.
+
+Two smaller things fell out of it. A model with no weights has nothing to
+hash, so `aidctl install --source remote:<id>` asks for no digest and
+manufactures none; its manifest identifier reads `remote:<id>` rather than
+wearing a `sha256:` prefix it could not honour, and offering `--digest`
+anyway is refused rather than ignored. And `shutdown()` no longer sends
+`Shutdown` to a backend the daemon merely dialled: that is a service it does
+not own and the daemon idling out is not a reason for it to die.
+
+**The portal** runs as the user, on the session bus, because
+`/proc/<pid>/root/.flatpak-info` is readable by the owner of that process and
+the daemon is a different uid — the daemon *cannot* do this itself, which is
+the whole reason a separate process exists. It reads the confinement for a pid
+the bus vouched for, never one a message body claimed, and re-reads the
+process start time afterwards so a recycled pid cannot substitute itself
+mid-read. A caller it cannot identify is refused rather than passed through:
+lending it the portal's own identity would label every unsandboxed app on the
+machine as the portal and make them share one grant.
+
+It also found a real hole in the daemon's side, which had been there since the
+first commit. The check on who may assert an app identity was
+`unit.starts_with("xdg-desktop-portal")`, chosen because desktops ship
+`-gtk`, `-gnome` and `-kde` variants. An unprivileged user can write
+`~/.config/systemd/user/xdg-desktop-portal-anything.service`, and everything
+they started under it would have been believed when it claimed to be any
+application on the machine. It is exact names now, the variants listed one by
+one, in a config key an administrator can extend or empty.
+
+Two things the container cannot show, both named where they happen:
+
+- **The portal-to-daemon assertion end to end.** The daemon identifies a
+  portal by the caller's systemd unit, read from `/proc/<pid>/cgroup` because
+  that is world-readable and not self-chosen. This box has no systemd and a
+  read-only cgroupfs, so nothing can be placed in a cgroup named after a unit
+  and the daemon sees a caller with no unit at all — and refuses, correctly.
+  The other two routes are closed for good reasons: `/proc/<pid>/exe` is
+  unreadable across uids and the portal must run as the user. So the
+  verification proves the portal's own half in full, proves the daemon's
+  refusal, and covers the daemon's acceptance with unit tests over the same
+  function the D-Bus path calls.
+- **A real sandbox.** `.flatpak-info` is placed at the container root rather
+  than in a mount namespace, which exercises the read and the parse and not
+  the isolation — that part is flatpak's to provide. Which section of the file
+  counts, and which AppArmor labels are refused, are unit tests.
+
+And one thing that is implemented but weaker than the headline: tool calling
+through a remote provider is not grammar-constrained, because constrained
+decoding needs the logits and those are on somebody else's machine. The
+endpoint does its own function calling instead. Refusing tools outright on
+that basis would rule out every hosted provider over a mechanism they replace
+rather than lack — so the daemon allows it, advertises `grammar` in the
+session's capabilities exactly when it is what happened, and checks every call
+that comes back against the tools the client actually offered. That check runs
+on the grammar path too, where it is free.
+
 ## What is not implemented
 
 Stated plainly rather than left to be discovered:
 
-- **The portal itself.** §13's `org.freedesktop.portal.AI` is published as a
-  proposal in `packaging/portal/` and is not installed anywhere. What exists is
-  the daemon's side of the contract: it accepts an app identity asserted over
-  its own API, but only from a caller that is actually xdg-desktop-portal, and
-  marks the session as the only strong app identity available. Writing the
-  portal backend is a separate piece of work in a separate repository.
-- **Remote providers.** The `local` flag is threaded through the backend
-  protocol, session info, consent metadata and the audit record, and the
-  daemon never substitutes remote for local. No remote backend exists.
-- **Media output.** Deferred by §11. Frames are typed, so nothing precludes it.
-- **Parallel tool calls, fine-grained logit control.** Deferred by §12.
+- **The freedesktop names.** `org.freedesktop.AI1` and
+  `org.freedesktop.portal.AI` are what this wants to be called and are not
+  what it is called. Both are proposals; the portal interface is implemented
+  and served under `io.github.agraves.AIPortal1`, which is the part review
+  would change. Squatting the name it wants to standardise would poison the
+  review it needs.
+- **`ListModels` through the portal is not narrowed to the asking app.** The
+  daemon filters by caller identity and the caller is the portal, so what
+  comes back is the machine's list. Fixing it means giving that method an
+  options dictionary, which changes its D-Bus signature from `()` to
+  `(a{sv})` and breaks every existing caller — a control-plane version bump,
+  not a patch. `CreateSession` is where a per-app decision is enforced, and
+  always was.
 - **A vendor NPU backend.** The provider protocol was written to be sufficient
   for one — device claims, capability declarations, memory reporting — but
   nobody has written one, so that sufficiency is a claim rather than a
@@ -205,8 +320,9 @@ OpenAI shim. It is deliberately adversarial — a wrong digest, an oversized
 image, a truncated PNG, a user outside the gate, a remote `image_url` — because
 "it generated some text" is the easy half and the refusals are the project.
 
-Ninety-one checks, all passing. Two of them are honest about their limits
-rather than quietly weaker:
+A hundred and eighty-odd checks, all passing. Four of them are honest about
+their limits rather than quietly weaker — the two below, plus the portal's
+cgroup and its sandbox, described in the section above:
 
 - **systemd is absent**, so the run stands in for the init system and only for
   that: the daemon still runs as the packaged user, under the packaged bus

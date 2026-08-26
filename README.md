@@ -35,8 +35,12 @@ That is this.
 ## What it actually does
 
 **Tells its callers apart.** Peer credentials plus the caller's systemd unit
-for native processes, an app id asserted by xdg-desktop-portal for sandboxed
-ones, and the lowest trust class for anything arriving through the HTTP shim.
+for native processes, an application id for sandboxed ones — read out of their
+Flatpak or Snap confinement by `ai-daemon-portal`, which runs in the user's
+session because the daemon cannot read another user's `/proc` — and the
+lowest trust class for anything arriving through the HTTP shim. The daemon
+takes an asserted app id only from a caller on `policy.portal_units`, never
+because a message said so.
 The first request from a new app asks the user through polkit; the answer is
 remembered per (identity, capability) and is revocable. Linux has no
 code-signature check on a peer, so native identity is a good guess rather than
@@ -60,6 +64,16 @@ itself and moves the artifact in. The process that touches prompts cannot
 reach a network and the process that touches the network never sees a prompt.
 This is not configurable off.
 
+**Can still use a provider that is not on this machine, and says so.** A
+remote backend runs as its own unit with its own uid and its own network, and
+the daemon connects to it rather than forking it — because a child of the
+daemon would inherit a namespace with no route anywhere. Everything it serves
+is marked `local: false` in the consent prompt, in the session, and in every
+audit record, and a model it serves carries `remote:<id>` where a local model
+carries a content hash, because there is nothing here to hash. It is off
+unless an administrator writes `/etc/ai-daemon/remote.toml`; the package ships
+an example and no configuration.
+
 **Links no media codecs.** Attachments arrive as raw pixels or PCM, or as
 encoded bytes handed to `ai-daemon-decode`: one child per attachment, seccomp
 confined to read, write, memory and exit. A decoder crash costs one
@@ -69,7 +83,14 @@ attachment.
 so tool calls are well-formed by construction, and the daemon emits a
 `tool_call` frame — inert data. The client executes it. Prompt-injection
 consequences land in the client's sandbox under the client's permissions,
-where the user granted them.
+where the user granted them. A model may ask for several tools at once; the
+turn resumes when the last one has been answered.
+
+**Generates media as well as text**, behind its own capability. A user can let
+an app write text and refuse to let it synthesise a voice, which a permission
+that cannot be withheld on its own does not allow. Results are raw pixels or
+raw PCM: there is no encoder in the daemon, for the same reason there is no
+decoder.
 
 **Logs who, never what.** Identity, model, digest and token counts go to the
 journal and an audit file. Content does not, and there is exactly one module
@@ -117,9 +138,11 @@ text" is the easy half and the refusals are the point.
 | | |
 |---|---|
 | `crates/ai-daemon` | the service: D-Bus control plane, sessions, policy, registry, scheduler |
-| `crates/ai-daemon-proto` | the three wire contracts, frozen at v1 |
+| `crates/ai-daemon-proto` | the three wire contracts; data and provider planes at v2, v1 still served |
 | `crates/ai-daemon-backend-llamacpp` | reference provider backend (GGUF via llama.cpp) |
 | `crates/ai-daemon-backend-mock` | conformance backend: deterministic, no weights, no devices |
+| `crates/ai-daemon-backend-remote` | an OpenAI-compatible endpoint elsewhere; its own unit, its own network |
+| `crates/ai-daemon-portal` | session-bus portal: turns a sandbox into an app identity |
 | `crates/ai-daemon-fetch` | the download helper, and the only thing here with a network |
 | `crates/ai-daemon-decode` | the confined media decoder |
 | `crates/ai-daemon-shim` | OpenAI-compatible localhost endpoint, off by default |
@@ -151,6 +174,13 @@ project's protocol has users.
 
 ## Status
 
-Draft. The protocols are frozen at v1 in the sense that the daemon refuses a
-peer speaking anything else — not in the sense that anyone has agreed to them
-yet. The design record this implements is in `notes/`.
+Draft. The data plane and provider protocol are at v2 and both still serve v1;
+"frozen" means the daemon refuses a peer speaking anything outside that range,
+not that anyone has agreed to them yet. The design record this implements is
+in `notes/`.
+
+Not built: the freedesktop review that would make `org.freedesktop.AI1` and
+`org.freedesktop.portal.AI` real names rather than a proposal and an interim,
+and structured output beyond tool-call grammars. The portal interface is
+implemented and served — under our own bus name, which is the part review
+would change.

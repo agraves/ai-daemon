@@ -35,6 +35,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-daemon-backend-remote"
+version = "0.1.0"
+dependencies = [
+ "ai-daemon-proto",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "ai-daemon-decode"
 version = "0.1.0"
 dependencies = [
@@ -50,6 +60,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "ai-daemon-portal"
+version = "0.1.0"
+dependencies = [
+ "zbus",
 ]
 
 [[package]]

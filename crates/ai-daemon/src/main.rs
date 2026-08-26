@@ -44,6 +44,7 @@ const DEFAULT_CONFIG: &str = "/etc/ai-daemon/config.toml";
 
 fn main() {
     let mut config_path = PathBuf::from(DEFAULT_CONFIG);
+    let mut check_only = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -56,6 +57,15 @@ fn main() {
                 return;
             }
             "--debug" => log::set_debug(true),
+            // Load the configuration, say whether it is coherent, and exit.
+            //
+            // Worth having as a mode rather than as a thing you learn by
+            // starting the daemon: config.toml.d drop-ins mean an
+            // administrator's change and the daemon's reading of it are far
+            // apart, and "systemctl restart, then look at the journal" is a
+            // bad way to find a typo in a file that governs who may talk to
+            // the machine's inference service.
+            "--check-config" => check_only = true,
             "--config" => match args.next() {
                 Some(path) => config_path = PathBuf::from(path),
                 None => fatal("--config needs a path"),
@@ -71,6 +81,16 @@ fn main() {
         Ok(config) => config,
         Err(e) => fatal(&format!("configuration: {e}")),
     };
+    if check_only {
+        println!(
+            "{} is usable: {} backend(s), {} identity rule(s), consent {:?}",
+            config_path.display(),
+            config.backends.iter().filter(|b| b.enabled).count(),
+            config.identities.len(),
+            config.policy.consent
+        );
+        return;
+    }
 
     info!(
         "ai-daemon {} starting: state {}, {} backend(s) configured, consent {:?}",
@@ -118,9 +138,10 @@ fn print_help() {
     println!(
         "ai-daemon {} — a system inference service for desktop Linux
 
-usage: ai-daemon [--config PATH] [--debug]
+usage: ai-daemon [--config PATH] [--debug] [--check-config]
 
   --config PATH   configuration file (default {DEFAULT_CONFIG})
+  --check-config  load it, report what it says, exit without serving
   --debug         log at debug priority; also AI_DAEMON_DEBUG=1
   --version       print the version and exit
 

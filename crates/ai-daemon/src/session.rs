@@ -15,7 +15,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use ai_daemon_proto::backend::{BackendEvent, BackendRequest, RawAttachment};
 use ai_daemon_proto::frame::{
     self, AttachKind, AttachMeta, Event, Frame, MediaKind, MediaOut, Message, Params, Request,
-    SessionInfo, ToolResultItem, ToolSchema, Usage,
+    SessionInfo, ToolCall, ToolResultItem, ToolSchema, Usage,
 };
 use ai_daemon_proto::DATA_PROTO;
 
@@ -39,15 +39,99 @@ use crate::state::{Daemon, Session};
 /// backend that has stopped existing in every way except closing its socket.
 const BACKEND_SILENCE_TIMEOUT: Duration = Duration::from_secs(900);
 
+/// How often the wait below surfaces to look around.
+///
+/// Small enough that a pause is noticed promptly and a cancel is acted on
+/// within a few seconds rather than at the far end of the silence window;
+/// large enough that a fifteen-minute wait costs a couple of hundred wakeups.
+const SILENCE_SLICE: Duration = Duration::from_secs(5);
+
 /// What to tell the client when the wait ended without an answer.
-fn stalled(backend: &str, reason: std::sync::mpsc::RecvTimeoutError) -> String {
+fn stalled(backend: &str, silence: Duration, reason: std::sync::mpsc::RecvTimeoutError) -> String {
     match reason {
         std::sync::mpsc::RecvTimeoutError::Timeout => format!(
             "backend {backend} went silent for {}s without finishing the request",
-            BACKEND_SILENCE_TIMEOUT.as_secs()
+            silence.as_secs()
         ),
         std::sync::mpsc::RecvTimeoutError::Disconnected => {
             format!("backend {backend} stopped answering")
+        }
+    }
+}
+
+/// Wait for the next backend event, not counting time the daemon itself asked
+/// the backend to stand still.
+///
+/// The silence net exists for a backend that has stopped answering without
+/// closing its socket. A *paused* request also stops answering — that is the
+/// entire meaning of pausing — so a bare `recv_timeout` cannot tell the two
+/// apart, and §8's preemption makes the confusion routine rather than exotic:
+/// every background request is paused whenever any interactive one is running
+/// and stays paused until none is left. Chained chat turns, or the shim
+/// serving a couple of HTTP clients, will hold a batch job still for a long
+/// unbroken stretch. Counting that as silence kills a healthy request that the
+/// daemon itself silenced, throws away the tokens already generated, and makes
+/// the retry re-spend the whole prompt — landing on exactly the workload
+/// preemption exists to protect, and only under the load where preemption is
+/// actually happening.
+///
+/// So the window is accumulated in slices and a paused slice does not count.
+/// It does not *reset* the count either: a backend that died and is being
+/// paused and resumed around would otherwise evade the net forever, and the
+/// question this answers is how long the backend has been silent while it was
+/// free to speak.
+///
+/// `between_slices` runs on every slice that produced nothing, which is where
+/// the callers re-read the cancel flag — so a cancel during a long pause is
+/// acted on then rather than a quarter of an hour later.
+fn wait_for_event(
+    events: &std::sync::mpsc::Receiver<BackendEvent>,
+    silence: Duration,
+    slot: Option<&crate::sched::Slot<'_>>,
+    mut between_slices: impl FnMut(),
+) -> Result<BackendEvent, std::sync::mpsc::RecvTimeoutError> {
+    wait_for_event_with(
+        events,
+        silence,
+        SILENCE_SLICE,
+        &|| slot.is_some_and(crate::sched::Slot::is_paused),
+        &mut between_slices,
+    )
+}
+
+/// The same wait with its slice length and its notion of "paused" supplied.
+///
+/// Split out for the same reason `decode_within` is: the accounting is the
+/// part that was wrong and the part worth testing, and testing it through the
+/// real clock and a real scheduler would mean a test that takes fifteen
+/// minutes to fail.
+fn wait_for_event_with(
+    events: &std::sync::mpsc::Receiver<BackendEvent>,
+    silence: Duration,
+    slice_len: Duration,
+    paused: &dyn Fn() -> bool,
+    between_slices: &mut dyn FnMut(),
+) -> Result<BackendEvent, std::sync::mpsc::RecvTimeoutError> {
+    let mut silent_for = Duration::ZERO;
+    loop {
+        // Never zero: a zero-length recv_timeout is a busy loop.
+        let slice = slice_len
+            .min(silence.saturating_sub(silent_for))
+            .max(Duration::from_millis(1));
+        match events.recv_timeout(slice) {
+            Ok(event) => return Ok(event),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if !paused() {
+                    silent_for = silent_for.saturating_add(slice);
+                    if silent_for >= silence {
+                        return Err(std::sync::mpsc::RecvTimeoutError::Timeout);
+                    }
+                }
+                between_slices();
+            }
         }
     }
 }
@@ -545,6 +629,52 @@ impl Worker {
     // Generation
     // -----------------------------------------------------------------------
 
+    /// A tool call has to be one of the tools the client offered.
+    ///
+    /// With a grammar this is true by construction and the check costs
+    /// nothing. Without one — a hosted endpoint doing its own function
+    /// calling — it is the only thing standing between a model that invented
+    /// a tool name and a client that dispatches on it. Clients written
+    /// against the grammar-backed path are entitled to assume it, so the
+    /// daemon enforces it on every path rather than documenting a difference
+    /// and hoping.
+    ///
+    /// Arguments must parse as JSON for the same reason: the frame says
+    /// `arguments` is JSON, and a client that does `json.loads` on it should
+    /// not be the one to find out otherwise.
+    fn calls_are_ones_we_offered(&self, calls: &[ToolCall]) -> Result<(), String> {
+        let Some(offered) = &self.tools else {
+            return Err(format!(
+                "backend {} sent a tool call for a turn that offered no tools",
+                self.session.backend
+            ));
+        };
+        for call in calls {
+            if !offered.iter().any(|tool| tool.name == call.name) {
+                return Err(format!(
+                    "backend {} called {:?}, which this turn did not offer",
+                    self.session.backend, call.name
+                ));
+            }
+            if serde_json::from_str::<serde_json::Value>(&call.arguments).is_err() {
+                return Err(format!(
+                    "backend {} sent arguments for {:?} that are not JSON",
+                    self.session.backend, call.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The configured silence window, or the shipped one if the number is
+    /// nonsense. Zero would mean "give up immediately", which nobody means.
+    fn backend_silence(&self) -> Duration {
+        match self.daemon.config.daemon.backend_silence_seconds {
+            0 => BACKEND_SILENCE_TIMEOUT,
+            seconds => Duration::from_secs(seconds),
+        }
+    }
+
     fn session_capabilities(&self) -> Vec<String> {
         let mut caps = Vec::new();
         if let Ok(backend) = self.daemon.backends.get(&self.session.backend) {
@@ -575,31 +705,50 @@ impl Worker {
         // permits free text would silently defeat that.
         let mut effective_grammar = self.grammar.clone();
         if let Some(tools) = &self.tools {
-            if !backend.can("grammar") || !backend.can("tools") {
+            if !backend.can("tools") {
                 self.send(&Event::error(
                     "attachment-unsupported",
-                    format!(
-                        "backend {} does not offer constrained tool calling",
-                        backend.name
-                    ),
+                    format!("backend {} does not offer tool calling", backend.name),
                 ));
                 return;
             }
-            match grammar::compile(tools) {
-                Ok(compiled) => {
-                    debug!(
-                        "session {}: constrained decoding to {} tool(s) [{}]{}",
-                        self.session.id,
-                        compiled.names.len(),
-                        compiled.names.join(", "),
-                        if compiled.widened { " (schema partly widened)" } else { "" }
-                    );
-                    effective_grammar = Some(compiled.gbnf);
+            // Grammar-constrained decoding needs the logits, so only a backend
+            // running the model can offer it. A remote endpoint does its own
+            // function calling instead and never shows anyone a logit — which
+            // is a weaker guarantee, not an absent one, and refusing tools
+            // outright on that basis would rule out every hosted provider on
+            // the strength of a mechanism they replace rather than lack.
+            //
+            // The difference is not hidden: `grammar` is in the session's
+            // advertised capabilities exactly when it is what happened, so a
+            // client that depends on well-formedness by construction can look
+            // before it asks. And the check below is what keeps the weaker
+            // path from being a hole: whatever comes back is matched against
+            // the tools the client actually offered.
+            if backend.can("grammar") {
+                match grammar::compile(tools) {
+                    Ok(compiled) => {
+                        debug!(
+                            "session {}: constrained decoding to {} tool(s) [{}]{}",
+                            self.session.id,
+                            compiled.names.len(),
+                            compiled.names.join(", "),
+                            if compiled.widened { " (schema partly widened)" } else { "" }
+                        );
+                        effective_grammar = Some(compiled.gbnf);
+                    }
+                    Err(e) => {
+                        self.send(&Event::error("protocol", format!("tool schema: {e}")));
+                        return;
+                    }
                 }
-                Err(e) => {
-                    self.send(&Event::error("protocol", format!("tool schema: {e}")));
-                    return;
-                }
+            } else {
+                debug!(
+                    "session {}: {} does the shaping; {} tool(s) travel as schemas",
+                    self.session.id,
+                    backend.name,
+                    tools.len()
+                );
             }
         }
 
@@ -740,6 +889,7 @@ impl Worker {
         let mut usage = Usage { attachment_tokens, ..Usage::default() };
         let mut emitted_tool_call = false;
         let mut cancel_sent = false;
+        let silence = self.backend_silence();
         loop {
             // The flag's reader. The reading thread cancels the backend
             // directly when it can, but a cancel that lands between `begin`
@@ -750,7 +900,14 @@ impl Worker {
                 cancel_sent = true;
                 backend.cancel(req_id);
             }
-            match events.recv_timeout(BACKEND_SILENCE_TIMEOUT) {
+            match wait_for_event(&events, silence, Some(&slot), || {
+                // Also on every quiet slice, so a cancel that arrives while
+                // the scheduler is holding this request still is acted on now.
+                if !cancel_sent && self.session.cancelled.load(Ordering::SeqCst) {
+                    cancel_sent = true;
+                    backend.cancel(req_id);
+                }
+            }) {
                 Ok(BackendEvent::Token { tok, logprobs, .. }) => {
                     usage.completion_tokens += 1;
                     slot.charge(&self.session.id, 1);
@@ -762,6 +919,10 @@ impl Worker {
                 Ok(BackendEvent::ToolCalls { tool_calls, .. }) => {
                     // Inert data, several at a time. Same rule as one: the
                     // daemon has no idea what any of these do (§10).
+                    if let Err(e) = self.calls_are_ones_we_offered(&tool_calls) {
+                        self.send(&Event::error("backend-failed", e));
+                        break;
+                    }
                     for call in &tool_calls {
                         self.history.push(Message {
                             role: "assistant".into(),
@@ -780,6 +941,11 @@ impl Worker {
                 Ok(BackendEvent::ToolCall { tool_call, .. }) => {
                     // Inert data. The daemon has no idea what this tool does
                     // and will not find out (§10).
+                    if let Err(e) = self.calls_are_ones_we_offered(std::slice::from_ref(&tool_call))
+                    {
+                        self.send(&Event::error("backend-failed", e));
+                        break;
+                    }
                     self.history.push(Message {
                         role: "assistant".into(),
                         content: format!(
@@ -809,7 +975,10 @@ impl Worker {
                 }
                 Ok(other) => debug!("session {}: ignoring {other:?}", self.session.id),
                 Err(reason) => {
-                    self.send(&Event::error("backend-failed", stalled(&backend.name, reason)));
+                    self.send(&Event::error(
+                        "backend-failed",
+                        stalled(&backend.name, silence, reason),
+                    ));
                     break;
                 }
             }
@@ -882,7 +1051,32 @@ impl Worker {
                 return;
             }
         };
-        let _ = loaded;
+        // Deliberately not reserved against the KV budget, and worth writing
+        // down because it is a hole waiting for a model that fills it.
+        //
+        // §8 budgets KV as bytes-per-token times context length, which is the
+        // right accounting for a generation that grows a cache token by token.
+        // An image model does not: it runs a fixed pipeline and holds no
+        // per-token cache, so reserving `kv_bytes_per_token * max_context`
+        // for it would price a picture like a full-context conversation and
+        // lock out real ones. Every backend that generates media today
+        // reports zero, so reserving nothing and reserving what it said are
+        // the same number.
+        //
+        // The day one reports non-zero, that stops being true and this
+        // becomes the scheduler's blind spot: memory in use that its budget
+        // does not know about, on the one resource that is not
+        // cgroup-controllable. The fix then is to reserve what the backend
+        // says rather than to keep skipping it — the load already returned
+        // the number, which is why it is bound here rather than dropped at
+        // the call.
+        if loaded.kv_bytes_per_token > 0 {
+            warn!(
+                "session {}: {} reports {} KV bytes/token for media, which the \
+                 scheduler is not budgeting — see the note at this line",
+                self.session.id, backend.name, loaded.kv_bytes_per_token
+            );
+        }
 
         // Charged against the same allowance as everything else, estimated
         // from the prompt: a request that produces pictures still costs the
@@ -931,12 +1125,14 @@ impl Worker {
         let mut usage = Usage::default();
         let mut produced = 0u32;
         let mut cancel_sent = false;
+        let silence = self.backend_silence();
         loop {
-            if !cancel_sent && self.session.cancelled.load(Ordering::SeqCst) {
-                cancel_sent = true;
-                backend.cancel(req_id);
-            }
-            match events.recv_timeout(BACKEND_SILENCE_TIMEOUT) {
+            match wait_for_event(&events, silence, Some(&slot), || {
+                if !cancel_sent && self.session.cancelled.load(Ordering::SeqCst) {
+                    cancel_sent = true;
+                    backend.cancel(req_id);
+                }
+            }) {
                 Ok(BackendEvent::Media { kind, w, h, fmt, rate, data, .. }) => {
                     if data.len() as u64 > ai_daemon_proto::frame::MAX_ATTACHMENT_PAYLOAD {
                         self.send(&Event::error(
@@ -986,7 +1182,10 @@ impl Worker {
                 }
                 Ok(other) => debug!("session {}: ignoring {other:?}", self.session.id),
                 Err(reason) => {
-                    self.send(&Event::error("backend-failed", stalled(&backend.name, reason)));
+                    self.send(&Event::error(
+                        "backend-failed",
+                        stalled(&backend.name, silence, reason),
+                    ));
                     break;
                 }
             }
@@ -1039,7 +1238,7 @@ impl Worker {
             return;
         };
         slot.attach(&backend.name, req_id);
-        self.pump_simple(&backend, req_id, events);
+        self.pump_simple(&backend, req_id, events, Some(&slot));
     }
 
     fn tokenize(&self, text: String) {
@@ -1057,7 +1256,9 @@ impl Worker {
             self.send(&Event::error("backend-failed", "could not start a tokenize request"));
             return;
         };
-        self.pump_simple(&backend, req_id, events);
+        // No slot: tokenizing does not go through the scheduler, so there is
+        // nothing that could have paused it.
+        self.pump_simple(&backend, req_id, events, None);
     }
 
     /// Drain a one-shot request that answers with a single value.
@@ -1066,9 +1267,14 @@ impl Worker {
         backend: &Arc<Backend>,
         req_id: u64,
         events: std::sync::mpsc::Receiver<BackendEvent>,
+        // Embeddings hold a scheduler slot and can therefore be paused;
+        // tokenizing does not go through the scheduler at all. Both wait here,
+        // so the slot travels rather than being assumed either way.
+        slot: Option<&crate::sched::Slot<'_>>,
     ) {
+        let silence = self.backend_silence();
         loop {
-            match events.recv_timeout(BACKEND_SILENCE_TIMEOUT) {
+            match wait_for_event(&events, silence, slot, || {}) {
                 Ok(BackendEvent::Vectors { vectors, .. }) => {
                     self.send(&Event::Vectors { vectors });
                 }
@@ -1085,7 +1291,10 @@ impl Worker {
                 }
                 Ok(_) => {}
                 Err(reason) => {
-                    self.send(&Event::error("backend-failed", stalled(&backend.name, reason)));
+                    self.send(&Event::error(
+                        "backend-failed",
+                        stalled(&backend.name, silence, reason),
+                    ));
                     break;
                 }
             }
@@ -1331,5 +1540,143 @@ mod tests {
             data: vec![0; 100],
         };
         assert_eq!(estimate_attachment_tokens(&odd), 0);
+    }
+
+    /// The net still catches a backend that is quiet while free to speak.
+    /// Without this the fix below could be "never time out", which passes
+    /// every other test in this file.
+    #[test]
+    fn a_backend_that_is_quiet_and_not_paused_is_given_up_on() {
+        let (_tx, rx) = std::sync::mpsc::channel::<BackendEvent>();
+        let started = std::time::Instant::now();
+        let outcome = wait_for_event(&rx, Duration::from_millis(300), None, || {});
+        assert!(
+            matches!(outcome, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "expected a timeout, got {outcome:?}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(300), "gave up early");
+    }
+
+    /// And a backend whose socket went away is still a disconnection, not a
+    /// silence: the two say different things to the client.
+    #[test]
+    fn a_backend_that_disconnected_says_so_immediately() {
+        let (tx, rx) = std::sync::mpsc::channel::<BackendEvent>();
+        drop(tx);
+        let started = std::time::Instant::now();
+        let outcome = wait_for_event(&rx, Duration::from_secs(30), None, || {});
+        assert!(
+            matches!(outcome, Err(std::sync::mpsc::RecvTimeoutError::Disconnected)),
+            "expected a disconnection, got {outcome:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5), "waited out the window first");
+    }
+
+    /// The finding: time the daemon spent holding the request still is not
+    /// the backend's silence, and counting it kills healthy work.
+    ///
+    /// A real `Slot` needs a live scheduler, so the paused state is supplied
+    /// through the same predicate the caller passes one — the code under test
+    /// is the accounting, which is what was wrong.
+    #[test]
+    fn time_spent_paused_is_not_counted_as_silence() {
+        let (tx, rx) = std::sync::mpsc::channel::<BackendEvent>();
+        // Paused for well past the window, then an event arrives.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            let _ = tx.send(BackendEvent::Done {
+                req_id: 1,
+                usage: Usage::default(),
+                finish_reason: Some("stop".into()),
+            });
+        });
+        let paused = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let outcome = wait_for_event_with(
+            &rx,
+            Duration::from_millis(200),
+            Duration::from_millis(20),
+            &|| paused.load(Ordering::SeqCst),
+            &mut || {},
+        );
+        assert!(
+            matches!(outcome, Ok(BackendEvent::Done { .. })),
+            "a paused request was killed as a silent backend: {outcome:?}"
+        );
+    }
+
+    /// Pausing must not *reset* the count either. A backend that died while
+    /// being paused and resumed around it would otherwise never be caught,
+    /// because every pause would wipe the evidence.
+    ///
+    /// Driven off a scripted answer rather than a call index, and asserted on
+    /// the whole trace: deferring and clearing both end in a timeout, so the
+    /// only thing that tells them apart is *how many* unpaused slices it took
+    /// — four in total if the two before the pause still count, six if they
+    /// were thrown away. An assertion that passes for both proves nothing,
+    /// and the first version of this test was one.
+    #[test]
+    fn a_pause_defers_the_window_rather_than_clearing_it() {
+        let (_tx, rx) = std::sync::mpsc::channel::<BackendEvent>();
+        // Two quiet slices, then held still for ten, then quiet again.
+        let mut script: Vec<bool> = vec![false, false];
+        script.extend([true; 10]);
+        let script = Arc::new(Mutex::new(std::collections::VecDeque::from(script)));
+        let trace = Arc::new(Mutex::new(Vec::new()));
+
+        let paused = {
+            let script = script.clone();
+            let trace = trace.clone();
+            move || {
+                // Anything past the script is the backend free to speak again.
+                let answer = script.lock().unwrap().pop_front().unwrap_or(false);
+                trace.lock().unwrap().push(answer);
+                answer
+            }
+        };
+        let outcome = wait_for_event_with(
+            &rx,
+            Duration::from_millis(80),
+            Duration::from_millis(20),
+            &paused,
+            &mut || {},
+        );
+        let trace = trace.lock().unwrap().clone();
+        assert!(
+            matches!(outcome, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "unpaused silence either side of a pause must still add up: {outcome:?}"
+        );
+        let unpaused = trace.iter().filter(|paused| !**paused).count();
+        assert_eq!(
+            unpaused, 4,
+            "an 80ms window in 20ms slices is four unpaused slices; six would \
+             mean the pause cleared the two that came before it. trace: {trace:?}"
+        );
+        assert_eq!(
+            trace.len(),
+            14,
+            "two unpaused, ten paused, two unpaused. trace: {trace:?}"
+        );
+    }
+
+    /// The cancel check runs during a pause, not only at the far end of one.
+    #[test]
+    fn the_caller_gets_a_look_in_on_every_quiet_slice() {
+        let (_tx, rx) = std::sync::mpsc::channel::<BackendEvent>();
+        let looks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = looks.clone();
+        let _ = wait_for_event_with(
+            &rx,
+            Duration::from_millis(200),
+            Duration::from_millis(20),
+            &|| false,
+            &mut || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert!(
+            looks.load(Ordering::SeqCst) >= 5,
+            "only {} looks in a ten-slice window",
+            looks.load(Ordering::SeqCst)
+        );
     }
 }

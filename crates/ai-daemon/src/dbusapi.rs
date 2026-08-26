@@ -48,6 +48,33 @@ pub struct Manager {
     pub daemon: Arc<Daemon>,
 }
 
+/// May this caller speak for an application?
+///
+/// Exact names, and that is the whole point of this function existing rather
+/// than a `starts_with` at the call site. It used to be a prefix test — the
+/// real portal ships as `xdg-desktop-portal.service` and desktops add
+/// `-gtk`, `-gnome` and `-kde` variants, so a prefix looked like the tidy way
+/// to cover them. It is not: an unprivileged user can write
+/// `~/.config/systemd/user/xdg-desktop-portal-anything.service`, and every
+/// process they start under it would have been believed when it claimed to be
+/// any application on the machine. The grant this function hands out is "name
+/// any app you like", which is not a thing to hand out on a prefix.
+///
+/// The suffix is optional in the configured name purely so an administrator
+/// can write `ai-daemon-portal` or `ai-daemon-portal.service` and mean the
+/// same unit. Everything else must match to the character.
+fn is_trusted_introducer(allowed: &[String], unit: Option<&str>, exe: Option<&str>) -> bool {
+    let matches = |candidate: &str, name: &str| {
+        candidate == name || candidate.strip_suffix(".service") == Some(name)
+    };
+    allowed.iter().any(|name| {
+        let name = name.trim().trim_end_matches(".service");
+        !name.is_empty()
+            && (unit.is_some_and(|unit| matches(unit, name))
+                || exe.is_some_and(|exe| matches(exe, name)))
+    })
+}
+
 #[interface(name = "io.github.agraves.AIDaemon1.Manager")]
 impl Manager {
     /// Every model this caller can see, system store plus their own.
@@ -524,14 +551,20 @@ impl Manager {
             // The unit carries this, not the executable: the portal runs as
             // the user, so its /proc entry is unreadable to us, while its
             // cgroup is world-readable and is not something it can choose.
-            let looks_like_portal = identity
-                .unit
-                .as_deref()
-                .is_some_and(|unit| unit.starts_with("xdg-desktop-portal"))
-                || identity
-                    .exe
-                    .as_deref()
-                    .is_some_and(|exe| exe.starts_with("xdg-desktop-portal"));
+            // The exe arm is a fallback for machines with no systemd user
+            // session, and it is second for that reason.
+            //
+            // The list is configuration, not a constant, because there are two
+            // implementations of this job — xdg-desktop-portal once the
+            // interface is accepted upstream, ai-daemon-portal until then —
+            // and an empty list is how a machine with no desktop turns the
+            // whole path off.
+            let allowed = &self.daemon.config.policy.portal_units;
+            let looks_like_portal = is_trusted_introducer(
+                allowed,
+                identity.unit.as_deref(),
+                identity.exe.as_deref(),
+            );
             if !looks_like_portal {
                 warn!(
                     "{} asserted portal_app_id={app_id} without being a portal; ignoring the claim",
@@ -793,6 +826,77 @@ fn str_value(text: &str) -> OwnedValue {
 
 #[cfg(test)]
 mod tests {
+    /// The list of who may speak for an application is a privilege grant, and
+    /// these are the shapes it must and must not accept.
+    mod introducers {
+        use super::super::is_trusted_introducer;
+
+        fn allowed() -> Vec<String> {
+            crate::config::default_portal_units()
+        }
+
+        #[test]
+        fn the_shipped_portals_are_recognised_by_unit() {
+            for unit in [
+                "xdg-desktop-portal.service",
+                "xdg-desktop-portal-gnome.service",
+                "ai-daemon-portal.service",
+            ] {
+                assert!(
+                    is_trusted_introducer(&allowed(), Some(unit), None),
+                    "{unit} should be trusted"
+                );
+            }
+        }
+
+        /// The reason this is exact rather than a prefix.
+        ///
+        /// An unprivileged user can put any name they like in
+        /// ~/.config/systemd/user, so a prefix test hands "assert any
+        /// application identity on this machine" to anybody who can write a
+        /// file in their own home directory.
+        #[test]
+        fn a_unit_that_merely_starts_with_a_trusted_name_is_not_trusted() {
+            for impostor in [
+                "xdg-desktop-portal-evil.service",
+                "xdg-desktop-portalx.service",
+                "ai-daemon-portal-mine.service",
+                "app-flatpak-xdg-desktop-portal-1.scope",
+            ] {
+                assert!(
+                    !is_trusted_introducer(&allowed(), Some(impostor), None),
+                    "{impostor} must not be trusted"
+                );
+            }
+        }
+
+        #[test]
+        fn the_executable_arm_is_exact_too() {
+            assert!(is_trusted_introducer(&allowed(), None, Some("ai-daemon-portal")));
+            assert!(!is_trusted_introducer(&allowed(), None, Some("ai-daemon-portal-evil")));
+        }
+
+        /// Emptying the list is how a machine with no desktop turns the whole
+        /// path off, so it has to actually turn it off.
+        #[test]
+        fn an_empty_list_trusts_nothing() {
+            assert!(!is_trusted_introducer(&[], Some("xdg-desktop-portal.service"), None));
+            assert!(!is_trusted_introducer(
+                &["".to_string(), "  ".to_string()],
+                Some("xdg-desktop-portal.service"),
+                None
+            ));
+        }
+
+        /// An administrator writing either spelling means the same unit.
+        #[test]
+        fn the_service_suffix_is_optional_in_the_configured_name() {
+            let with = vec!["ai-daemon-portal.service".to_string()];
+            assert!(is_trusted_introducer(&with, Some("ai-daemon-portal.service"), None));
+            assert!(is_trusted_introducer(&with, Some("ai-daemon-portal"), None));
+        }
+    }
+
     use super::*;
     use crate::identity::Class;
     use crate::policy::Limits;

@@ -43,8 +43,16 @@ pub struct Manifest {
     /// Human name, unique in a store: `llama-3.1-8b-q4`.
     pub name: String,
     /// `sha256:<hex>` over the weights file. The only identity that counts.
+    ///
+    /// One exception, and it is visible in the string rather than hidden: a
+    /// remote model has no weights on this machine, so there is nothing to
+    /// hash and its digest reads `remote:<endpoint-model-id>`. That is an
+    /// identifier, not a content hash, and it makes no integrity claim —
+    /// which is exactly why it does not wear a `sha256:` prefix it could not
+    /// honour. Use `Manifest::is_remote` rather than testing the prefix.
     pub digest: String,
-    /// `gguf` in v1.
+    /// `gguf` in v1, or `remote` for a model that lives on somebody else's
+    /// machine.
     pub format: String,
     #[serde(default)]
     pub quantization: String,
@@ -71,4 +79,18 @@ pub struct Manifest {
 
 /// The three aliases every install has, so apps can ask for a role rather than
 /// a model and let the machine's owner decide what fills it (§6).
+impl Manifest {
+    /// True when the weights are not on this machine and never will be.
+    ///
+    /// The distinction is load-bearing in three places: there is no blob to
+    /// resolve, there is no digest to verify, and the user has to be told —
+    /// so it is a method rather than a scattering of `== "remote"`.
+    pub fn is_remote(&self) -> bool {
+        self.format == REMOTE_FORMAT
+    }
+}
+
+/// The format string a model served by a remote provider carries.
+pub const REMOTE_FORMAT: &str = "remote";
+
 pub const WELL_KNOWN_ALIASES: [&str; 3] = ["default", "fast", "embed"];

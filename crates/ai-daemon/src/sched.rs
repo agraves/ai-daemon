@@ -137,6 +137,23 @@ impl Slot<'_> {
         }
     }
 
+    /// Is the daemon currently holding this request still?
+    ///
+    /// Asked by the session's event loop, which otherwise cannot tell a
+    /// backend that has died from one that is doing exactly what it was told.
+    /// A paused request emits nothing — that is the whole of what pausing is —
+    /// so silence means opposite things depending on this answer, and the
+    /// scheduler is the only thing that knows which.
+    pub fn is_paused(&self) -> bool {
+        self.scheduler
+            .inner
+            .lock()
+            .unwrap()
+            .running
+            .iter()
+            .any(|r| r.ticket == self.ticket && r.paused)
+    }
+
     pub fn charge(&self, session: &str, tokens: u64) {
         let mut inner = self.scheduler.inner.lock().unwrap();
         *inner.served.entry(session.to_string()).or_insert(0) += tokens;

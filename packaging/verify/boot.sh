@@ -81,6 +81,16 @@ cat > /etc/ai-daemon/config.toml.d/60-rate-limit.conf <<'CONF'
 [[identity]]
 identity = "uid:4002"
 tokens_per_minute = 50
+
+# And alice gets a large one, because she is the workhorse of the whole run
+# and the shipped 12000/minute is a limit on a person, not on a test suite
+# generating a hundred thousand tokens in three minutes. Worth being explicit
+# about: the rate limit *under test* is bob's above. Alice hitting hers was
+# silently turning later sections into tests of the rate limiter — one of them
+# passed a cancellation check by being refused in 109ms.
+[[identity]]
+identity = "uid:4001"
+tokens_per_minute = 10000000
 CONF
 
 cat > /etc/ai-daemon/config.toml.d/75-attachments.conf <<'CONF'
@@ -105,10 +115,86 @@ libexec_dir = "/usr/lib/ai-daemon"
 # back, so exiting would end the verification rather than demonstrate anything.
 idle_exit_seconds = 0
 model_idle_unload_seconds = 0
+# Shipped default is 900s, which no test can wait out. Eight is comfortably
+# longer than anything here legitimately goes quiet for — the mock emits every
+# 4ms and paused time no longer counts — and short enough that section 18 can
+# hold a request past it on purpose within one session's context window.
+backend_silence_seconds = 8
+CONF
+
+# ---------------------------------------------------------------------------
+# The remote provider, and something for it to be remote to.
+#
+# On a real machine this is one `systemctl enable` and a config file. Here it
+# is by hand for the usual reason — no init system — but everything that
+# matters is the same: its own uid, the group the socket is shared through, the
+# 0660 mode, and a daemon that reaches it by connecting rather than by forking.
+# ---------------------------------------------------------------------------
+log "starting a stand-in for somebody else's inference service"
+/usr/local/bin/stub-endpoint 8099 >/tmp/stub-endpoint.log 2>&1 &
+sleep 0.3
+
+log "configuring the remote provider (nothing the package installs does this)"
+install -m 0400 -o ai-daemon-remote -g ai-daemon /dev/null /etc/ai-daemon/remote.key
+printf 'verification-key' > /etc/ai-daemon/remote.key
+cat > /etc/ai-daemon/remote.toml <<'CONF'
+# http, not https, and that is the one interesting thing in this file: the
+# backend refuses plaintext unless it is told to, and the stand-in endpoint has
+# no certificate. The refusal is tested too, by pointing it at https and
+# watching it fail before a byte leaves.
+base_url = "http://127.0.0.1:8099/v1"
+api_key_file = "/etc/ai-daemon/remote.key"
+allow_plaintext = true
+capabilities = ["generate", "tools", "parallel-tools", "logprobs", "embed"]
+
+[models]
+"cloud-small" = "stub-model-1"
+CONF
+
+# The same endpoint again, with allow_plaintext left at its default. Its
+# purpose is to be refused: the backend must not send a prompt over http
+# unless somebody said so, and a claim like that is only worth anything with
+# the negative case standing next to it.
+sed '/allow_plaintext/d; s/cloud-small/cloud-strict/' /etc/ai-daemon/remote.toml \
+  > /etc/ai-daemon/remote-strict.toml
+
+cat > /etc/ai-daemon/config.toml.d/80-remote.conf <<'CONF'
+# The two lines that turn a remote provider on. `connect` rather than `exec`
+# because the daemon has PrivateNetwork=yes and anything it forks has no route
+# anywhere; this one runs as its own unit and the daemon dials it.
+[[backend]]
+name = "remote"
+connect = "/run/ai-daemon-remote/remote.sock"
+enabled = true
+
+[[backend]]
+name = "remote-strict"
+connect = "/run/ai-daemon-remote/strict.sock"
+enabled = true
 CONF
 
 log "creating the state the tmpfiles.d snippet creates on a real install"
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/ai-daemon.conf 2>&1 | sed 's/^/       /'
+
+# After tmpfiles, which creates /run/ai-daemon, and before the daemon, which
+# connects to it. User/Group exactly as the unit sets them, so the socket lands
+# with the ownership the unit produces and the verification can assert it.
+log "starting the remote backend as its own user, the way its unit would"
+# RuntimeDirectory= in the unit; by hand here, with the ownership and mode
+# systemd would give it, because those are what the verification asserts.
+install -d -m 0750 -o ai-daemon-remote -g ai-daemon /run/ai-daemon-remote
+setpriv --reuid ai-daemon-remote --regid ai-daemon --clear-groups --inh-caps=-all \
+  -- /usr/lib/ai-daemon/backends/ai-daemon-backend-remote \
+     --config /etc/ai-daemon/remote.toml \
+     --socket /run/ai-daemon-remote/remote.sock >/tmp/remote-backend.log 2>&1 &
+setpriv --reuid ai-daemon-remote --regid ai-daemon --clear-groups --inh-caps=-all \
+  -- /usr/lib/ai-daemon/backends/ai-daemon-backend-remote \
+     --config /etc/ai-daemon/remote-strict.toml \
+     --socket /run/ai-daemon-remote/strict.sock >/tmp/remote-strict.log 2>&1 &
+for _ in $(seq 1 40); do
+  [ -S /run/ai-daemon-remote/remote.sock ] && [ -S /run/ai-daemon-remote/strict.sock ] && break
+  sleep 0.25
+done
 
 log "starting ai-daemon as the ai-daemon user, the way its unit would"
 setpriv --reuid ai-daemon --regid ai-daemon --init-groups --inh-caps=-all \
@@ -123,6 +209,52 @@ if ! busctl --system status io.github.agraves.AIDaemon1 >/dev/null 2>&1; then
   exit 1
 fi
 log "the daemon is on the bus"
+
+# ---------------------------------------------------------------------------
+# The portal, in alice's session.
+#
+# On a desktop this is a systemd *user* unit, started by graphical-session or
+# by the session bus when an app first asks. There is neither here, so it is
+# started by hand — but as alice, on a session bus, which is what matters: the
+# whole reason this process exists is that it runs as the person whose apps it
+# speaks for, and the daemon cannot.
+# ---------------------------------------------------------------------------
+log "starting a session bus for alice"
+install -d -m 0700 -o alice -g alice /run/user/4001
+export ALICE_BUS=unix:path=/run/user/4001/bus
+setpriv --reuid alice --regid alice --init-groups --inh-caps=-all \
+  -- dbus-daemon --session --address="$ALICE_BUS" --fork --print-pid \
+  > /tmp/alice-bus.pid 2>/tmp/alice-bus.log
+sleep 0.3
+
+# The daemon decides whether to believe a portal by reading the caller's
+# cgroup, which is world-readable and is not something a process can choose for
+# itself. systemd would put this in ai-daemon-portal.service; here the cgroup
+# is made by hand and the process is moved into it before dropping to alice, so
+# what the daemon reads is the same string by the same mechanism.
+#
+# If the cgroup filesystem is not writable in this container the portal still
+# runs and its own logic is still tested, but the daemon will refuse its
+# assertion — and the verification says which of those happened rather than
+# quietly passing a smaller test.
+if mkdir -p /sys/fs/cgroup/ai-daemon-portal.service 2>/tmp/portal-cgroup.err; then
+  echo yes > /tmp/portal-cgroup
+  log "the portal gets a cgroup the daemon can recognise"
+else
+  echo no > /tmp/portal-cgroup
+  log "no cgroup for the portal: $(cat /tmp/portal-cgroup.err)"
+  log "the daemon identifies a portal by its unit, read from the caller's"
+  log "cgroup, so without one it will refuse the assertion — correctly."
+fi
+
+log "starting the portal as alice, the way its user unit would"
+env DBUS_SESSION_BUS_ADDRESS="$ALICE_BUS" \
+  sh -c 'if [ "$(cat /tmp/portal-cgroup)" = yes ]; then
+           echo $$ > /sys/fs/cgroup/ai-daemon-portal.service/cgroup.procs || true
+         fi
+         exec setpriv --reuid alice --regid alice --init-groups --inh-caps=-all \
+           -- /usr/lib/ai-daemon/ai-daemon-portal' >/tmp/portal.log 2>&1 &
+sleep 1
 
 log "starting the shim (off by default on a real install; on here to test it)"
 setpriv --reuid ai-daemon-shim --regid ai-daemon-shim --init-groups --inh-caps=-all \

@@ -1,0 +1,14 @@
+[package]
+name = "ai-daemon-backend-remote"
+description = "Remote provider backend for ai-daemon: an OpenAI-compatible endpoint, in its own unit with its own network."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ai-daemon-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true

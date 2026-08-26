@@ -103,14 +103,14 @@ impl Registry {
 
         if let Some(root) = uid.and_then(Registry::user_root) {
             if let Some(manifest) = read_manifest(&root.join("manifests").join(format!("{target}.json"))) {
-                let blob = blob_path(&root, &manifest.digest)?;
+                let blob = blob_for(&root, &manifest)?;
                 return Ok(Resolved { manifest, blob, store: Store::User });
             }
         }
         let path = self.system_root.join("manifests").join(format!("{target}.json"));
         let manifest = read_manifest(&path)
             .ok_or_else(|| format!("no model named {target:?} in this install"))?;
-        let blob = blob_path(&self.system_root, &manifest.digest)?;
+        let blob = blob_for(&self.system_root, &manifest)?;
         Ok(Resolved { manifest, blob, store: Store::System })
     }
 
@@ -191,6 +191,32 @@ impl Registry {
         Ok(manifest)
     }
 
+    /// Record a model that has no bytes here.
+    ///
+    /// Separate from `accept_staged` on purpose. That function's entire job is
+    /// to verify a digest before anything enters the store, and a remote model
+    /// has nothing to verify — so rather than teach it a mode where it skips
+    /// its one safety check, remote registration is a different function that
+    /// visibly never had one. It writes a manifest and no blob.
+    pub fn register_remote(&self, manifest: Manifest) -> Result<Manifest, String> {
+        if !manifest.is_remote() {
+            return Err(format!(
+                "register_remote called for {} which is format {:?}",
+                manifest.name, manifest.format
+            ));
+        }
+        let manifest_path =
+            self.system_root.join("manifests").join(format!("{}.json", manifest.name));
+        let text = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
+        write_atomic(&manifest_path, text.as_bytes()).map_err(|e| e.to_string())?;
+        self.invalidate();
+        info!(
+            "registry: registered remote model {} -> {} (no weights on this machine)",
+            manifest.name, manifest.digest
+        );
+        Ok(manifest)
+    }
+
     /// Remove a model by name. The blob survives if another manifest still
     /// points at the same digest — content addressing means removal is
     /// refcounted by definition.
@@ -205,7 +231,7 @@ impl Registry {
             .system_manifests()
             .iter()
             .any(|m| m.digest == manifest.digest);
-        if !still_referenced {
+        if !still_referenced && !manifest.is_remote() {
             if let Ok(blob) = blob_path(&self.system_root, &manifest.digest) {
                 let _ = std::fs::remove_file(blob);
             }
@@ -213,6 +239,20 @@ impl Registry {
         info!("registry: removed {name}");
         Ok(())
     }
+}
+
+/// Where a manifest's weights are, or nowhere at all.
+///
+/// A remote model resolves to an empty path rather than an error: it is a
+/// perfectly good model, it just has no file. Every backend is handed this
+/// path and the remote one ignores it; a local backend handed an empty path
+/// fails when it opens it, which is the right failure for a manifest that
+/// claimed the wrong format.
+fn blob_for(root: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
+    if manifest.is_remote() {
+        return Ok(PathBuf::new());
+    }
+    blob_path(root, &manifest.digest)
 }
 
 fn blob_path(root: &Path, digest: &str) -> Result<PathBuf, String> {

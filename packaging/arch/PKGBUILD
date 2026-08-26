@@ -61,12 +61,20 @@ package() {
   # neither is useful to invoke by hand.
   install -Dm755 target/release/ai-daemon-fetch  "$pkgdir/usr/lib/$pkgname/ai-daemon-fetch"
   install -Dm755 target/release/ai-daemon-decode "$pkgdir/usr/lib/$pkgname/ai-daemon-decode"
+  # The portal runs as the user rather than as a service account, but it is
+  # still not a command anybody types: it is started by the session, or by the
+  # session bus when an app first asks for it.
+  install -Dm755 target/release/ai-daemon-portal "$pkgdir/usr/lib/$pkgname/ai-daemon-portal"
 
   # Provider plugins.
   install -Dm755 target/release/ai-daemon-backend-llamacpp \
     "$pkgdir/usr/lib/$pkgname/backends/ai-daemon-backend-llamacpp"
   install -Dm755 target/release/ai-daemon-backend-mock \
     "$pkgdir/usr/lib/$pkgname/backends/ai-daemon-backend-mock"
+  # Not started, not configured. Its unit has ConditionPathExists on a file
+  # this package does not install, so shipping the binary turns nothing on.
+  install -Dm755 target/release/ai-daemon-backend-remote \
+    "$pkgdir/usr/lib/$pkgname/backends/ai-daemon-backend-remote"
 
   # systemd.
   install -Dm644 packaging/systemd/ai-daemon.service \
@@ -75,6 +83,11 @@ package() {
     "$pkgdir/usr/lib/systemd/system/ai-daemon-fetch@.service"
   install -Dm644 packaging/systemd/ai-daemon-shim.service \
     "$pkgdir/usr/lib/systemd/system/ai-daemon-shim.service"
+  install -Dm644 packaging/systemd/ai-daemon-backend-remote.service \
+    "$pkgdir/usr/lib/systemd/system/ai-daemon-backend-remote.service"
+  # A user unit, because it must run as the person whose apps it speaks for.
+  install -Dm644 packaging/systemd/ai-daemon-portal.service \
+    "$pkgdir/usr/lib/systemd/user/ai-daemon-portal.service"
 
   # sysusers.d and tmpfiles.d are processed by pacman's systemd hooks, so the
   # ai-daemon user, the ai group and the model store all exist after install
@@ -90,6 +103,9 @@ package() {
     "$pkgdir/usr/share/dbus-1/system.d/io.github.agraves.AIDaemon1.conf"
   install -Dm644 packaging/dbus/io.github.agraves.AIDaemon1.service \
     "$pkgdir/usr/share/dbus-1/system-services/io.github.agraves.AIDaemon1.service"
+  # Session bus, not system: the portal belongs to a login session.
+  install -Dm644 packaging/dbus/io.github.agraves.AIPortal1.service \
+    "$pkgdir/usr/share/dbus-1/services/io.github.agraves.AIPortal1.service"
 
   # polkit: the consent actions, and the one narrow rule that lets the daemon
   # start its own download helper (the daemon has no network of its own).
@@ -100,6 +116,11 @@ package() {
 
   install -Dm644 packaging/config/config.toml "$pkgdir/etc/ai-daemon/config.toml"
   install -dm755 "$pkgdir/etc/ai-daemon/config.toml.d"
+  # An example, not a config: the remote backend's unit will not start until
+  # somebody copies this to remote.toml, which is the deliberate act that
+  # sending prompts off this machine should be.
+  install -Dm644 packaging/config/remote.toml.example \
+    "$pkgdir/usr/share/doc/$pkgname/remote.toml.example"
 
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 docs/protocol.md "$pkgdir/usr/share/doc/$pkgname/protocol.md"
