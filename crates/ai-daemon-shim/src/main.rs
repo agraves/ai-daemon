@@ -441,10 +441,11 @@ fn chat(stream: &mut TcpStream, request: &HttpRequest, peer: &Peer) -> Result<()
     )
     .map_err(|e| e.to_string())?;
 
+    let mut cancel_channel = session.socket.try_clone().map_err(|e| e.to_string())?;
     let outcome = if streaming {
         relay_sse(stream, &mut reader, &model)
     } else {
-        relay_json(stream, &mut reader, &model)
+        relay_json(stream, &mut reader, &mut cancel_channel, &model)
     };
     session.close();
     outcome
@@ -533,14 +534,42 @@ fn relay_sse(
     Ok(())
 }
 
+/// Has the HTTP client gone away?
+///
+/// Asked between events rather than discovered on the next write, because a
+/// non-streaming completion does not write anything until it is finished: the
+/// first attempt to notice a vanished client would otherwise be the response
+/// nobody is there to read, by which point the daemon has generated the whole
+/// thing and held a decode slot to do it.
+fn peer_hung_up(stream: &TcpStream) -> bool {
+    let mut pollfd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLRDHUP,
+        revents: 0,
+    };
+    // SAFETY: one initialised pollfd, a matching count, and no blocking.
+    let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    ready > 0 && pollfd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
+}
+
 fn relay_json(
     stream: &mut TcpStream,
     reader: &mut impl Read,
+    daemon: &mut UnixStream,
     model: &str,
 ) -> Result<(), String> {
     let mut content = String::new();
     let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+    let mut abandoned = false;
     loop {
+        if !abandoned && peer_hung_up(stream) {
+            // Tell the daemon to stop. Then keep draining until it says done,
+            // so the session ends the way every other session ends rather than
+            // by having its socket yanked.
+            abandoned = true;
+            eprintln!("<6>ai-daemon-shim: client went away; cancelling the generation");
+            let _ = frame::write_cbor(daemon, &Request::Cancel);
+        }
         match read_event(reader)? {
             None => break,
             Some(Event::Token { tok }) => content.push_str(&tok),
@@ -550,6 +579,10 @@ fn relay_json(
                 "function": {"name": tool_call.name, "arguments": tool_call.arguments},
             })),
             Some(Event::Done { usage, finish_reason, .. }) => {
+                if abandoned {
+                    // Nobody to answer. The session is closed by the caller.
+                    return Ok(());
+                }
                 let mut message = serde_json::json!({"role": "assistant", "content": content});
                 if !tool_calls.is_empty() {
                     message["tool_calls"] = serde_json::Value::Array(tool_calls);

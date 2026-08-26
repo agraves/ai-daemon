@@ -9,7 +9,7 @@
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 use ai_daemon_proto::backend::{BackendEvent, BackendRequest, RawAttachment};
 use ai_daemon_proto::frame::{
@@ -39,6 +39,20 @@ pub fn spawn(daemon: Arc<Daemon>, session: Arc<Session>, socket: UnixStream, lim
             }
         };
         *session.sink.lock().unwrap() = Some(sink.clone());
+
+        let (sender, frames) = mpsc::sync_channel::<Frame>(0);
+        let reader = std::thread::Builder::new()
+            .name(format!("session-{}-read", session.id))
+            .spawn({
+                let daemon = daemon.clone();
+                let session = session.clone();
+                move || read_socket(daemon, session, socket, sender)
+            });
+        if let Err(e) = reader {
+            warn!("could not start a reader for session {}: {e}", session.id);
+            return;
+        }
+
         let mut worker = Worker {
             daemon: daemon.clone(),
             session: session.clone(),
@@ -50,11 +64,86 @@ pub fn spawn(daemon: Arc<Daemon>, session: Arc<Session>, socket: UnixStream, lim
             grammar: None,
             pending_tool_call: None,
         };
-        worker.run(socket);
+        worker.run(frames);
         worker.teardown();
     });
     if let Err(e) = result {
         warn!("could not start a thread for session: {e}");
+    }
+}
+
+/// Read the socket, and be the only thing that does.
+///
+/// This exists so that `Cancel` means something. The session used to read and
+/// work on one thread, which reads the socket only *between* turns — so a
+/// cancel sent during a generation sat unread in the socket buffer until the
+/// generation it was cancelling had finished. Every effect of the cancel arm
+/// then no-opped: `current_req` was already cleared, and the flag it set was
+/// reset by the next turn before anything looked at it.
+///
+/// So the parse happens here, off the working thread, and a cancel is acted on
+/// the moment it arrives. Everything else is handed across a rendezvous
+/// channel — capacity zero, deliberately: the socket used to be the
+/// backpressure and a buffer here would replace it with an allocation a client
+/// controls. A frame waits until the worker is ready for it, exactly as it
+/// waited in the kernel before.
+fn read_socket(
+    daemon: Arc<Daemon>,
+    session: Arc<Session>,
+    socket: UnixStream,
+    frames: mpsc::SyncSender<Frame>,
+) {
+    let mut reader = BufReader::new(socket);
+    loop {
+        match frame::read_frame(&mut reader) {
+            Ok(Some(Frame::Cbor(value))) => {
+                // Peeked before forwarding, so a cancel never queues behind
+                // work — including behind the generation it is cancelling.
+                if let Ok(Request::Cancel) = value.deserialized::<Request>() {
+                    debug!("session {}: cancel from the client", session.id);
+                    cancel_in_flight(&daemon, &session);
+                    continue;
+                }
+                if frames.send(Frame::Cbor(value)).is_err() {
+                    return;
+                }
+            }
+            Ok(Some(blob)) => {
+                if frames.send(blob).is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {
+                debug!("session {}: client closed the socket", session.id);
+                break;
+            }
+            Err(e) => {
+                debug!("session {}: {e}", session.id);
+                break;
+            }
+        }
+    }
+    // The client is gone. Anything still generating is generating for nobody,
+    // and it holds a decode slot while it does it — which is how two abandoned
+    // requests take out interactive capacity on an install that allows two.
+    // A non-streaming request is the case that matters: nothing is written
+    // until `done`, so there is no failing send to notice the disconnect.
+    cancel_in_flight(&daemon, &session);
+}
+
+/// Stop whatever this session has in flight, from any thread.
+///
+/// The one shared implementation, because there are four ways to arrive here —
+/// the client's `Cancel` frame, the client vanishing, `Session.Cancel` on the
+/// bus, and `Session.Close` — and three of them used to do something
+/// different, or nothing.
+pub fn cancel_in_flight(daemon: &Daemon, session: &Session) {
+    session.cancelled.store(true, Ordering::SeqCst);
+    let current = *session.current_req.lock().unwrap();
+    if let Some(req_id) = current {
+        if let Ok(backend) = daemon.backends.get(&session.backend) {
+            backend.cancel(req_id);
+        }
     }
 }
 
@@ -74,35 +163,27 @@ struct Worker {
 }
 
 impl Worker {
-    fn run(&mut self, socket: UnixStream) {
-        let mut reader = BufReader::new(socket);
+    fn run(&mut self, frames: mpsc::Receiver<Frame>) {
         loop {
             if self.session.closed.load(Ordering::Relaxed) {
                 return;
             }
-            let request: Request = match frame::read_frame(&mut reader) {
-                Ok(None) => {
-                    debug!("session {}: client closed the socket", self.session.id);
-                    return;
-                }
-                Ok(Some(Frame::Blob(_))) => {
+            let request: Request = match frames.recv() {
+                Err(_) => return, // the reader is gone, and so is the client
+                Ok(Frame::Blob(_)) => {
                     self.send(&Event::error("protocol", "a BLOB arrived with no attachment to own it"));
                     return;
                 }
-                Ok(Some(Frame::Cbor(value))) => match value.deserialized() {
+                Ok(Frame::Cbor(value)) => match value.deserialized() {
                     Ok(request) => request,
                     Err(e) => {
                         self.send(&Event::error("protocol", format!("unrecognised request: {e}")));
                         continue;
                     }
                 },
-                Err(e) => {
-                    debug!("session {}: {e}", self.session.id);
-                    return;
-                }
             };
             self.daemon.touch();
-            if let Err(fatal) = self.dispatch(request, &mut reader) {
+            if let Err(fatal) = self.dispatch(request, &frames) {
                 if fatal {
                     return;
                 }
@@ -112,7 +193,7 @@ impl Worker {
 
     /// `Err(true)` means the socket is no longer usable and the thread should
     /// stop; `Err(false)` means the request failed but the session lives.
-    fn dispatch(&mut self, request: Request, reader: &mut BufReader<UnixStream>) -> Result<(), bool> {
+    fn dispatch(&mut self, request: Request, frames: &mpsc::Receiver<Frame>) -> Result<(), bool> {
         match request {
             Request::Hello { proto } => {
                 if proto != 0 && proto != DATA_PROTO {
@@ -133,7 +214,7 @@ impl Worker {
                 self.send(&Event::Hello { ok: true, proto: DATA_PROTO, session: info });
                 Ok(())
             }
-            Request::Attach { id, kind, meta, len } => self.attach(id, kind, meta, len, reader),
+            Request::Attach { id, kind, meta, len } => self.attach(id, kind, meta, len, frames),
             Request::Generate { messages, stream, params, grammar, tools } => {
                 self.history = messages;
                 self.params = params.unwrap_or_default();
@@ -178,15 +259,11 @@ impl Worker {
                 self.tokenize(text);
                 Ok(())
             }
-            Request::Cancel => {
-                self.session.cancelled.store(true, Ordering::Relaxed);
-                if let Some(req_id) = *self.session.current_req.lock().unwrap() {
-                    if let Ok(backend) = self.daemon.backends.get(&self.session.backend) {
-                        backend.cancel(req_id);
-                    }
-                }
-                Ok(())
-            }
+            // Handled by the reading thread the instant it arrives, which is
+            // the only place it can be handled in time. Reaching here means a
+            // cancel with nothing to cancel — the session was idle — and the
+            // flag the reader set is cleared by the next turn.
+            Request::Cancel => Ok(()),
         }
     }
 
@@ -200,7 +277,7 @@ impl Worker {
         kind: AttachKind,
         meta: AttachMeta,
         len: u64,
-        reader: &mut BufReader<UnixStream>,
+        frames: &mpsc::Receiver<Frame>,
     ) -> Result<(), bool> {
         let budget = &self.daemon.config.attachments;
 
@@ -224,17 +301,13 @@ impl Worker {
         // that follows, so a rejected attachment is still a drained one.
         let mut payload = Vec::with_capacity(len.min(1 << 20) as usize);
         while (payload.len() as u64) < len {
-            match frame::read_frame(reader) {
-                Ok(Some(Frame::Blob(mut chunk))) => payload.append(&mut chunk),
-                Ok(Some(Frame::Cbor(_))) => {
+            match frames.recv() {
+                Ok(Frame::Blob(mut chunk)) => payload.append(&mut chunk),
+                Ok(Frame::Cbor(_)) => {
                     self.send(&Event::error("protocol", "attachment interrupted by a request frame"));
                     return Err(true);
                 }
-                Ok(None) => return Err(true),
-                Err(e) => {
-                    debug!("session {}: reading attachment: {e}", self.session.id);
-                    return Err(true);
-                }
+                Err(_) => return Err(true),
             }
             if payload.len() as u64 > len {
                 self.send(&Event::error("protocol", "attachment BLOBs exceeded the declared length"));
@@ -517,7 +590,17 @@ impl Worker {
 
         let mut usage = Usage { attachment_tokens, ..Usage::default() };
         let mut emitted_tool_call = false;
+        let mut cancel_sent = false;
         loop {
+            // The flag's reader. The reading thread cancels the backend
+            // directly when it can, but a cancel that lands between `begin`
+            // and the `current_req` store above finds nothing to cancel and
+            // leaves only this flag behind — so the loop checks it too, and
+            // the backend hears about it once either way.
+            if !cancel_sent && self.session.cancelled.load(Ordering::SeqCst) {
+                cancel_sent = true;
+                backend.cancel(req_id);
+            }
             match events.recv() {
                 Ok(BackendEvent::Token { tok, .. }) => {
                     usage.completion_tokens += 1;

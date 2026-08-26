@@ -357,6 +357,7 @@ fn generate(args: &[String]) -> Result<(), String> {
     let mut image: Option<String> = None;
     let mut raw_image: Option<String> = None;
     let mut show_usage = false;
+    let mut cancel_after: Option<u64> = None;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -371,6 +372,7 @@ fn generate(args: &[String]) -> Result<(), String> {
             "--image" => image = iter.next().cloned(),
             "--image-raw" => raw_image = iter.next().cloned(),
             "--usage" => show_usage = true,
+            "--cancel-after" => cancel_after = iter.next().and_then(|v| v.parse().ok()),
             "--help" => {
                 println!(
                     "usage: aidctl generate [options] [PROMPT]
@@ -384,6 +386,8 @@ fn generate(args: &[String]) -> Result<(), String> {
       --image-raw WxH:FILE
                         attach raw RGBA8 pixels, decoded by nobody
       --usage           print the usage record when the turn ends
+      --cancel-after MS send the protocol's Cancel this long after asking, to
+                        watch a generation actually stop
 
 With no PROMPT, reads one from stdin."
                 );
@@ -500,6 +504,17 @@ With no PROMPT, reads one from stdin."
         },
     )
     .map_err(|e| format!("generate: {e}"))?;
+
+    // The data-plane Cancel, sent from a second thread because this one is
+    // about to block reading tokens — which is the whole difficulty the daemon
+    // has with it too.
+    if let Some(delay) = cancel_after {
+        let mut socket = session.socket.try_clone().map_err(|e| e.to_string())?;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+            let _ = frame::write_cbor(&mut socket, &Request::Cancel);
+        });
+    }
 
     let mut exit = 0;
     loop {

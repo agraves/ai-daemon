@@ -403,7 +403,44 @@ check "both requests completed" test -s /tmp/bg.txt -a -s /tmp/fg.txt
 lacks "neither request errored" /tmp/fg.txt 'policy-denied|backend-failed|rate-limited'
 
 # ---------------------------------------------------------------------------
-section "14. Idle unloading and removal"
+section "14. Cancellation actually reaches the backend"
+# ---------------------------------------------------------------------------
+note "The mock emits exactly max_tokens tokens at 4ms each, so 2000 tokens is"
+note "about eight seconds of generation to interrupt."
+
+note "The protocol's own Cancel frame, sent mid-generation:"
+START=$(date +%s%N)
+runas alice aidctl generate --max-tokens 2000 --cancel-after 500 --usage \
+  "a long generation that should not run to completion" >/tmp/cancelled.txt 2>&1
+ELAPSED=$(( ($(date +%s%N) - START) / 1000000 ))
+run cat /tmp/cancelled.txt
+note "took ${ELAPSED}ms"
+contains "the backend stopped and said why" /tmp/cancelled.txt 'finish=cancelled'
+check "it stopped early rather than running to the token limit" test "$ELAPSED" -lt 5000
+
+note "A client that simply vanishes mid-generation. Non-streaming, so nothing"
+note "has been written yet and there is no failing send to notice it by —"
+note "this is the case that used to burn a decode slot to completion."
+curl -sS --max-time 1 http://127.0.0.1:11434/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"default","max_tokens":2000,"messages":[{"role":"user","content":"abandon me"}]}' \
+  >/dev/null 2>&1 || true
+sleep 1
+aidctl sessions > /tmp/after-abandon.txt 2>&1
+run cat /tmp/after-abandon.txt
+contains "the abandoned session is gone, not still generating" /tmp/after-abandon.txt 'no open sessions'
+
+note "And the slot it was holding is free: an interactive request served now"
+note "must not be queued behind a generation nobody is waiting for."
+START=$(date +%s%N)
+runas alice aidctl generate --max-tokens 8 "am I queued" >/tmp/after-cancel.txt 2>&1
+ELAPSED=$(( ($(date +%s%N) - START) / 1000000 ))
+note "took ${ELAPSED}ms"
+check "the decode slot was released" test "$ELAPSED" -lt 5000
+lacks "and the request was served normally" /tmp/after-cancel.txt 'policy-denied|backend-failed|rate-limited'
+
+# ---------------------------------------------------------------------------
+section "15. Idle unloading and removal"
 # ---------------------------------------------------------------------------
 check "a model can be pinned resident" aidctl pin mock-small
 run aidctl models

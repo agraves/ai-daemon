@@ -310,7 +310,7 @@ impl Manager {
         let removed = self.daemon.policy.revoke(&identity) as u32;
         for session in self.daemon.session_list() {
             if session.identity.key() == identity {
-                close_session(&session);
+                close_session(&self.daemon, &session);
             }
         }
         Ok(removed)
@@ -598,16 +598,11 @@ pub struct SessionObject {
 impl SessionObject {
     /// Stop the current generation. The session survives; its context does.
     fn cancel(&self) {
-        self.session.cancelled.store(true, Ordering::Relaxed);
-        if let Some(req_id) = *self.session.current_req.lock().unwrap() {
-            if let Ok(backend) = self.daemon.backends.get(&self.session.backend) {
-                backend.cancel(req_id);
-            }
-        }
+        session::cancel_in_flight(&self.daemon, &self.session);
     }
 
     fn close(&self) {
-        close_session(&self.session);
+        close_session(&self.daemon, &self.session);
     }
 
     #[zbus(property)]
@@ -668,8 +663,14 @@ impl SessionObject {
 /// Shutting the socket down is what actually stops it: the thread is blocked
 /// in `read`, and a flag it will not look at until the next frame is not a
 /// close.
-pub fn close_session(session: &Arc<Session>) {
+///
+/// Cancelling is separate from closing and both are needed. Shutting the
+/// socket stops the session *accepting* work; it does not stop the generation
+/// already running, which would carry on to its token limit holding a decode
+/// slot for a client that has been told the session is over.
+pub fn close_session(daemon: &Daemon, session: &Arc<Session>) {
     session.closed.store(true, Ordering::Relaxed);
+    session::cancel_in_flight(daemon, session);
     let sink = session.sink.lock().unwrap().clone();
     if let Some(sink) = sink {
         let _ = sink.lock().unwrap().shutdown(std::net::Shutdown::Both);
