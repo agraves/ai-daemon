@@ -283,6 +283,15 @@ impl Scheduler {
     /// Account for a session's KV cache, evicting others if the budget is
     /// exceeded. Returns the sessions that were evicted so their owners can be
     /// told `context-evicted`.
+    ///
+    /// Victims are chosen before anybody is touched, and the whole plan is
+    /// abandoned if it would not be enough. That ordering is the point: the
+    /// obvious shape — evict as you go, then check whether it worked — can
+    /// destroy a session's cache and *then* return an error, at which point the
+    /// caller has an `Err` and no list of who it just cost. Those sessions are
+    /// never told to replay, so they carry on generating against context the
+    /// daemon quietly threw away, and the damage lands on an innocent session
+    /// rather than on the one that asked for too much.
     pub fn reserve_kv(
         &self,
         session: &str,
@@ -293,6 +302,7 @@ impl Scheduler {
         let mut inner = self.inner.lock().unwrap();
         let previous = inner.kv.get(session).map(|e| e.bytes).unwrap_or(0);
         let mut evicted: Vec<String> = Vec::new();
+        let mut to_drop: Vec<(String, String)> = Vec::new();
 
         if bytes > previous {
             let extra = bytes - previous;
@@ -302,36 +312,49 @@ impl Scheduler {
                     extra, self.kv_budget
                 ));
             }
-            // Background caches go first, then idle interactive ones. Nothing
-            // with a request in flight is ever evicted, and the requesting
-            // session never evicts itself.
+
+            // Plan. Background caches go first, then idle interactive ones.
+            // Nothing with a request in flight is ever evicted, and the
+            // requesting session never evicts itself.
+            let mut freed = 0u64;
+            let mut plan: Vec<(String, String, u64)> = Vec::new();
             for pass in [Class::Background, Class::Interactive] {
-                while inner.kv_used + extra > self.kv_budget {
-                    let victim = inner
-                        .kv
-                        .iter()
-                        .filter(|(id, e)| {
-                            id.as_str() != session && e.class == pass && !e.active
-                        })
-                        .min_by_key(|(_, e)| e.last_used)
-                        .map(|(id, _)| id.clone());
-                    let Some(victim) = victim else { break };
-                    let entry = inner.kv.remove(&victim).expect("victim was just found");
-                    inner.kv_used = inner.kv_used.saturating_sub(entry.bytes);
-                    info!(
-                        "sched: evicting {} bytes of {} context for {session}",
-                        entry.bytes, victim
-                    );
-                    evicted.push(victim.clone());
-                    let backend = entry.backend.clone();
-                    self.with_preemptor(|p| p.drop_cache(&backend, &victim));
+                if inner.kv_used.saturating_sub(freed) + extra <= self.kv_budget {
+                    break;
+                }
+                let mut candidates: Vec<(&String, &KvEntry)> = inner
+                    .kv
+                    .iter()
+                    .filter(|(id, e)| id.as_str() != session && e.class == pass && !e.active)
+                    .collect();
+                candidates.sort_by_key(|(_, e)| e.last_used);
+                for (id, entry) in candidates {
+                    if inner.kv_used.saturating_sub(freed) + extra <= self.kv_budget {
+                        break;
+                    }
+                    freed += entry.bytes;
+                    plan.push((id.clone(), entry.backend.clone(), entry.bytes));
                 }
             }
-            if inner.kv_used + extra > self.kv_budget {
+
+            if inner.kv_used.saturating_sub(freed) + extra > self.kv_budget {
+                // Nothing has been evicted and nothing has been dropped: the
+                // only session affected by this failure is the one asking.
                 return Err(format!(
-                    "KV budget exhausted: {} of {} bytes in use and nothing evictable",
-                    inner.kv_used, self.kv_budget
+                    "KV budget exhausted: {} of {} bytes in use, only {} of it evictable, \
+                     and {extra} more needed",
+                    inner.kv_used, self.kv_budget, freed
                 ));
+            }
+
+            // Commit. Past this line the reservation cannot fail, so every
+            // cache dropped is a cache the caller will be handed the name of.
+            for (id, backend, size) in plan {
+                inner.kv.remove(&id);
+                inner.kv_used = inner.kv_used.saturating_sub(size);
+                info!("sched: evicting {size} bytes of {id} context for {session}");
+                evicted.push(id.clone());
+                to_drop.push((backend, id));
             }
             inner.kv_used += extra;
         } else {
@@ -348,6 +371,15 @@ impl Scheduler {
                 active: true,
             },
         );
+
+        // Tell the backends after releasing the lock. The accounting is
+        // already consistent, and writing to a backend socket while holding
+        // the scheduler's lock would block every other session on this one's
+        // pipe.
+        drop(inner);
+        for (backend, victim) in &to_drop {
+            self.with_preemptor(|p| p.drop_cache(backend, victim));
+        }
         Ok(evicted)
     }
 
@@ -475,6 +507,81 @@ mod tests {
         assert_eq!(scheduler.kv_used().0, 800);
     }
 
+    /// The regression. Budget 1000; A is interactive and mid-generation at
+    /// 700; B is an idle background cache of 200. C asks for 400, which cannot
+    /// be made to fit because A is untouchable. The old code evicted B and
+    /// dropped its backend cache *before* discovering that, then returned Err
+    /// — and the caller only announces `context-evicted` on Ok, so B was left
+    /// generating against context that no longer existed.
+    #[test]
+    fn a_reservation_that_cannot_succeed_evicts_nobody() {
+        let (scheduler, events) = scheduler(1000);
+        scheduler.reserve_kv("A", "mock", Class::Interactive, 700).unwrap();
+        scheduler.reserve_kv("B", "mock", Class::Background, 200).unwrap();
+        scheduler.mark_idle("B");
+        // A stays active: it has a request in flight and is not evictable.
+        assert_eq!(scheduler.kv_used().0, 900);
+
+        let error = scheduler
+            .reserve_kv("C", "mock", Class::Interactive, 400)
+            .unwrap_err();
+        assert!(error.contains("KV budget exhausted"), "{error}");
+
+        assert!(
+            events.try_recv().is_err(),
+            "a failed reservation must not drop anybody's backend cache"
+        );
+        assert_eq!(
+            scheduler.kv_used().0,
+            900,
+            "B's accounting must survive a reservation that never happened"
+        );
+    }
+
+    /// The same shape, but the eviction is enough. Here B really is evicted,
+    /// and the caller is handed its name so it can be told to replay.
+    #[test]
+    fn a_reservation_that_can_succeed_reports_every_cache_it_dropped() {
+        let (scheduler, events) = scheduler(1000);
+        scheduler.reserve_kv("A", "mock", Class::Interactive, 400).unwrap();
+        scheduler.mark_idle("A");
+        scheduler.reserve_kv("B", "mock", Class::Background, 200).unwrap();
+        scheduler.mark_idle("B");
+
+        let evicted = scheduler
+            .reserve_kv("C", "mock", Class::Interactive, 500)
+            .unwrap();
+        // Only B: background goes first, and once it fits nobody else is
+        // touched. Evicting A as well would be a cache destroyed for nothing.
+        assert_eq!(evicted, vec!["B"]);
+        assert_eq!(events.recv().unwrap(), "drop mock/B");
+        assert!(
+            events.try_recv().is_err(),
+            "no cache may be dropped that the caller was not told about"
+        );
+        assert_eq!(scheduler.kv_used().0, 900, "A (400) plus C (500)");
+    }
+
+    /// When one pass is not enough, idle interactive caches go too — and every
+    /// one of them still comes back in the returned list.
+    #[test]
+    fn a_larger_reservation_reaches_past_the_background_pass() {
+        let (scheduler, events) = scheduler(1000);
+        scheduler.reserve_kv("A", "mock", Class::Interactive, 400).unwrap();
+        scheduler.mark_idle("A");
+        scheduler.reserve_kv("B", "mock", Class::Background, 200).unwrap();
+        scheduler.mark_idle("B");
+
+        let evicted = scheduler
+            .reserve_kv("C", "mock", Class::Interactive, 900)
+            .unwrap();
+        assert_eq!(evicted, vec!["B", "A"], "background first, then idle interactive");
+        let mut dropped = vec![events.recv().unwrap(), events.recv().unwrap()];
+        dropped.sort();
+        assert_eq!(dropped, vec!["drop mock/A", "drop mock/B"]);
+        assert_eq!(scheduler.kv_used().0, 900);
+    }
+
     #[test]
     fn a_session_with_a_request_in_flight_is_never_evicted() {
         let (scheduler, _events) = scheduler(1000);
@@ -483,7 +590,7 @@ mod tests {
         let error = scheduler
             .reserve_kv("chat", "mock", Class::Interactive, 900)
             .unwrap_err();
-        assert!(error.contains("nothing evictable"), "{error}");
+        assert!(error.contains("only 0 of it evictable"), "{error}");
     }
 
     #[test]
