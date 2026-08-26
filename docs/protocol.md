@@ -319,9 +319,16 @@ one a message body claimed, and re-reads the process start time afterwards so
 a recycled pid cannot substitute itself mid-read.
 
 The daemon believes it because of who is calling, never because of what the
-call says: `policy.portal_units` is a prefix list matched against the caller's
-systemd unit (from its cgroup, which is world-readable and not self-chosen)
-and against its executable name. Emptying that list turns portal identity off.
+call says: `policy.portal_units` is a list of exact unit names, matched
+against the caller's systemd unit (from its cgroup, which is world-readable and
+not self-chosen) and against its executable name. Only the `.service` suffix
+is optional, so an administrator may write either spelling of the same unit;
+everything else must match to the character. Not a prefix, deliberately: a
+prefix would cover the `-gtk`/`-gnome`/`-kde` variants in one line and would
+also let any user write
+`~/.config/systemd/user/xdg-desktop-portal-anything.service` and be believed
+about every application on the machine, so the variants are listed one by one.
+Emptying that list turns portal identity off.
 An app that sets `portal_app_id` itself is refused twice — by the portal,
 which will not forward a caller-chosen id, and by the daemon, which will not
 take the claim from anything not on the list.

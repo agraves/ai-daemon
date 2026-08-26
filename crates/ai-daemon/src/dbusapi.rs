@@ -63,7 +63,7 @@ pub struct Manager {
 /// The suffix is optional in the configured name purely so an administrator
 /// can write `ai-daemon-portal` or `ai-daemon-portal.service` and mean the
 /// same unit. Everything else must match to the character.
-fn is_trusted_introducer(allowed: &[String], unit: Option<&str>, exe: Option<&str>) -> bool {
+pub(crate) fn is_trusted_introducer(allowed: &[String], unit: Option<&str>, exe: Option<&str>) -> bool {
     let matches = |candidate: &str, name: &str| {
         candidate == name || candidate.strip_suffix(".service") == Some(name)
     };

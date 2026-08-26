@@ -52,19 +52,23 @@ gate_group = "ai"
 # another user's /proc/<pid>/exe — an exe check would never pass.
 shim_user = "ai-daemon-shim"
 
-# Who may say "I am calling on behalf of application X". Matched as a prefix
-# against the caller's systemd unit, and against its executable name where
-# that can be read. Only a sandboxed app has a forgeable-by-nobody identity,
-# and only a process outside the sandbox can read it, so somebody has to be
-# trusted to carry it — this is the list of who.
+# Who may say "I am calling on behalf of application X". Matched against the
+# caller's systemd unit, and against its executable name where that can be
+# read. Only a sandboxed app has a forgeable-by-nobody identity, and only a
+# process outside the sandbox can read it, so somebody has to be trusted to
+# carry it — this is the list of who.
 #
 # Adding a name here grants that process the right to name any application it
 # likes. Emptying the list turns portal identity off, which is the right
 # setting for a machine with no desktop session.
-# Exact unit names, never prefixes. A prefix would be tidier — the desktop
-# variants below differ only by a suffix — and it would also mean any user
-# could write ~/.config/systemd/user/xdg-desktop-portal-anything.service and
-# be believed about every application on the machine.
+#
+# Exact unit names, never prefixes — only the .service suffix is optional, so
+# either spelling of the same unit means the same unit. A prefix would be
+# tidier, since the desktop variants below differ only by a suffix, and it
+# would also mean any user could write
+# ~/.config/systemd/user/xdg-desktop-portal-anything.service and be believed
+# about every application on the machine. That is why they are listed one by
+# one; add yours here rather than shortening the list.
 portal_units = [
   "xdg-desktop-portal",
   "xdg-desktop-portal-gtk",

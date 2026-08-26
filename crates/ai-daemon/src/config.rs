@@ -88,12 +88,19 @@ pub struct Policy {
     pub shim_user: String,
     /// Which callers may assert an application identity for somebody else.
     ///
-    /// Matched as a prefix against the caller's systemd unit, and against its
-    /// executable name where that is readable. A short list rather than a
-    /// single hardcoded name because there are two implementations of the same
-    /// job — xdg-desktop-portal once `org.freedesktop.portal.AI` is accepted
-    /// upstream, and `ai-daemon-portal` until then — and because a distro that
-    /// ships a third has somewhere to say so that is not a patch.
+    /// Matched against the caller's systemd unit, and against its executable
+    /// name where that is readable. Exact names, not prefixes — see
+    /// [`crate::dbusapi::is_trusted_introducer`], which is where the reason
+    /// lives and where a prefix test was a real privilege hole. Only the
+    /// `.service` suffix is optional in what is written here.
+    ///
+    /// A list rather than a single hardcoded name because there are two
+    /// implementations of the same job — xdg-desktop-portal once
+    /// `org.freedesktop.portal.AI` is accepted upstream, and
+    /// `ai-daemon-portal` until then — because the desktop ships `-gtk`,
+    /// `-gnome` and `-kde` variants that a prefix would have covered and an
+    /// exact list must name, and because a distro that ships another has
+    /// somewhere to say so that is not a patch.
     ///
     /// Emptying this list turns portal identity off entirely, which is a
     /// reasonable thing for a machine with no desktop to do. Adding to it is
@@ -448,6 +455,45 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shipped config and the compiled default must agree about who may
+    /// speak for an application.
+    ///
+    /// Two lists of the same eight unit names, in two files, and nothing was
+    /// stopping them drifting: an install that never wrote a config would
+    /// trust one set and an administrator reading /etc/ai-daemon/config.toml
+    /// would believe another. For a key whose whole job is granting the right
+    /// to name any app on the machine, "the documentation and the behaviour
+    /// disagree" is the failure mode, not a tidiness complaint — a stale
+    /// *description* of this key is what prompted this test.
+    #[test]
+    fn the_shipped_config_agrees_with_the_compiled_default_about_portals() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/config/config.toml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let shipped: Config = toml::from_str(&text)
+            .unwrap_or_else(|e| panic!("the shipped config does not parse: {e}"));
+
+        assert_eq!(
+            shipped.policy.portal_units,
+            default_portal_units(),
+            "packaging/config/config.toml and default_portal_units() disagree \
+             about who may assert an application identity"
+        );
+        // And it is not a prefix list, whatever any comment says: every name
+        // must be one is_trusted_introducer actually accepts.
+        for name in &shipped.policy.portal_units {
+            assert!(
+                crate::dbusapi::is_trusted_introducer(
+                    &shipped.policy.portal_units,
+                    Some(&format!("{name}.service")),
+                    None
+                ),
+                "{name} is listed but would not be trusted"
+            );
+        }
+    }
 
     fn backend_toml(body: &str) -> Result<Config, String> {
         let text = format!("[[backend]]\nname = \"x\"\n{body}");
