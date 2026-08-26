@@ -28,9 +28,18 @@ pub const CAP_GENERATE: &str = "generate";
 pub const CAP_GENERATE_TOOLS: &str = "generate-tools";
 pub const CAP_EMBED: &str = "embed";
 pub const CAP_MODEL_ADMIN: &str = "model-admin";
+/// Producing an image or a clip (§11). Separate from `generate` because a
+/// user may reasonably let an app write text and not let it synthesise a
+/// voice, and a permission that cannot be withheld on its own is not one.
+pub const CAP_GENERATE_MEDIA: &str = "generate-media";
 
-pub const ALL_CAPABILITIES: [&str; 4] =
-    [CAP_GENERATE, CAP_GENERATE_TOOLS, CAP_EMBED, CAP_MODEL_ADMIN];
+pub const ALL_CAPABILITIES: [&str; 5] = [
+    CAP_GENERATE,
+    CAP_GENERATE_TOOLS,
+    CAP_GENERATE_MEDIA,
+    CAP_EMBED,
+    CAP_MODEL_ADMIN,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -243,6 +252,7 @@ impl PolicyEngine {
                     let action = match capability {
                         CAP_EMBED => "io.github.agraves.aidaemon.embed",
                         CAP_GENERATE_TOOLS => "io.github.agraves.aidaemon.generate-tools",
+                        CAP_GENERATE_MEDIA => "io.github.agraves.aidaemon.generate-media",
                         _ => "io.github.agraves.aidaemon.generate",
                     };
                     match self.ask_polkit(identity, action) {

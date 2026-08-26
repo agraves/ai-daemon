@@ -9,20 +9,48 @@
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::sync::{mpsc, Arc, Mutex};
 
 use ai_daemon_proto::backend::{BackendEvent, BackendRequest, RawAttachment};
 use ai_daemon_proto::frame::{
-    self, AttachKind, AttachMeta, Event, Frame, Message, Params, Request, SessionInfo, ToolSchema,
-    Usage,
+    self, AttachKind, AttachMeta, Event, Frame, MediaKind, MediaOut, Message, Params, Request,
+    SessionInfo, ToolResultItem, ToolSchema, Usage,
 };
 use ai_daemon_proto::DATA_PROTO;
 
 use crate::backend::Backend;
 use crate::decode;
 use crate::grammar;
-use crate::policy::{Limits, CAP_EMBED, CAP_GENERATE, CAP_GENERATE_TOOLS};
+use crate::policy::{Limits, CAP_EMBED, CAP_GENERATE, CAP_GENERATE_MEDIA, CAP_GENERATE_TOOLS};
 use crate::state::{Daemon, Session};
+
+/// How long the daemon will wait for a backend to say anything at all.
+///
+/// A backend request that dies without sending `done` used to leave the
+/// session thread in `recv()` for good: the backend process is still alive, so
+/// nothing closes the channel, and the client holds a session that will never
+/// answer while a decode slot nobody can reclaim stays held. A panicking
+/// worker thread inside a backend is enough to cause it, which is not
+/// hypothetical — it is what a backend bug looks like from here.
+///
+/// Generous, because a slow first token is real and the llama.cpp backend
+/// already bounds its own silence at ten minutes. This is the outer net for a
+/// backend that has stopped existing in every way except closing its socket.
+const BACKEND_SILENCE_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// What to tell the client when the wait ended without an answer.
+fn stalled(backend: &str, reason: std::sync::mpsc::RecvTimeoutError) -> String {
+    match reason {
+        std::sync::mpsc::RecvTimeoutError::Timeout => format!(
+            "backend {backend} went silent for {}s without finishing the request",
+            BACKEND_SILENCE_TIMEOUT.as_secs()
+        ),
+        std::sync::mpsc::RecvTimeoutError::Disconnected => {
+            format!("backend {backend} stopped answering")
+        }
+    }
+}
 use crate::{debug, info, warn};
 
 pub type Sink = Arc<Mutex<UnixStream>>;
@@ -78,7 +106,8 @@ pub fn spawn(
                 tools: None,
                 params: Params::default(),
                 grammar: None,
-                pending_tool_call: None,
+            pending_tool_calls: Vec::new(),
+            proto: ai_daemon_proto::MIN_DATA_PROTO,
             };
             worker.run(frames);
             worker.teardown();
@@ -214,7 +243,14 @@ struct Worker {
     tools: Option<Vec<ToolSchema>>,
     params: Params,
     grammar: Option<String>,
-    pending_tool_call: Option<String>,
+    /// Calls the model has made and the client has not answered. A list
+    /// rather than one, because a v2 client can be handed several at once and
+    /// the turn resumes only when the last of them comes back.
+    pending_tool_calls: Vec<String>,
+    /// What the client said it speaks. A v1 client is never sent anything v2
+    /// added, which is what lets the protocol grow without breaking readers
+    /// that have never heard of the additions.
+    proto: u32,
 }
 
 impl Worker {
@@ -251,13 +287,20 @@ impl Worker {
     fn dispatch(&mut self, request: Request, frames: &mpsc::Receiver<Frame>) -> Result<(), bool> {
         match request {
             Request::Hello { proto } => {
-                if proto != 0 && proto != DATA_PROTO {
+                // Zero means "whatever you speak", which is what the first
+                // clients sent before there was a second version.
+                let asked = if proto == 0 { DATA_PROTO } else { proto };
+                if !(ai_daemon_proto::MIN_DATA_PROTO..=DATA_PROTO).contains(&asked) {
                     self.send(&Event::error(
                         "protocol",
-                        format!("this daemon speaks data protocol {DATA_PROTO}"),
+                        format!(
+                            "this daemon speaks data protocol {} to {DATA_PROTO}, not {asked}",
+                            ai_daemon_proto::MIN_DATA_PROTO
+                        ),
                     ));
                     return Err(true);
                 }
+                self.proto = asked;
                 let info = SessionInfo {
                     session: self.session.id.clone(),
                     model: self.session.model.clone(),
@@ -266,7 +309,9 @@ impl Worker {
                     capabilities: self.session_capabilities(),
                     max_context: self.session.max_context,
                 };
-                self.send(&Event::Hello { ok: true, proto: DATA_PROTO, session: info });
+                // Echo what was negotiated, not what we are capable of: the
+                // client needs to know which of the two it is talking.
+                self.send(&Event::Hello { ok: true, proto: self.proto, session: info });
                 Ok(())
             }
             Request::Attach { id, kind, meta, len } => self.attach(id, kind, meta, len, frames),
@@ -275,35 +320,20 @@ impl Worker {
                 self.params = params.unwrap_or_default();
                 self.tools = tools;
                 self.grammar = grammar;
-                self.pending_tool_call = None;
+                self.pending_tool_calls.clear();
                 self.turn(stream);
                 Ok(())
             }
             Request::ToolResult { id, content } => {
-                match self.pending_tool_call.take() {
-                    Some(expected) if expected == id => {
-                        self.history.push(Message {
-                            role: "tool".into(),
-                            content,
-                            attachments: Vec::new(),
-                            tool_call_id: Some(id),
-                        });
-                        self.turn(true);
-                    }
-                    Some(expected) => {
-                        self.pending_tool_call = Some(expected.clone());
-                        self.send(&Event::error(
-                            "protocol",
-                            format!("this session is waiting on tool call {expected}, not {id}"),
-                        ));
-                    }
-                    None => {
-                        self.send(&Event::error(
-                            "protocol",
-                            "no tool call is outstanding on this session",
-                        ));
-                    }
-                }
+                self.answer_tools(vec![ToolResultItem { id, content }]);
+                Ok(())
+            }
+            Request::ToolResults { results } => {
+                self.answer_tools(results);
+                Ok(())
+            }
+            Request::GenerateMedia { kind, prompt, params, count } => {
+                self.generate_media(kind, prompt, params.unwrap_or_default(), count);
                 Ok(())
             }
             Request::Embed { inputs } => {
@@ -319,6 +349,46 @@ impl Worker {
             // cancel with nothing to cancel — the session was idle — and the
             // flag the reader set is cleared by the next turn.
             Request::Cancel => Ok(()),
+        }
+    }
+
+    /// Take tool results, and resume once nothing is outstanding.
+    ///
+    /// One path for the single and batch forms, because the only difference
+    /// between them is how many arrive at a time: the turn resumes when the
+    /// last outstanding call has been answered, whichever request carried it.
+    fn answer_tools(&mut self, results: Vec<ToolResultItem>) {
+        if self.pending_tool_calls.is_empty() {
+            self.send(&Event::error(
+                "protocol",
+                "no tool call is outstanding on this session",
+            ));
+            return;
+        }
+        for result in results {
+            let Some(at) = self.pending_tool_calls.iter().position(|id| *id == result.id) else {
+                self.send(&Event::error(
+                    "protocol",
+                    format!(
+                        "this session is waiting on {:?}, not {}",
+                        self.pending_tool_calls, result.id
+                    ),
+                ));
+                return;
+            };
+            self.pending_tool_calls.remove(at);
+            self.history.push(Message {
+                role: "tool".into(),
+                content: result.content,
+                attachments: Vec::new(),
+                tool_call_id: Some(result.id),
+            });
+        }
+        // Still waiting on the rest: the model asked for several and the
+        // client has answered some. Resuming now would put the model in front
+        // of a half-answered question.
+        if self.pending_tool_calls.is_empty() {
+            self.turn(true);
         }
     }
 
@@ -642,6 +712,10 @@ impl Worker {
         let tools = self.tools.clone();
         let session_id = self.session.id.clone();
         let model_id = self.session.model.clone();
+        // Only ask for several when there is somewhere for them to go: a v1
+        // client cannot answer more than one, and a backend that produced
+        // three would have two of them dropped.
+        let parallel_tools = self.proto >= 2 && backend.can("parallel-tools");
         let begun = backend.begin(move |req_id| BackendRequest::Generate {
             req_id,
             model_id,
@@ -650,6 +724,7 @@ impl Worker {
             params,
             grammar: effective_grammar,
             tools,
+            parallel_tools,
             attachments,
         });
         let (req_id, events) = match begun {
@@ -675,14 +750,32 @@ impl Worker {
                 cancel_sent = true;
                 backend.cancel(req_id);
             }
-            match events.recv() {
-                Ok(BackendEvent::Token { tok, .. }) => {
+            match events.recv_timeout(BACKEND_SILENCE_TIMEOUT) {
+                Ok(BackendEvent::Token { tok, logprobs, .. }) => {
                     usage.completion_tokens += 1;
                     slot.charge(&self.session.id, 1);
-                    if stream && !self.send_ok(&Event::Token { tok }) {
+                    if stream && !self.send_ok(&Event::Token { tok, logprobs }) {
                         backend.cancel(req_id);
                         break;
                     }
+                }
+                Ok(BackendEvent::ToolCalls { tool_calls, .. }) => {
+                    // Inert data, several at a time. Same rule as one: the
+                    // daemon has no idea what any of these do (§10).
+                    for call in &tool_calls {
+                        self.history.push(Message {
+                            role: "assistant".into(),
+                            content: format!(
+                                "{{\"tool_call\":{{\"id\":\"{}\",\"name\":\"{}\",\"arguments\":{}}}}}",
+                                call.id, call.name, call.arguments
+                            ),
+                            attachments: Vec::new(),
+                            tool_call_id: Some(call.id.clone()),
+                        });
+                        self.pending_tool_calls.push(call.id.clone());
+                    }
+                    emitted_tool_call = true;
+                    self.send(&Event::ToolCalls { tool_calls });
                 }
                 Ok(BackendEvent::ToolCall { tool_call, .. }) => {
                     // Inert data. The daemon has no idea what this tool does
@@ -696,7 +789,7 @@ impl Worker {
                         attachments: Vec::new(),
                         tool_call_id: Some(tool_call.id.clone()),
                     });
-                    self.pending_tool_call = Some(tool_call.id.clone());
+                    self.pending_tool_calls.push(tool_call.id.clone());
                     emitted_tool_call = true;
                     self.send(&Event::ToolCall { tool_call });
                 }
@@ -715,11 +808,8 @@ impl Worker {
                     break;
                 }
                 Ok(other) => debug!("session {}: ignoring {other:?}", self.session.id),
-                Err(_) => {
-                    self.send(&Event::error(
-                        "backend-failed",
-                        format!("backend {} stopped answering", backend.name),
-                    ));
+                Err(reason) => {
+                    self.send(&Event::error("backend-failed", stalled(&backend.name, reason)));
                     break;
                 }
             }
@@ -742,6 +832,172 @@ impl Worker {
         totals.prompt_tokens += usage.prompt_tokens;
         totals.completion_tokens += usage.completion_tokens;
         totals.attachment_tokens += usage.attachment_tokens;
+    }
+
+    /// Generate an image or a clip (§11's deferred output half).
+    ///
+    /// A separate capability in the grant table, not a corner of `generate`.
+    /// §11 asks for that and it is right: a user may reasonably let an app
+    /// write text and not let it synthesise a voice, and a capability that
+    /// cannot be withheld separately is not one.
+    fn generate_media(&mut self, kind: MediaKind, prompt: String, params: Params, count: u32) {
+        if self.proto < 2 {
+            self.send(&Event::error(
+                "protocol",
+                "media output needs data protocol 2; say hello with it",
+            ));
+            return;
+        }
+        if let Err(reason) = self.daemon.policy.check(&self.session.identity, CAP_GENERATE_MEDIA) {
+            self.daemon.audit.denied(&self.session.identity, CAP_GENERATE_MEDIA, &reason);
+            self.send(&Event::error("policy-denied", reason));
+            return;
+        }
+        let backend = match self.daemon.backends.get(&self.session.backend) {
+            Ok(backend) => backend,
+            Err(e) => {
+                self.send(&Event::error("backend-failed", e));
+                return;
+            }
+        };
+        if !backend.can(kind.capability()) {
+            self.send(&Event::error(
+                "attachment-unsupported",
+                format!("backend {} does not {}", backend.name, kind.capability()),
+            ));
+            return;
+        }
+
+        let budget = &self.daemon.config.attachments;
+        let count = count.clamp(1, budget.max_per_session);
+        let loaded = match backend.load(
+            &self.session.model,
+            &self.session.blob,
+            &self.session.digest,
+            self.session.max_context,
+        ) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                self.send(&Event::error("backend-failed", format!("loading {}: {e}", self.session.model)));
+                return;
+            }
+        };
+        let _ = loaded;
+
+        // Charged against the same allowance as everything else, estimated
+        // from the prompt: a request that produces pictures still costs the
+        // machine, and leaving it uncharged would make media the way to get
+        // around a rate limit written for text.
+        let estimate = estimate_tokens(&prompt) + u64::from(count) * 64;
+        if !self
+            .daemon
+            .policy
+            .charge_tokens(&self.session.identity, &self.limits, estimate)
+        {
+            self.send(&Event::error(
+                "rate-limited",
+                format!(
+                    "{} is over its {} tokens/minute allowance",
+                    self.session.identity.key(),
+                    self.limits.tokens_per_minute
+                ),
+            ));
+            return;
+        }
+
+        self.session.cancelled.store(false, Ordering::SeqCst);
+        let slot = self.daemon.scheduler.admit(&self.session.id, self.session.class);
+        let session_id = self.session.id.clone();
+        let model_id = self.session.model.clone();
+        let begun = backend.begin(move |req_id| BackendRequest::GenerateMedia {
+            req_id,
+            model_id,
+            session_id,
+            kind,
+            prompt,
+            params,
+            count,
+        });
+        let (req_id, events) = match begun {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.send(&Event::error("backend-failed", e));
+                return;
+            }
+        };
+        slot.attach(&backend.name, req_id);
+        *self.session.current_req.lock().unwrap() = Some(req_id);
+
+        let mut usage = Usage::default();
+        let mut produced = 0u32;
+        let mut cancel_sent = false;
+        loop {
+            if !cancel_sent && self.session.cancelled.load(Ordering::SeqCst) {
+                cancel_sent = true;
+                backend.cancel(req_id);
+            }
+            match events.recv_timeout(BACKEND_SILENCE_TIMEOUT) {
+                Ok(BackendEvent::Media { kind, w, h, fmt, rate, data, .. }) => {
+                    if data.len() as u64 > ai_daemon_proto::frame::MAX_ATTACHMENT_PAYLOAD {
+                        self.send(&Event::error(
+                            "backend-failed",
+                            format!(
+                                "the backend produced {} bytes, past the {} one request can carry",
+                                data.len(),
+                                ai_daemon_proto::frame::MAX_ATTACHMENT_PAYLOAD
+                            ),
+                        ));
+                        break;
+                    }
+                    produced += 1;
+                    usage.media_bytes += data.len() as u64;
+                    let header = Event::Media {
+                        media: MediaOut {
+                            id: format!("{}-{produced}", self.session.id),
+                            kind,
+                            w,
+                            h,
+                            fmt,
+                            rate,
+                            len: data.len() as u64,
+                        },
+                    };
+                    if !self.send_ok(&header) {
+                        backend.cancel(req_id);
+                        break;
+                    }
+                    // The bytes follow the header, chunked by the writer, the
+                    // same shape an attachment uses coming the other way.
+                    let mut sink = self.sink.lock().unwrap();
+                    if frame::write_blob(&mut *sink, &data).is_err() {
+                        drop(sink);
+                        backend.cancel(req_id);
+                        break;
+                    }
+                }
+                Ok(BackendEvent::Done { usage: reported, finish_reason, .. }) => {
+                    usage.media_bytes = usage.media_bytes.max(reported.media_bytes);
+                    self.send(&Event::Done { done: true, usage: usage.clone(), finish_reason });
+                    break;
+                }
+                Ok(BackendEvent::Error { code, message, .. }) => {
+                    self.send(&Event::error(&code, message));
+                    break;
+                }
+                Ok(other) => debug!("session {}: ignoring {other:?}", self.session.id),
+                Err(reason) => {
+                    self.send(&Event::error("backend-failed", stalled(&backend.name, reason)));
+                    break;
+                }
+            }
+        }
+        backend.finish(req_id);
+        *self.session.current_req.lock().unwrap() = None;
+        drop(slot);
+        self.daemon.scheduler.mark_idle(&self.session.id);
+        self.session
+            .attachment_bytes
+            .fetch_add(usage.media_bytes, Ordering::Relaxed);
     }
 
     fn embed(&self, inputs: Vec<String>) {
@@ -812,7 +1068,7 @@ impl Worker {
         events: std::sync::mpsc::Receiver<BackendEvent>,
     ) {
         loop {
-            match events.recv() {
+            match events.recv_timeout(BACKEND_SILENCE_TIMEOUT) {
                 Ok(BackendEvent::Vectors { vectors, .. }) => {
                     self.send(&Event::Vectors { vectors });
                 }
@@ -828,8 +1084,8 @@ impl Worker {
                     break;
                 }
                 Ok(_) => {}
-                Err(_) => {
-                    self.send(&Event::error("backend-failed", "backend stopped answering"));
+                Err(reason) => {
+                    self.send(&Event::error("backend-failed", stalled(&backend.name, reason)));
                     break;
                 }
             }

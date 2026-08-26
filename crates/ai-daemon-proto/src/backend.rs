@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::frame::{Message, Params, ToolCall, ToolSchema, Usage};
+use crate::frame::{MediaKind, Message, Params, ToolCall, ToolSchema, Usage};
 
 /// What a backend says it can do, in its `hello` reply.
 ///
@@ -38,7 +38,14 @@ pub struct BackendInfo {
     /// is the whole device".
     #[serde(default)]
     pub device_memory: Option<u64>,
-    /// `generate`, `embed`, `logprobs`, `grammar`, `vision`, `audio-in`, `tools`.
+    /// `generate`, `embed`, `logprobs`, `grammar`, `vision`, `audio-in`,
+    /// `tools`, and from protocol v2 `parallel-tools`, `image-out`,
+    /// `audio-out`.
+    ///
+    /// The daemon asks for nothing a backend has not claimed here, which is
+    /// what lets v2 be added without breaking a backend that still speaks v1:
+    /// an old backend simply never claims the new capabilities and is never
+    /// sent the new requests.
     pub capabilities: Vec<String>,
     /// False for a backend that sends bytes off this machine (§7). The daemon
     /// propagates this into every consent prompt and session info; it is never
@@ -125,6 +132,12 @@ pub enum BackendRequest {
         grammar: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tools: Option<Vec<ToolSchema>>,
+        /// Whether the daemon can forward more than one tool call from this
+        /// turn (protocol v2). False when the client speaks v1, so the backend
+        /// produces one and the model's intent is not silently truncated on
+        /// the way out.
+        #[serde(default)]
+        parallel_tools: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<RawAttachment>,
     },
@@ -132,6 +145,18 @@ pub enum BackendRequest {
         req_id: u64,
         model_id: String,
         inputs: Vec<String>,
+    },
+    /// Protocol v2. Only sent to a backend claiming `image-out` or
+    /// `audio-out` for the matching kind.
+    GenerateMedia {
+        req_id: u64,
+        model_id: String,
+        session_id: String,
+        kind: MediaKind,
+        prompt: String,
+        #[serde(default)]
+        params: Params,
+        count: u32,
     },
     Tokenize {
         req_id: u64,
@@ -177,10 +202,37 @@ pub enum BackendEvent {
     Token {
         req_id: u64,
         tok: String,
+        /// Protocol v2, and only when the request asked for it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logprobs: Option<Vec<crate::frame::TokenProb>>,
     },
     ToolCall {
         req_id: u64,
         tool_call: ToolCall,
+    },
+    /// Protocol v2. A backend claiming `parallel-tools` may answer with
+    /// several at once; the daemon forwards them whole to a v2 client and
+    /// takes only the first for a v1 one.
+    ToolCalls {
+        req_id: u64,
+        tool_calls: Vec<ToolCall>,
+    },
+    /// Protocol v2. One produced image or clip, raw — the daemon frames it for
+    /// the client. Bounded by the same per-request ceiling as an attachment,
+    /// because it crosses the same single CBOR frame to get here.
+    Media {
+        req_id: u64,
+        kind: MediaKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        w: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        h: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fmt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate: Option<u32>,
+        #[serde(with = "serde_bytes_compat")]
+        data: Vec<u8>,
     },
     Vectors {
         req_id: u64,

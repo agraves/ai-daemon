@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ai_daemon_proto::backend::{BackendEvent, BackendInfo, BackendRequest};
-use ai_daemon_proto::frame::{self, Message, Params, ToolCall, Usage};
+use ai_daemon_proto::frame::{self, Message, Params, ToolCall, TokenProb, Usage};
 use ai_daemon_proto::BACKEND_PROTO;
 
 const NAME: &str = "llamacpp";
@@ -308,6 +308,18 @@ fn handle(state: &Arc<State>, writer: &Writer, request: BackendRequest) -> std::
         // is nothing for this backend to drop that the server will not drop
         // itself. Saying so beats pretending to have complied.
         BackendRequest::DropCache { .. } => {}
+        // Declared by neither capability, so the daemon will not send this —
+        // but a backend should refuse clearly rather than fall through a match
+        // if one ever arrives. llama.cpp runs language models; diffusion and
+        // speech are a different model class and, per §11, plausibly a
+        // different backend entirely.
+        BackendRequest::GenerateMedia { req_id, kind, .. } => {
+            send(writer, &BackendEvent::Error {
+                req_id: Some(req_id),
+                code: "attachment-unsupported".into(),
+                message: format!("{NAME} does not generate {}", kind.as_str()),
+            });
+        }
         BackendRequest::Shutdown => return std::ops::ControlFlow::Break(()),
     }
     std::ops::ControlFlow::Continue(())
@@ -492,6 +504,33 @@ fn generate(
     if let Some(grammar) = grammar {
         request["grammar"] = serde_json::json!(grammar);
     }
+    // The v2 sampling controls llama-server has fields for. top_k, min_p and
+    // repeat_penalty are native to it; logprobs was in this backend's declared
+    // capabilities from the first commit and was never actually wired, which
+    // made the claim false — it is wired now.
+    if let Some(top_k) = params.top_k {
+        request["top_k"] = serde_json::json!(top_k);
+    }
+    if let Some(min_p) = params.min_p {
+        request["min_p"] = serde_json::json!(min_p);
+    }
+    if let Some(penalty) = params.repeat_penalty {
+        request["repeat_penalty"] = serde_json::json!(penalty);
+    }
+    if !params.logit_bias.is_empty() {
+        // llama-server takes [[token, bias], …] rather than an object.
+        request["logit_bias"] = serde_json::Value::Array(
+            params
+                .logit_bias
+                .iter()
+                .map(|(token, bias)| serde_json::json!([token, bias]))
+                .collect(),
+        );
+    }
+    if let Some(wanted) = params.logprobs.filter(|n| *n > 0) {
+        request["logprobs"] = serde_json::json!(true);
+        request["top_logprobs"] = serde_json::json!(wanted);
+    }
 
     let mut stream = open(port)?;
     match stream.try_clone() {
@@ -599,7 +638,25 @@ fn generate(
         completion.push_str(token);
         emitted += 1;
         if !has_tools {
-            send(writer, &BackendEvent::Token { req_id, tok: token.to_string() });
+            let logprobs = choice
+                .get("logprobs")
+                .and_then(|l| l.get("content"))
+                .and_then(|c| c.as_array())
+                .and_then(|entries| entries.first())
+                .and_then(|entry| entry.get("top_logprobs"))
+                .and_then(|top| top.as_array())
+                .map(|alternatives| {
+                    alternatives
+                        .iter()
+                        .filter_map(|alternative| {
+                            Some(TokenProb {
+                                tok: alternative.get("token")?.as_str()?.to_string(),
+                                logprob: alternative.get("logprob")?.as_f64()? as f32,
+                            })
+                        })
+                        .collect()
+                });
+            send(writer, &BackendEvent::Token { req_id, tok: token.to_string(), logprobs });
         }
     }
 
@@ -615,7 +672,7 @@ fn generate(
             }
             None => {
                 for token in completion.split_inclusive(' ') {
-                    send(writer, &BackendEvent::Token { req_id, tok: token.to_string() });
+                    send(writer, &BackendEvent::Token { req_id, tok: token.to_string(), logprobs: None });
                 }
             }
         }
@@ -626,7 +683,7 @@ fn generate(
         usage: Usage {
             prompt_tokens,
             completion_tokens: emitted,
-            attachment_tokens: 0,
+            ..Usage::default()
         },
         finish_reason: finish_reason.or_else(|| Some("stop".into())),
     });

@@ -25,7 +25,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ai_daemon_proto::backend::{BackendEvent, BackendInfo, BackendRequest, RawAttachment};
-use ai_daemon_proto::frame::{self, Message, Params, ToolCall, ToolSchema, Usage};
+use ai_daemon_proto::frame::{
+    self, MediaKind, Message, Params, ToolCall, ToolSchema, TokenProb, Usage,
+};
 use ai_daemon_proto::BACKEND_PROTO;
 
 const NAME: &str = "mock";
@@ -118,8 +120,11 @@ fn handle(state: &Arc<State>, writer: &Writer, request: BackendRequest) -> std::
                             "logprobs".into(),
                             "grammar".into(),
                             "tools".into(),
+                            "parallel-tools".into(),
                             "vision".into(),
                             "audio-in".into(),
+                            "image-out".into(),
+                            "audio-out".into(),
                         ],
                         local: true,
                     },
@@ -160,6 +165,7 @@ fn handle(state: &Arc<State>, writer: &Writer, request: BackendRequest) -> std::
             params,
             grammar,
             tools,
+            parallel_tools,
             attachments,
         } => {
             let paused = Arc::new(AtomicBool::new(false));
@@ -171,7 +177,8 @@ fn handle(state: &Arc<State>, writer: &Writer, request: BackendRequest) -> std::
             std::thread::spawn(move || {
                 generate(
                     &state, &writer, req_id, &model_id, &session_id, &messages, &params,
-                    grammar.as_deref(), tools.as_deref(), &attachments, &paused, &cancelled,
+                    grammar.as_deref(), tools.as_deref(), parallel_tools, &attachments,
+                    &paused, &cancelled,
                 );
                 state.paused.lock().unwrap().remove(&req_id);
                 state.cancelled.lock().unwrap().remove(&req_id);
@@ -185,7 +192,7 @@ fn handle(state: &Arc<State>, writer: &Writer, request: BackendRequest) -> std::
                 writer,
                 &BackendEvent::Done {
                     req_id,
-                    usage: Usage { prompt_tokens: tokens, completion_tokens: 0, attachment_tokens: 0 },
+                    usage: Usage { prompt_tokens: tokens, completion_tokens: 0, ..Usage::default() },
                     finish_reason: Some("stop".into()),
                 },
             );
@@ -198,7 +205,7 @@ fn handle(state: &Arc<State>, writer: &Writer, request: BackendRequest) -> std::
                 writer,
                 &BackendEvent::Done {
                     req_id,
-                    usage: Usage { prompt_tokens: count, completion_tokens: 0, attachment_tokens: 0 },
+                    usage: Usage { prompt_tokens: count, completion_tokens: 0, ..Usage::default() },
                     finish_reason: Some("stop".into()),
                 },
             );
@@ -221,6 +228,13 @@ fn handle(state: &Arc<State>, writer: &Writer, request: BackendRequest) -> std::
         BackendRequest::DropCache { session_id } => {
             state.dropped.lock().unwrap().push(session_id);
         }
+        BackendRequest::GenerateMedia { req_id, model_id, kind, prompt, params, count, .. } => {
+            let writer = writer.clone();
+            let state = state.clone();
+            std::thread::spawn(move || {
+                generate_media(&state, &writer, req_id, &model_id, kind, &prompt, &params, count);
+            });
+        }
         BackendRequest::Shutdown => return std::ops::ControlFlow::Break(()),
     }
     std::ops::ControlFlow::Continue(())
@@ -237,6 +251,7 @@ fn generate(
     params: &Params,
     grammar: Option<&str>,
     tools: Option<&[ToolSchema]>,
+    parallel_tools: bool,
     attachments: &[RawAttachment],
     paused: &AtomicBool,
     cancelled: &AtomicBool,
@@ -267,23 +282,31 @@ fn generate(
     let answered_a_tool = messages.iter().any(|m| m.role == "tool");
     if let Some(tools) = tools {
         if !answered_a_tool && !tools.is_empty() {
-            let tool = &tools[0];
-            send(
-                writer,
-                &BackendEvent::ToolCall {
-                    req_id,
-                    tool_call: ToolCall {
-                        id: format!("call-{req_id}"),
-                        name: tool.name.clone(),
-                        arguments: sample_arguments(&tool.json_schema),
-                    },
-                },
-            );
+            // Every offered tool at once. A fixture that always calls exactly
+            // one could not tell a daemon that handles parallel calls from one
+            // that quietly drops all but the first, which is the property
+            // being added.
+            let calls: Vec<ToolCall> = tools
+                .iter()
+                .enumerate()
+                .map(|(index, tool)| ToolCall {
+                    id: format!("call-{req_id}-{index}"),
+                    name: tool.name.clone(),
+                    arguments: sample_arguments(&tool.json_schema),
+                })
+                .collect();
+            if calls.len() == 1 || !parallel_tools {
+                // One only: either that is all there was, or the daemon said
+                // the client on the far end cannot answer more.
+                send(writer, &BackendEvent::ToolCall { req_id, tool_call: calls[0].clone() });
+            } else {
+                send(writer, &BackendEvent::ToolCalls { req_id, tool_calls: calls });
+            }
             send(
                 writer,
                 &BackendEvent::Done {
                     req_id,
-                    usage: Usage { prompt_tokens, completion_tokens: 8, attachment_tokens: 0 },
+                    usage: Usage { prompt_tokens, completion_tokens: 8, ..Usage::default() },
                     finish_reason: Some("tool_call".into()),
                 },
             );
@@ -320,14 +343,25 @@ fn generate(
                     usage: Usage {
                         prompt_tokens,
                         completion_tokens: emitted as u64,
-                        attachment_tokens: 0,
+                        ..Usage::default()
                     },
                     finish_reason: Some("cancelled".into()),
                 },
             );
             return;
         }
-        send(writer, &BackendEvent::Token { req_id, tok: token.clone() });
+        // Deterministic alternatives: the emitted token at a high probability
+        // and a fixed ladder below it. Useless as a distribution, checkable as
+        // a shape, which is what a fixture is for.
+        let logprobs = params.logprobs.filter(|n| *n > 0).map(|wanted| {
+            (0..wanted.min(8))
+                .map(|rank| TokenProb {
+                    tok: if rank == 0 { token.clone() } else { format!("alt{rank}") },
+                    logprob: -(rank as f32) - 0.1,
+                })
+                .collect()
+        });
+        send(writer, &BackendEvent::Token { req_id, tok: token.clone(), logprobs });
         emitted += 1;
         // Slow enough that streaming is observably streaming, fast enough that
         // a test suite does not notice.
@@ -342,8 +376,100 @@ fn generate(
                 prompt_tokens,
                 completion_tokens: emitted as u64,
                 attachment_tokens: attachments.len() as u64,
+                ..Usage::default()
             },
             finish_reason: Some(if emitted >= limit { "length" } else { "stop" }.into()),
+        },
+    );
+}
+
+/// Produce media without a model, deterministically.
+///
+/// A gradient and a sine wave. Nothing here is diffusion or speech; what is
+/// being exercised is the daemon's side — the capability gate, the policy
+/// capability, the framing of bytes back to a client, and the accounting —
+/// none of which is a property of the model that would eventually do it.
+#[allow(clippy::too_many_arguments)]
+fn generate_media(
+    state: &State,
+    writer: &Writer,
+    req_id: u64,
+    model_id: &str,
+    kind: MediaKind,
+    prompt: &str,
+    params: &Params,
+    count: u32,
+) {
+    if !state.models.lock().unwrap().contains_key(model_id) {
+        send(
+            writer,
+            &BackendEvent::Error {
+                req_id: Some(req_id),
+                code: "no-such-model".into(),
+                message: format!("{model_id} is not loaded"),
+            },
+        );
+        return;
+    }
+    // The prompt seeds it, so the same prompt gives the same bytes and a test
+    // can assert on them.
+    let seed = params.seed.unwrap_or_else(|| fnv(prompt));
+    let mut produced = 0u64;
+    for index in 0..count.max(1) {
+        let salt = seed.wrapping_add(index as u64);
+        let event = match kind {
+            MediaKind::Image => {
+                let (w, h) = (32u32, 24u32);
+                let mut data = Vec::with_capacity((w * h * 4) as usize);
+                for y in 0..h {
+                    for x in 0..w {
+                        data.push((x * 8 + (salt & 0xff) as u32) as u8);
+                        data.push((y * 10) as u8);
+                        data.push(((x + y) * 4) as u8);
+                        data.push(0xff);
+                    }
+                }
+                produced += data.len() as u64;
+                BackendEvent::Media {
+                    req_id,
+                    kind,
+                    w: Some(w),
+                    h: Some(h),
+                    fmt: Some("rgba8".into()),
+                    rate: None,
+                    data,
+                }
+            }
+            MediaKind::Audio => {
+                let rate = 16_000u32;
+                let samples = rate / 4; // a quarter second
+                let tone = 220.0 + (salt % 440) as f32;
+                let mut data = Vec::with_capacity(samples as usize * 4);
+                for n in 0..samples {
+                    let t = n as f32 / rate as f32;
+                    let value = (t * tone * std::f32::consts::TAU).sin() * 0.25;
+                    data.extend_from_slice(&value.to_le_bytes());
+                }
+                produced += data.len() as u64;
+                BackendEvent::Media {
+                    req_id,
+                    kind,
+                    w: None,
+                    h: None,
+                    fmt: None,
+                    rate: Some(rate),
+                    data,
+                }
+            }
+        };
+        send(writer, &event);
+    }
+    send(
+        writer,
+        &BackendEvent::Done {
+            req_id,
+            usage: Usage { media_bytes: produced, ..Usage::default() },
+            finish_reason: Some("stop".into()),
         },
     );
 }
@@ -444,6 +570,17 @@ fn sample_arguments(schema: &serde_json::Value) -> String {
         }
     }
     build(schema).to_string()
+}
+
+/// FNV-1a over some text, as a single number. Used to seed generated media
+/// from its prompt, so the same prompt gives the same bytes.
+fn fnv(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// FNV-1a over the text, spread into a unit vector. Deterministic, and similar

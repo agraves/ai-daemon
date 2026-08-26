@@ -17,7 +17,9 @@ use std::io::{BufReader, IsTerminal, Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 
-use ai_daemon_proto::frame::{self, Event, Frame, Message, Params, Request, ToolSchema};
+use ai_daemon_proto::frame::{
+    self, Event, Frame, MediaKind, Message, Params, Request, ToolResultItem, ToolSchema,
+};
 use ai_daemon_proto::DATA_PROTO;
 use zbus::blocking::Connection;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
@@ -56,6 +58,7 @@ fn main() {
         "pin" => pin(rest, true),
         "unpin" => pin(rest, false),
         "generate" => generate(rest),
+        "generate-media" => generate_media(rest),
         "embed" => embed(rest),
         "tokenize" => tokenize(rest),
         other => Err(format!("unknown command {other:?}; try `aidctl help`")),
@@ -358,6 +361,10 @@ fn generate(args: &[String]) -> Result<(), String> {
     let mut raw_image: Option<String> = None;
     let mut show_usage = false;
     let mut cancel_after: Option<u64> = None;
+    let mut logprobs: Option<u32> = None;
+    // So a v1 client can be impersonated on purpose. Without it, "we still
+    // serve the old protocol" is a claim with nothing behind it.
+    let mut proto = DATA_PROTO;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -372,6 +379,8 @@ fn generate(args: &[String]) -> Result<(), String> {
             "--image" => image = iter.next().cloned(),
             "--image-raw" => raw_image = iter.next().cloned(),
             "--usage" => show_usage = true,
+            "--logprobs" => logprobs = iter.next().and_then(|v| v.parse().ok()),
+            "--proto" => proto = iter.next().and_then(|v| v.parse().ok()).unwrap_or(DATA_PROTO),
             "--cancel-after" => cancel_after = iter.next().and_then(|v| v.parse().ok()),
             "--help" => {
                 println!(
@@ -386,6 +395,8 @@ fn generate(args: &[String]) -> Result<(), String> {
       --image-raw WxH:FILE
                         attach raw RGBA8 pixels, decoded by nobody
       --usage           print the usage record when the turn ends
+      --logprobs N      ask for N alternatives per token, and show them
+      --proto N         speak an older data protocol, to see what it is sent
       --cancel-after MS send the protocol's Cancel this long after asking, to
                         watch a generation actually stop
 
@@ -415,7 +426,7 @@ With no PROMPT, reads one from stdin."
     let mut socket = session.socket.try_clone().map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(session.socket.try_clone().map_err(|e| e.to_string())?);
 
-    frame::write_cbor(&mut socket, &Request::Hello { proto: DATA_PROTO })
+    frame::write_cbor(&mut socket, &Request::Hello { proto })
         .map_err(|e| format!("hello: {e}"))?;
     if let Some(Event::Hello { session: info, .. }) = read_event(&mut reader)? {
         eprintln!(
@@ -498,7 +509,11 @@ With no PROMPT, reads one from stdin."
         &Request::Generate {
             messages,
             stream: true,
-            params: Some(Params { max_tokens: Some(max_tokens), ..Default::default() }),
+            params: Some(Params {
+                max_tokens: Some(max_tokens),
+                logprobs,
+                ..Default::default()
+            }),
             grammar: None,
             tools: tools.clone(),
         },
@@ -520,8 +535,15 @@ With no PROMPT, reads one from stdin."
     loop {
         match read_event(&mut reader)? {
             None => break,
-            Some(Event::Token { tok }) => {
+            Some(Event::Token { tok, logprobs }) => {
                 print!("{tok}");
+                if let Some(alternatives) = logprobs {
+                    let shown: Vec<String> = alternatives
+                        .iter()
+                        .map(|a| format!("{}={:.2}", a.tok.trim(), a.logprob))
+                        .collect();
+                    print!("[{}]", shown.join(" "));
+                }
                 let _ = std::io::stdout().flush();
             }
             Some(Event::ToolCall { tool_call }) => {
@@ -532,12 +554,53 @@ With no PROMPT, reads one from stdin."
                 println!("[aidctl does not execute tools; replying with a canned result]");
                 frame::write_cbor(
                     &mut socket,
-                    &Request::ToolResult {
-                        id: tool_call.id.clone(),
-                        content: "{\"ok\":true,\"note\":\"canned result from aidctl\"}".into(),
-                    },
+                    &Request::ToolResult { id: tool_call.id.clone(), content: canned() },
                 )
                 .map_err(|e| format!("tool_result: {e}"))?;
+            }
+            Some(Event::ToolCalls { tool_calls }) => {
+                // The point of the batch: a real client runs these
+                // concurrently. Answering them one at a time would put back
+                // the serialisation the model just avoided.
+                println!("\n[tool_calls {}]", tool_calls.len());
+                for call in &tool_calls {
+                    println!("  {} {}({})", call.id, call.name, call.arguments);
+                }
+                println!("[aidctl does not execute tools; replying with canned results]");
+                frame::write_cbor(
+                    &mut socket,
+                    &Request::ToolResults {
+                        results: tool_calls
+                            .iter()
+                            .map(|call| ToolResultItem { id: call.id.clone(), content: canned() })
+                            .collect(),
+                    },
+                )
+                .map_err(|e| format!("tool_results: {e}"))?;
+            }
+            Some(Event::Media { media }) => {
+                let bytes = read_blob(&mut reader, media.len)?;
+                let name = match media.kind {
+                    MediaKind::Image => format!("{}.rgba", media.id),
+                    MediaKind::Audio => format!("{}.f32", media.id),
+                };
+                std::fs::write(&name, &bytes).map_err(|e| format!("{name}: {e}"))?;
+                match media.kind {
+                    MediaKind::Image => println!(
+                        "[media {} image {}x{} {} -> {name} ({} bytes)]",
+                        media.id,
+                        media.w.unwrap_or(0),
+                        media.h.unwrap_or(0),
+                        media.fmt.as_deref().unwrap_or("rgba8"),
+                        bytes.len()
+                    ),
+                    MediaKind::Audio => println!(
+                        "[media {} audio {} samples at {} Hz -> {name}]",
+                        media.id,
+                        bytes.len() / 4,
+                        media.rate.unwrap_or(0)
+                    ),
+                }
             }
             Some(Event::Notice { event, detail }) => {
                 eprintln!("\n[{event}] {detail}");
@@ -567,6 +630,97 @@ With no PROMPT, reads one from stdin."
         }
     }
 
+    session.close();
+    if exit != 0 {
+        std::process::exit(exit);
+    }
+    Ok(())
+}
+
+/// Ask for an image or a clip and write what comes back.
+fn generate_media(args: &[String]) -> Result<(), String> {
+    let mut model = "default".to_string();
+    let mut kind = MediaKind::Image;
+    let mut prompt = String::new();
+    let mut count: u32 = 1;
+    let mut proto = DATA_PROTO;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-m" | "--model" => model = iter.next().cloned().unwrap_or_default(),
+            "--audio" => kind = MediaKind::Audio,
+            "--image" => kind = MediaKind::Image,
+            "--count" => count = iter.next().and_then(|v| v.parse().ok()).unwrap_or(1),
+            "--proto" => proto = iter.next().and_then(|v| v.parse().ok()).unwrap_or(DATA_PROTO),
+            "--help" => {
+                println!(
+                    "usage: aidctl generate-media [--image|--audio] [-m MODEL] [--count N] PROMPT
+
+Writes each result beside you as <session>-<n>.rgba or .f32 — raw, because
+the daemon links no encoders any more than it links decoders. Needs the
+generate-media capability and a backend declaring image-out or audio-out."
+                );
+                return Ok(());
+            }
+            other if other.starts_with('-') => return Err(format!("unknown option {other:?}")),
+            other => prompt = other.to_string(),
+        }
+    }
+    if prompt.is_empty() {
+        return Err("give a prompt".into());
+    }
+
+    let session = open_session(&model, HashMap::new())?;
+    let mut socket = session.socket.try_clone().map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(session.socket.try_clone().map_err(|e| e.to_string())?);
+    frame::write_cbor(&mut socket, &Request::Hello { proto })
+        .map_err(|e| format!("hello: {e}"))?;
+    let _ = read_event(&mut reader);
+
+    frame::write_cbor(
+        &mut socket,
+        &Request::GenerateMedia { kind, prompt, params: None, count },
+    )
+    .map_err(|e| format!("generate_media: {e}"))?;
+
+    let mut exit = 0;
+    loop {
+        match read_event(&mut reader)? {
+            None => break,
+            Some(Event::Media { media }) => {
+                let bytes = read_blob(&mut reader, media.len)?;
+                let name = match media.kind {
+                    MediaKind::Image => format!("{}.rgba", media.id),
+                    MediaKind::Audio => format!("{}.f32", media.id),
+                };
+                std::fs::write(&name, &bytes).map_err(|e| format!("{name}: {e}"))?;
+                match media.kind {
+                    MediaKind::Image => println!(
+                        "image {}x{} {} -> {name} ({} bytes)",
+                        media.w.unwrap_or(0),
+                        media.h.unwrap_or(0),
+                        media.fmt.as_deref().unwrap_or("rgba8"),
+                        bytes.len()
+                    ),
+                    MediaKind::Audio => println!(
+                        "audio {} samples at {} Hz -> {name}",
+                        bytes.len() / 4,
+                        media.rate.unwrap_or(0)
+                    ),
+                }
+            }
+            Some(Event::Done { usage, .. }) => {
+                println!("usage: media_bytes={}", usage.media_bytes);
+                break;
+            }
+            Some(Event::Error { error }) => {
+                eprintln!("[{}] {}", error.code, error.message);
+                exit = 1;
+                break;
+            }
+            Some(_) => {}
+        }
+    }
     session.close();
     if exit != 0 {
         std::process::exit(exit);
@@ -653,6 +807,24 @@ fn tokenize(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn canned() -> String {
+    "{\"ok\":true,\"note\":\"canned result from aidctl\"}".into()
+}
+
+/// Read exactly `len` bytes of BLOB frames, the way every payload arrives.
+fn read_blob(reader: &mut impl Read, len: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(len.min(1 << 20) as usize);
+    while (bytes.len() as u64) < len {
+        match frame::read_frame(reader) {
+            Ok(Some(Frame::Blob(mut chunk))) => bytes.append(&mut chunk),
+            Ok(Some(Frame::Cbor(_))) => return Err("a request frame interrupted the payload".into()),
+            Ok(None) => return Err("the payload ended early".into()),
+            Err(e) => return Err(format!("payload: {e}")),
+        }
+    }
+    Ok(bytes)
+}
+
 fn read_event(reader: &mut impl Read) -> Result<Option<Event>, String> {
     match frame::read_frame(reader) {
         Ok(None) => Ok(None),
@@ -725,6 +897,7 @@ inspection
 
 using it
   generate [opts] [PROMPT]    open a session and stream an answer
+  generate-media [opts] PROMPT  ask for an image or a clip (§11)
   embed [-m MODEL] TEXT...    embedding vectors
   tokenize [-m MODEL] TEXT    token ids
 
@@ -733,7 +906,7 @@ administration (polkit action io.github.agraves.aidaemon.model-admin)
   remove NAME
   alias ALIAS MODEL
   pin MODEL | unpin MODEL
-  grant IDENTITY CAPABILITY   capabilities: generate, generate-tools, embed, model-admin
+  grant IDENTITY CAPABILITY   capabilities: generate, generate-tools, generate-media, embed, model-admin
   deny IDENTITY CAPABILITY
   revoke IDENTITY             forget every grant, and close live sessions
 

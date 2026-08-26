@@ -433,6 +433,31 @@ fn chat(stream: &mut TcpStream, request: &HttpRequest, peer: &Peer) -> Result<()
         stop: body.get("stop").and_then(|s| s.as_array()).map(|items| {
             items.iter().filter_map(|i| i.as_str().map(str::to_string)).collect()
         }),
+        // Of the v2 sampling controls, only the two OpenAI itself defines are
+        // mapped. top_k, min_p and repeat_penalty have no field in that API,
+        // and inventing one here would mean a client's request meaning
+        // something different through the shim than through the native
+        // protocol — which is the one thing a compatibility bridge must not do.
+        logit_bias: body
+            .get("logit_bias")
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(token, bias)| {
+                        Some((token.parse().ok()?, bias.as_f64()? as f32))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        logprobs: body
+            .get("top_logprobs")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .or_else(|| {
+                // Bare `logprobs: true` means the chosen token's own figure.
+                body.get("logprobs").and_then(|v| v.as_bool()).and_then(|on| on.then_some(1))
+            }),
+        ..Default::default()
     };
 
     frame::write_cbor(
@@ -467,7 +492,7 @@ fn relay_sse(
     loop {
         match read_event(reader)? {
             None => break,
-            Some(Event::Token { tok }) => {
+            Some(Event::Token { tok, .. }) => {
                 let chunk = serde_json::json!({
                     "id": id,
                     "object": "chat.completion.chunk",
@@ -572,7 +597,7 @@ fn relay_json(
         }
         match read_event(reader)? {
             None => break,
-            Some(Event::Token { tok }) => content.push_str(&tok),
+            Some(Event::Token { tok, .. }) => content.push_str(&tok),
             Some(Event::ToolCall { tool_call }) => tool_calls.push(serde_json::json!({
                 "id": tool_call.id,
                 "type": "function",

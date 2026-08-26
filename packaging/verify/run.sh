@@ -250,10 +250,69 @@ cat > /tmp/tools.json <<'JSON'
 JSON
 runas alice aidctl generate --max-tokens 24 --tool /tmp/tools.json "what is the weather in Oslo" >/tmp/tool.txt 2>&1
 run cat /tmp/tool.txt
-contains "the daemon emitted a structured tool_call" /tmp/tool.txt 'tool_call call-[0-9]+ get_weather'
+contains "the daemon emitted a structured tool_call" /tmp/tool.txt 'tool_call call-[0-9-]+ get_weather'
 contains "the arguments are well-formed JSON matching the schema" /tmp/tool.txt '\{"city":"mock"\}'
 contains "generation resumed in the same session after tool_result" /tmp/tool.txt 'Tool result seen'
 lacks "the daemon did not execute anything" /tmp/tool.txt 'executed|ran the tool'
+note "Parallel tool calls (protocol v2): two tools offered, both called at"
+note "once, both answered in one batch, and the turn resumes only after the"
+note "last of them comes back."
+cat > /tmp/tools2.json <<'JSON'
+[{"name": "get_weather",
+  "description": "Look up the weather",
+  "json_schema": {"type": "object",
+                  "properties": {"city": {"type": "string"}},
+                  "required": ["city"]}},
+ {"name": "get_time",
+  "description": "Look up the time",
+  "json_schema": {"type": "object",
+                  "properties": {"zone": {"type": "string"}},
+                  "required": ["zone"]}}]
+JSON
+runas alice aidctl generate --max-tokens 24 --tool /tmp/tools2.json \
+  "weather and time please" >/tmp/partool.txt 2>&1
+run cat /tmp/partool.txt
+contains "both calls arrived in one batch" /tmp/partool.txt '^\[tool_calls 2\]'
+contains "the first is there" /tmp/partool.txt 'get_weather\(\{"city":"mock"\}\)'
+contains "the second is too" /tmp/partool.txt 'get_time\(\{"zone":"mock"\}\)'
+contains "and the turn resumed after both were answered" /tmp/partool.txt 'Tool result seen'
+
+note "Fine-grained logit control: alternatives per token, on request."
+runas alice aidctl generate --max-tokens 6 --logprobs 3 "alternatives please" \
+  >/tmp/logprobs.txt 2>&1
+run cat /tmp/logprobs.txt
+contains "alternatives came back with the tokens" /tmp/logprobs.txt '\[[^]]*alt1=-1\.10[^]]*\]'
+runas alice aidctl generate --max-tokens 6 "no alternatives please" >/tmp/nologprobs.txt 2>&1
+lacks "and not when they were not asked for" /tmp/nologprobs.txt 'alt1='
+
+note "Media output (§11's deferred half). Its own capability, so it can be"
+note "withheld separately from text."
+cd /tmp
+runas alice aidctl generate-media --image --count 2 "a test pattern" >/tmp/media.txt 2>&1
+run cat /tmp/media.txt
+contains "an image came back with its dimensions" /tmp/media.txt 'image 32x24 rgba8'
+contains "and the second one too" /tmp/media.txt '\-2\.rgba'
+contains "the bytes were accounted" /tmp/media.txt 'media_bytes=[1-9][0-9]+'
+runas alice aidctl generate-media --audio "a test tone" >/tmp/audio.txt 2>&1
+run cat /tmp/audio.txt
+contains "audio came back at its sample rate" /tmp/audio.txt 'audio 4000 samples at 16000 Hz'
+cd - >/dev/null
+
+note "The capability is separate, so denying it leaves text working:"
+check "media can be denied on its own" aidctl deny uid:4001 generate-media
+refute "and then media is refused" runas alice aidctl generate-media --image "denied"
+check "while plain generation still works" runas alice aidctl generate --max-tokens 8 "still here"
+check "and it can be granted back" aidctl grant uid:4001 generate-media
+
+note "A v1 client is served, and is sent nothing v2 added: the same two tools"
+note "produce one call, not a batch it could not answer."
+runas alice aidctl generate --proto 1 --max-tokens 24 --tool /tmp/tools2.json \
+  "weather and time please" >/tmp/v1tool.txt 2>&1
+run cat /tmp/v1tool.txt
+contains "a v1 client still gets a single tool_call" /tmp/v1tool.txt '^\[tool_call '
+lacks "and never the batch form" /tmp/v1tool.txt 'tool_calls'
+refute "media output is refused to a v1 client" \
+  runas alice aidctl generate-media --proto 1 --image "too old"
 
 # ---------------------------------------------------------------------------
 section "8. Attachments, raw and encoded"

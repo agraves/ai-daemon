@@ -413,14 +413,28 @@ fn reader_loop(
                 break;
             }
         };
+        // Exhaustive, deliberately: no `_` arm.
+        //
+        // There used to be one, and it silently routed anything new to the
+        // control channel — where it is neither delivered to the request that
+        // asked for it nor recognised by the load/unload that is waiting
+        // there. Adding a variant then compiled cleanly and lost every event
+        // of that kind. Listing them all means the next variant does not
+        // build until somebody has decided which channel it belongs on.
         let routed = match &event {
             BackendEvent::Token { req_id, .. }
             | BackendEvent::ToolCall { req_id, .. }
+            | BackendEvent::ToolCalls { req_id, .. }
+            | BackendEvent::Media { req_id, .. }
             | BackendEvent::Vectors { req_id, .. }
             | BackendEvent::Tokens { req_id, .. }
             | BackendEvent::Done { req_id, .. } => Some(*req_id),
             BackendEvent::Error { req_id, .. } => *req_id,
-            _ => None,
+            // These answer a control operation, not a request: they carry no
+            // req_id because there is only ever one of them outstanding.
+            BackendEvent::Hello { .. }
+            | BackendEvent::Loaded { .. }
+            | BackendEvent::Unloaded { .. } => None,
         };
         match routed {
             Some(req_id) => {

@@ -47,6 +47,20 @@
     </defaults>
   </action>
 
+  <action id="io.github.agraves.aidaemon.generate-media">
+    <description>Generate images or audio with the local AI model</description>
+    <message>An application wants to generate images or audio locally.</message>
+    <!-- The daemon runs as its own unprivileged system user, not as root.
+         Without this, polkit refuses to answer it about anybody else's
+         process and refuses the details it wants to show in the dialog. -->
+    <annotate key="org.freedesktop.policykit.owner">unix-user:ai-daemon</annotate>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+  </action>
+
   <action id="io.github.agraves.aidaemon.embed">
     <description>Compute embeddings with the local AI model</description>
     <message>An application wants to compute embeddings locally.</message>

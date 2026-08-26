@@ -13,6 +13,7 @@
 //! ordering relative to the request that references them, so they ride the
 //! same stream.
 
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
@@ -175,6 +176,30 @@ pub struct Params {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
+
+    // Everything below is protocol v2, and every field is optional so that a
+    // backend which cannot honour one may ignore it. A client that needs to
+    // know whether it was honoured asks the session for its capabilities
+    // rather than inferring from the output.
+    /// Keep only the k most likely tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    /// Drop tokens below this fraction of the most likely one's probability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+    /// Penalty applied to tokens already produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f32>,
+    /// Per-token additive bias, keyed by token id. The fine-grained control
+    /// §12 deferred: it is how a client suppresses or insists on a token
+    /// without a grammar, and the only way to say "never this one" is a large
+    /// negative bias rather than a rule.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub logit_bias: BTreeMap<u32, f32>,
+    /// How many alternatives to report per emitted token. Needs the backend's
+    /// `logprobs` capability; ignored by backends without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<u32>,
 }
 
 /// A tool the *client* is offering to execute. The daemon compiles the schema
@@ -249,6 +274,63 @@ pub enum Request {
     Embed { inputs: Vec<String> },
     Tokenize { text: String },
     Cancel,
+
+    /// Answer several outstanding tool calls at once (protocol v2).
+    ///
+    /// The batch form exists because the daemon can now emit several calls in
+    /// one turn: answering them one at a time would make the client serialise
+    /// work the model deliberately parallelised.
+    ToolResults { results: Vec<ToolResultItem> },
+
+    /// Generate an image or a clip (§11's deferred output half, protocol v2).
+    ///
+    /// A separate op rather than a flag on `generate` because it is a
+    /// different model class with a different resource profile, and because
+    /// it needs its own capability in the grant table — a user may reasonably
+    /// let an app write text and not let it synthesise a voice.
+    GenerateMedia {
+        kind: MediaKind,
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<Params>,
+        /// How many to produce. Bounded by policy, not by the client.
+        #[serde(default = "one")]
+        count: u32,
+    },
+}
+
+fn one() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResultItem {
+    pub id: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaKind {
+    Image,
+    Audio,
+}
+
+impl MediaKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MediaKind::Image => "image",
+            MediaKind::Audio => "audio",
+        }
+    }
+
+    /// The backend capability a request of this kind needs.
+    pub fn capability(self) -> &'static str {
+        match self {
+            MediaKind::Image => "image-out",
+            MediaKind::Audio => "audio-out",
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -273,6 +355,11 @@ pub struct Usage {
     pub completion_tokens: u64,
     #[serde(default)]
     pub attachment_tokens: u64,
+    /// Bytes of media produced. Not tokens, because generated media is not
+    /// priced in them and pretending otherwise would put a number in the
+    /// audit log that means nothing.
+    #[serde(default)]
+    pub media_bytes: u64,
 }
 
 /// Session facts a client may want without asking D-Bus again.
@@ -298,9 +385,29 @@ pub enum Event {
     },
     Token {
         tok: String,
+        /// Alternatives considered for this position, most likely first.
+        /// Present only when the client asked for `logprobs` and the backend
+        /// offers the capability — absent, not empty, when it did not, so a
+        /// client can tell "not asked for" from "nothing else was possible".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logprobs: Option<Vec<TokenProb>>,
     },
+    /// One tool call. Still what a protocol v1 client is sent, even when the
+    /// model produced several, because a v1 client has no way to answer more
+    /// than one and silently dropping the rest would be worse than not
+    /// offering them.
     ToolCall {
         tool_call: ToolCall,
+    },
+    /// Several at once (protocol v2). The model decided these are independent;
+    /// the client can run them in parallel and answer with `tool_results`.
+    ToolCalls {
+        tool_calls: Vec<ToolCall>,
+    },
+    /// Describes the BLOB frames that follow it, exactly as `attach` does in
+    /// the other direction (protocol v2).
+    Media {
+        media: MediaOut,
     },
     Vectors {
         vectors: Vec<Vec<f32>>,
@@ -323,6 +430,34 @@ pub enum Event {
     Error {
         error: ErrorBody,
     },
+}
+
+/// One alternative the sampler considered, and what it thought of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenProb {
+    pub tok: String,
+    /// Natural log of the probability, the convention every sampler reports.
+    pub logprob: f32,
+}
+
+/// The header for a generated image or clip. The bytes follow as BLOB frames,
+/// totalling `len` — the same shape an attachment uses arriving, so a client
+/// that can read one can read the other.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaOut {
+    pub id: String,
+    pub kind: MediaKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub w: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h: Option<u32>,
+    /// `rgb8` or `rgba8` for an image; absent for audio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fmt: Option<String>,
+    /// Sample rate for audio; absent for an image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<u32>,
+    pub len: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,11 +541,11 @@ mod tests {
     #[test]
     fn events_deserialize_to_the_variant_they_were_written_as() {
         for event in [
-            Event::Token { tok: "hi".into() },
+            Event::Token { tok: "hi".into(), logprobs: None },
             Event::Notice { event: "context-evicted".into(), detail: "replay".into() },
             Event::Done {
                 done: true,
-                usage: Usage { prompt_tokens: 3, completion_tokens: 4, attachment_tokens: 0 },
+                usage: Usage { prompt_tokens: 3, completion_tokens: 4, ..Usage::default() },
                 finish_reason: Some("stop".into()),
             },
             Event::error("policy-denied", "no"),
