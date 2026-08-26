@@ -814,6 +814,21 @@ impl Worker {
         if let Ok(backend) = self.daemon.backends.get(&self.session.backend) {
             backend.drop_cache(&self.session.id);
         }
+
+        // Shut the socket, or the reader thread outlives us.
+        //
+        // The worker used to own the socket, so returning from `run` dropped it
+        // and the client saw EOF. The reader thread owns it now, and it is
+        // blocked in a read that only the client can end — so every fatal
+        // protocol exit above (a bare BLOB, a wrong protocol version, an
+        // interrupted attachment) would leave a thread and this Session alive
+        // until the client felt like disconnecting. The session count has
+        // already been given back by then, so max_sessions does not bound it:
+        // one client in the ai group could mint them in a loop.
+        let sink = self.session.sink.lock().unwrap().clone();
+        if let Some(sink) = sink {
+            let _ = sink.lock().unwrap().shutdown(std::net::Shutdown::Both);
+        }
         info!("session {} closed", self.session.id);
     }
 }
@@ -857,6 +872,100 @@ fn estimate_attachment_tokens(attachment: &RawAttachment) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// A fatal protocol error must close the socket, not just stop serving it.
+    ///
+    /// The regression this pins: once the reader moved to its own thread, the
+    /// worker returning no longer dropped the socket, so the reader stayed
+    /// blocked in a read that only the client could end. Every fatal exit —
+    /// a bare BLOB, a wrong protocol version, an interrupted attachment — left
+    /// a thread and a Session alive for as long as the client cared to hold
+    /// the other end, and teardown had already handed back the session count,
+    /// so max_sessions did not bound it.
+    ///
+    /// Asserting on EOF rather than on a thread count: the property the client
+    /// and the kernel can both see is the one worth pinning.
+    #[test]
+    fn a_fatal_protocol_error_closes_the_socket() {
+        let dir = std::env::temp_dir()
+            .join(format!("ai-daemon-session-eof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.daemon.state_dir = dir.clone();
+        config.policy.gate_group = String::new();
+        let daemon = Daemon::new(config);
+
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let session = Arc::new(Session {
+            id: "s-eof".into(),
+            object_path: "/test/s-eof".into(),
+            identity: crate::identity::Identity {
+                class: crate::identity::Class::Native,
+                uid: 1000,
+                gid: 1000,
+                pid: std::process::id() as i32,
+                unit: None,
+                app_id: None,
+                exe: Some("test".into()),
+            },
+            model: "none".into(),
+            digest: "sha256:0".into(),
+            backend: "none".into(),
+            local: true,
+            class: crate::sched::Class::Interactive,
+            max_context: 1024,
+            created: std::time::Instant::now(),
+            blob: dir.join("weights"),
+            usage: Mutex::new(Usage::default()),
+            attachment_bytes: std::sync::atomic::AtomicU64::new(0),
+            attachments: Mutex::new(std::collections::HashMap::new()),
+            current_req: Mutex::new(None),
+            sink: Mutex::new(None),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        daemon.insert_session(session.clone());
+
+        spawn(
+            daemon.clone(),
+            session,
+            ours,
+            Limits {
+                max_context: 1024,
+                max_sessions: 4,
+                tokens_per_minute: 1000,
+                allowed_models: vec!["*".into()],
+            },
+        );
+
+        // A BLOB with no attachment to own it: one of the fatal arms.
+        let mut client = theirs;
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        frame::write_blob(&mut client, b"unowned").unwrap();
+
+        // Drain whatever the daemon says, then require the close.
+        let mut buffer = [0u8; 4096];
+        let mut saw_eof = false;
+        for _ in 0..16 {
+            match std::io::Read::read(&mut client, &mut buffer) {
+                Ok(0) => {
+                    saw_eof = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("expected EOF, got {e}"),
+            }
+        }
+        assert!(
+            saw_eof,
+            "the daemon finished with this session and left the socket open; \
+             the reader thread is still blocked on it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn token_estimates_are_conservative_and_never_zero_for_text() {
