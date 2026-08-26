@@ -408,7 +408,7 @@ impl Worker {
                         budget.max_samples
                     ));
                 }
-                if raw.data.len() % 4 != 0 {
+                if !raw.data.len().is_multiple_of(4) {
                     return Err("audio must be mono float32 PCM".into());
                 }
                 Ok(())

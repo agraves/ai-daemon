@@ -20,7 +20,16 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+# Not aspirational: the lockfile decides this. zbus 5.19, zvariant 5.15 and
+# zcheapstr 1.1 each declare rust-version = "1.87", so cargo refuses a 1.85
+# toolchain before compiling a line of ours — which is how Debian trixie's
+# 1.85.0 bounced. A stated minimum the lockfile forbids is a claim that fails
+# the first person who relies on it.
+#
+# The consequence is worth naming: trixie cannot build this as pinned. The
+# lever if that ever matters is the zbus pin, not this number. Arch, which is
+# what the package targets, ships far newer.
+rust-version = "1.87"
 license = "Apache-2.0"
 repository = "https://github.com/agraves/ai-daemon"
 

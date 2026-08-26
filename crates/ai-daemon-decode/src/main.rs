@@ -210,7 +210,7 @@ mod confine {
         // rather than a security boundary doing its job. Everything below is
         // something a Rust program does to its own memory, its own already-open
         // descriptors, or its own exit.
-        let allowed: &[libc::c_long] = &[
+        let mut allowed: Vec<libc::c_long> = vec![
             // Already-open descriptors: stdin in, stdout out.
             libc::SYS_read,
             libc::SYS_write,
@@ -220,7 +220,6 @@ mod confine {
             libc::SYS_close,
             libc::SYS_fstat,
             libc::SYS_statx,
-            libc::SYS_poll,
             libc::SYS_ppoll,
             // The allocator.
             libc::SYS_mmap,
@@ -252,6 +251,15 @@ mod confine {
             libc::SYS_exit_group,
         ];
 
+        // `poll` is not a syscall on arm64. Its generic syscall table has only
+        // `ppoll`, allowed above, which is what glibc calls there anyway — so
+        // naming `SYS_poll` unconditionally does not merely over-permit on
+        // arm64, it fails to compile, because the libc crate defines no such
+        // constant for that target. The rest of this module is already written
+        // for both architectures, one constant down from here.
+        #[cfg(target_arch = "x86_64")]
+        allowed.push(libc::SYS_poll);
+
         // The filter itself: check the architecture (a mismatched one means
         // the process is making calls through a compat entry point whose
         // numbers mean something else, so refuse), then compare the syscall
@@ -261,7 +269,7 @@ mod confine {
         program.push(SockFilter { code: JMP_JEQ_K, jt: 1, jf: 0, k: AUDIT_ARCH });
         program.push(SockFilter { code: RET_K, jt: 0, jf: 0, k: KILL_PROCESS });
         program.push(SockFilter { code: LD_W_ABS, jt: 0, jf: 0, k: NR_OFFSET });
-        for nr in allowed {
+        for nr in &allowed {
             program.push(SockFilter { code: JMP_JEQ_K, jt: 0, jf: 1, k: *nr as u32 });
             program.push(SockFilter { code: RET_K, jt: 0, jf: 0, k: ALLOW });
         }
@@ -493,7 +501,7 @@ mod inflate {
         if cmf & 0x0f != 8 {
             return Err("not a deflate stream".into());
         }
-        if (bytes[0] as u16 * 256 + bytes[1] as u16) % 31 != 0 {
+        if !(bytes[0] as u16 * 256 + bytes[1] as u16).is_multiple_of(31) {
             return Err("bad zlib header check".into());
         }
         if bytes[1] & 0x20 != 0 {

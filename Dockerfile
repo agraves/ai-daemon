@@ -82,6 +82,25 @@ RUN ./packaging/arch/make-package.sh
 RUN ls -l packaging/arch/*.pkg.tar.zst
 
 # ---------------------------------------------------------------------------
+# Does it still compile for arm64?
+#
+# This exists because the answer was no and nothing noticed. The seccomp filter
+# in ai-daemon-decode is written for both architectures — per-arch AUDIT_ARCH
+# constants, the whole module cfg-gated on the pair — but it named SYS_poll,
+# which arm64 has no syscall for and the libc crate therefore does not define,
+# so the crate did not build there at all. The shipped package is x86_64, so no
+# build in this repository ever asked.
+#
+# Native here rather than emulated: this host is arm64, and it is the amd64
+# stages above that pay for translation. Pinned to the exact toolchain the
+# workspace claims as its minimum, so rust-version is checked by being used
+# rather than by being asserted.
+FROM --platform=linux/arm64 rust:1.87-slim AS aarch64-check
+WORKDIR /src
+COPY . /src
+RUN cargo check --workspace --locked --all-targets && touch /src/arch-ok
+
+# ---------------------------------------------------------------------------
 # A box with the package installed, and nothing of the build tree in it.
 # Everything the verification touches came out of pacman.
 # ---------------------------------------------------------------------------
@@ -90,6 +109,9 @@ RUN printf 'DisableSandbox\n' >> /etc/pacman.conf \
  && pacman -Syu --noconfirm dbus polkit systemd curl iproute2 rust \
  && pacman -Scc --noconfirm
 
+# Pulls the arm64 stage into the graph, so a build that does not compile there
+# is a build that fails here.
+COPY --from=aarch64-check /src/arch-ok /var/lib/ai-daemon-arch-ok
 COPY --from=package /home/builder/src/packaging/arch/*.pkg.tar.zst /tmp/
 RUN pacman -U --noconfirm /tmp/ai-daemon-*.pkg.tar.zst && rm -f /tmp/*.pkg.tar.zst
 
