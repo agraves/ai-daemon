@@ -142,6 +142,28 @@ units, the honest answer is the bare uid, which is what the verification shows.
 can set its own `comm`, so an identity built on it would be chosen by the
 thing being identified.
 
+## A correction to the git history
+
+`b35f10e` — "Make the decoder deadline real, and the grant key survive a
+relaunch" — **describes the wrong diff.** Its title, body and test-name
+paragraph all narrate the decoder deadline and the grant key, which are
+`f1fe738`'s contents. Its own diff is one file: `crates/ai-daemon/src/sched.rs`,
+the KV **eviction** fix — `reserve_kv` rebuilt to plan victims before touching
+any of them, so a reservation that cannot succeed no longer destroys a
+session's backend cache on its way to returning `Err` and then discards the
+list of who it cost.
+
+It happened because two workers were running the same job at once after a
+lease expiry; one committed the other's newer tree under its own older
+message. History is landed and is not being rewritten for a wrong comment, so
+this paragraph is the record instead.
+
+The practical consequence, and the reason this is written down rather than
+shrugged at: `git log --grep=evict` returns nothing on master, so the eviction
+fix is not findable from the log at all. Anyone bisecting to `b35f10e` will
+read about decoders while looking at a scheduler diff. Search for
+`reserve_kv` or for this file instead.
+
 ## What is not implemented
 
 Stated plainly rather than left to be discovered:

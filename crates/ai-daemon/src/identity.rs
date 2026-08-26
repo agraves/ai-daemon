@@ -181,6 +181,19 @@ pub fn normalise_unit(component: &str) -> Option<String> {
     if name.starts_with("vte-spawn-") || name.starts_with("session-") || name == "init" {
         return None;
     }
+
+    // snapd mints `snap.<snap>.<app>-<uuid>.scope` with a fresh uuid per
+    // launch, which is the same defect as the app scopes below wearing a
+    // different prefix. It needs its own arm rather than the trailing-token
+    // rule: a uuid is five dash-separated groups, so popping one token at a
+    // time stops at the first four-character group and leaves most of it
+    // behind. Matching the whole 8-4-4-4-12 shape is also the safer trim —
+    // nothing that is genuinely part of a snap or command name looks like
+    // that, so two snaps cannot collide onto one key.
+    if name.starts_with("snap.") {
+        return Some(strip_launch_uuid(name).unwrap_or(name).to_string());
+    }
+
     let Some(body) = name.strip_prefix("app-") else {
         return Some(component.to_string());
     };
@@ -202,6 +215,29 @@ pub fn normalise_unit(component: &str) -> Option<String> {
         return Some(component.to_string());
     }
     Some(parts.join("-"))
+}
+
+/// Remove a trailing `-<uuid>`, where uuid is the RFC 4122 8-4-4-4-12 hex
+/// shape. `None` when the name does not end in one, so the caller can keep it
+/// verbatim rather than guess.
+fn strip_launch_uuid(name: &str) -> Option<&str> {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let parts: Vec<&str> = name.split('-').collect();
+    // Strictly more, so that something remains after the uuid is taken off.
+    if parts.len() <= GROUPS.len() {
+        return None;
+    }
+    let tail = &parts[parts.len() - GROUPS.len()..];
+    if !tail
+        .iter()
+        .zip(GROUPS)
+        .all(|(part, width)| part.len() == width && part.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    // 32 hex digits, the four dashes inside the uuid, and the one before it.
+    let suffix = GROUPS.iter().sum::<usize>() + GROUPS.len();
+    Some(&name[..name.len() - suffix])
 }
 
 /// A pid or a systemd `$RANDOM`: all digits, or a long hex string. Anything
@@ -409,6 +445,51 @@ mod tests {
         };
         assert_eq!(identity.unit, None, "a terminal tab is not an app identity");
         assert_eq!(identity.key(), "exe:aidctl@1000");
+    }
+
+    /// Held as a minor residual after the grant-key fix landed, and closed
+    /// here: snapd puts a fresh uuid in the scope name every launch, so the
+    /// key rotated for snap-packaged apps exactly the way it used to for every
+    /// app. Rare on the Arch target this ships for, real anywhere with snapd.
+    #[test]
+    fn a_snap_launch_uuid_is_stripped() {
+        assert_eq!(
+            normalise_unit("snap.spotify.spotify-1f2e3d4c-5b6a-7c8d-9e0f-a1b2c3d4e5f6.scope")
+                .as_deref(),
+            Some("snap.spotify.spotify")
+        );
+        // Snap names may contain dashes; matching the whole uuid shape rather
+        // than popping tokens is what keeps them.
+        assert_eq!(
+            normalise_unit("snap.my-editor.my-editor-00112233-4455-6677-8899-aabbccddeeff.scope")
+                .as_deref(),
+            Some("snap.my-editor.my-editor")
+        );
+    }
+
+    #[test]
+    fn the_same_snap_launched_twice_has_one_key() {
+        let key = |uuid: &str| {
+            normalise_unit(&format!("snap.spotify.spotify-{uuid}.scope")).unwrap()
+        };
+        assert_eq!(
+            key("1f2e3d4c-5b6a-7c8d-9e0f-a1b2c3d4e5f6"),
+            key("ffeeddcc-bbaa-9988-7766-554433221100")
+        );
+    }
+
+    #[test]
+    fn a_snap_scope_without_a_uuid_is_left_alone() {
+        // No uuid to strip, so it stays whole rather than being guessed at.
+        assert_eq!(
+            normalise_unit("snap.spotify.spotify.scope").as_deref(),
+            Some("snap.spotify.spotify")
+        );
+        // A trailing hex run that is not the uuid shape is part of the name.
+        assert_eq!(
+            normalise_unit("snap.foo.bar-deadbeef.scope").as_deref(),
+            Some("snap.foo.bar-deadbeef")
+        );
     }
 
     #[test]
