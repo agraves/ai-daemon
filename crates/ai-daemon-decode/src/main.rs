@@ -257,8 +257,16 @@ mod confine {
         // arm64, it fails to compile, because the libc crate defines no such
         // constant for that target. The rest of this module is already written
         // for both architectures, one constant down from here.
+        //
+        // Extended from a per-arch slice rather than pushed under a cfg, so
+        // the statement exists on every target: a conditional push leaves the
+        // binding needlessly mutable on the arch where it is compiled out, and
+        // that warning only shows up in the arm64 check.
         #[cfg(target_arch = "x86_64")]
-        allowed.push(libc::SYS_poll);
+        const ARCH_ONLY: &[libc::c_long] = &[libc::SYS_poll];
+        #[cfg(not(target_arch = "x86_64"))]
+        const ARCH_ONLY: &[libc::c_long] = &[];
+        allowed.extend_from_slice(ARCH_ONLY);
 
         // The filter itself: check the architecture (a mismatched one means
         // the process is making calls through a compat entry point whose

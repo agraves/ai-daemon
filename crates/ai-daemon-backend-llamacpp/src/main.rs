@@ -73,6 +73,14 @@ struct State {
     models: Mutex<HashMap<String, Loaded>>,
     paused: Mutex<HashMap<u64, Arc<AtomicBool>>>,
     cancelled: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    /// The socket each generation is reading llama-server's stream from.
+    ///
+    /// Kept so a cancel can act on the transport rather than on a flag. During
+    /// prompt evaluation llama-server sends nothing at all — tens of seconds
+    /// on CPU with a large context, minutes on a document — so the generate
+    /// thread is blocked in a read with no token boundary at which to notice
+    /// anything, which is exactly when a user reaches for cancel.
+    streams: Mutex<HashMap<u64, TcpStream>>,
 }
 
 fn main() {
@@ -97,6 +105,7 @@ fn main() {
         models: Mutex::new(HashMap::new()),
         paused: Mutex::new(HashMap::new()),
         cancelled: Mutex::new(HashMap::new()),
+        streams: Mutex::new(HashMap::new()),
     });
 
     let mut reader = BufReader::new(socket);
@@ -228,6 +237,7 @@ fn handle(state: &Arc<State>, writer: &Writer, request: BackendRequest) -> std::
                 }
                 state.paused.lock().unwrap().remove(&req_id);
                 state.cancelled.lock().unwrap().remove(&req_id);
+                state.streams.lock().unwrap().remove(&req_id);
             });
         }
         BackendRequest::Embed { req_id, model_id, inputs } => {
@@ -272,6 +282,16 @@ fn handle(state: &Arc<State>, writer: &Writer, request: BackendRequest) -> std::
         BackendRequest::Cancel { req_id } => {
             if let Some(flag) = state.cancelled.lock().unwrap().get(&req_id) {
                 flag.store(true, Ordering::Relaxed);
+            }
+            // Then end the read, rather than hoping a token arrives to notice
+            // the flag at. Shutting the socket also tells llama-server the
+            // client is gone, which is how it drops the slot; the blocked
+            // read_line returns at once and the loop reports finish=cancelled.
+            //
+            // Pause deliberately stays flag-only: a pause wants to resume, and
+            // a boundary is the right place to wait at.
+            if let Some(stream) = state.streams.lock().unwrap().get(&req_id) {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
             }
         }
         BackendRequest::Pause { req_id } => {
@@ -474,6 +494,14 @@ fn generate(
     }
 
     let mut stream = open(port)?;
+    match stream.try_clone() {
+        Ok(clone) => {
+            state.streams.lock().unwrap().insert(req_id, clone);
+        }
+        Err(e) => eprintln!(
+            "<4>{NAME}: cannot dup the generation socket ({e}); a cancel will wait for the next token"
+        ),
+    }
     let body = request.to_string();
     write!(
         stream,
@@ -513,8 +541,22 @@ fn generate(
 
     loop {
         line.clear();
-        let read = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        let read = match reader.read_line(&mut line) {
+            Ok(read) => read,
+            // A cancel shuts this socket from under us on purpose, so the
+            // error it produces is the cancel arriving, not a backend failing.
+            Err(e) => {
+                if cancelled.load(Ordering::Relaxed) {
+                    finish_reason = Some("cancelled".to_string());
+                    break;
+                }
+                return Err(e.to_string());
+            }
+        };
         if read == 0 {
+            if cancelled.load(Ordering::Relaxed) {
+                finish_reason = Some("cancelled".to_string());
+            }
             break;
         }
         let Some(payload) = line.strip_prefix("data: ") else { continue };
@@ -657,10 +699,22 @@ fn tokenize(state: &State, model_id: &str, text: &str) -> Result<Vec<u32>, Strin
         .unwrap_or_default())
 }
 
+/// How long to wait for llama-server to say *anything*.
+///
+/// This is a gap timeout, not a request timeout: it bounds the silence before
+/// the first token — which is prompt evaluation, and can legitimately run to
+/// minutes on a long document — and the silence between tokens after that.
+///
+/// It used to double as the ceiling on a wedged server, because a cancel could
+/// not reach a blocked read. It no longer does: a cancel shuts the socket. What
+/// remains is the case where nobody cancels, and ten minutes of a model saying
+/// nothing is a broken server rather than a slow one.
+const TOKEN_GAP_TIMEOUT: Duration = Duration::from_secs(600);
+
 fn open(port: u16) -> Result<TcpStream, String> {
     let stream = TcpStream::connect(("127.0.0.1", port))
         .map_err(|e| format!("connecting to llama-server on {port}: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(600))).ok();
+    stream.set_read_timeout(Some(TOKEN_GAP_TIMEOUT)).ok();
     stream.set_nodelay(true).ok();
     Ok(stream)
 }
@@ -693,5 +747,159 @@ fn send(writer: &Writer, event: &BackendEvent) {
     let mut guard = writer.lock().unwrap();
     if let Err(e) = frame::write_cbor(&mut *guard, event) {
         eprintln!("<3>{NAME}: writing to the daemon failed: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::os::unix::net::UnixStream;
+    use std::time::Instant;
+
+    /// A llama-server that accepts, sends the response headers, and then says
+    /// nothing — which is what a real one does while it evaluates the prompt.
+    /// The verification box has no llama.cpp, so this is the only place the
+    /// real backend's cancellation is exercised at all.
+    fn silent_server() -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let _ = socket.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+                );
+                let _ = socket.flush();
+                // Then nothing at all, until the far end goes away.
+                //
+                // The request has to be drained, not sampled: closing with
+                // unread bytes still in the receive buffer makes the kernel
+                // send RST, and the client sees a connection reset that looks
+                // like a backend failure rather than the silence being staged.
+                let mut sink = [0u8; 4096];
+                loop {
+                    match std::io::Read::read(&mut socket, &mut sink) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+            }
+        });
+        (port, handle)
+    }
+
+    fn state_with(port: u16) -> Arc<State> {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("a placeholder child for the Loaded record");
+        let mut models = HashMap::new();
+        models.insert(
+            "m".to_string(),
+            Loaded { model_id: "m".into(), child, port, n_ctx: 2048, kv_bytes_per_token: 64 },
+        );
+        Arc::new(State {
+            server_binary: PathBuf::from("/nonexistent"),
+            threads: None,
+            gpu_layers: None,
+            models: Mutex::new(models),
+            paused: Mutex::new(HashMap::new()),
+            cancelled: Mutex::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The regression. Cancel used to be observed only after an SSE chunk
+    /// parsed, so during prompt evaluation — when nothing arrives — it set a
+    /// flag nobody read and the generation held its decode slot until the
+    /// 600-second read timeout.
+    #[test]
+    fn a_cancel_during_prompt_evaluation_stops_the_read_now() {
+        let (port, server) = silent_server();
+        let state = state_with(port);
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let writer: Writer = Arc::new(Mutex::new(ours));
+
+        let paused = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        state.paused.lock().unwrap().insert(1, paused.clone());
+        state.cancelled.lock().unwrap().insert(1, cancelled.clone());
+
+        let started = Instant::now();
+        let worker = {
+            let state = state.clone();
+            let writer = writer.clone();
+            let paused = paused.clone();
+            let cancelled = cancelled.clone();
+            std::thread::spawn(move || {
+                generate(
+                    &state,
+                    &writer,
+                    1,
+                    "m",
+                    &[Message {
+                        role: "user".into(),
+                        content: "a long document".into(),
+                        attachments: Vec::new(),
+                        tool_call_id: None,
+                    }],
+                    &Params::default(),
+                    None,
+                    false,
+                    &paused,
+                    &cancelled,
+                )
+            })
+        };
+
+        // Let it get as far as blocking on the read, then cancel the way the
+        // daemon does.
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = handle(&state, &writer, BackendRequest::Cancel { req_id: 1 });
+
+        let outcome = worker.join().unwrap();
+        let elapsed = started.elapsed();
+        assert!(outcome.is_ok(), "a cancel is not a backend failure: {outcome:?}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "took {elapsed:?}; the read was not interrupted"
+        );
+
+        // And it reported the right ending.
+        let mut reader = std::io::BufReader::new(theirs);
+        let event: BackendEvent = frame::read_typed(&mut reader).unwrap().unwrap();
+        match &event {
+            BackendEvent::Done { finish_reason, .. } => {
+                assert_eq!(finish_reason.as_deref(), Some("cancelled"), "{event:?}");
+            }
+            other => panic!("expected done, got {other:?}"),
+        }
+
+        state.models.lock().unwrap().clear();
+        let _ = server.join();
+    }
+
+    /// Pause stays flag-based on purpose: it wants to resume, and shutting the
+    /// socket would not let it. So a pause must leave the socket registered.
+    #[test]
+    fn a_pause_does_not_close_the_socket() {
+        let (port, server) = silent_server();
+        let state = state_with(port);
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let writer: Writer = Arc::new(Mutex::new(ours));
+        let paused = Arc::new(AtomicBool::new(false));
+        state.paused.lock().unwrap().insert(2, paused.clone());
+
+        let _ = handle(&state, &writer, BackendRequest::Pause { req_id: 2 });
+        assert!(paused.load(Ordering::Relaxed), "the flag is how a pause works");
+        assert!(
+            state.streams.lock().unwrap().is_empty(),
+            "and it must not have touched a socket"
+        );
+
+        state.models.lock().unwrap().clear();
+        drop(server);
     }
 }
