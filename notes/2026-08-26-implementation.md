@@ -144,6 +144,14 @@ thing being identified.
 
 ## A correction to the git history
 
+Which commit contains what, since neither message says so correctly:
+
+| commit | what is actually in it |
+|---|---|
+| `f1fe738` | `crates/ai-daemon/src/decode.rs` — the decoder deadline moved onto the read; and `crates/ai-daemon/src/identity.rs` — `normalise_unit`, so the Native grant key survives a relaunch. |
+| `b35f10e` | `crates/ai-daemon/src/sched.rs` only — the KV eviction fix. Its message describes `f1fe738`'s two files and is stale. |
+| `2713f5a` | `identity.rs` again (snapd's per-launch uuid) and this note. |
+
 `b35f10e` — "Make the decoder deadline real, and the grant key survive a
 relaunch" — **describes the wrong diff.** Its title, body and test-name
 paragraph all narrate the decoder deadline and the grant key, which are
