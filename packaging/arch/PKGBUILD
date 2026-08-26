@@ -19,8 +19,23 @@ makedepends=('rust' 'cargo')
 # The reference backend drives llama-server when it is there, and declares no
 # capabilities when it is not, so the daemon routes around it. Not a hard
 # dependency: an install with only the conformance backend is a legitimate one.
+#
+# The package is `llama-cpp`, with a hyphen. This list said `llama.cpp` for the
+# upstream project's name, which is not a package on this distro and so was a
+# hint that installed nothing when followed.
+#
+# Arch also splits the compute backends out of `ggml`, which ships only
+# libggml.so and libggml-base.so — no kernels. Installing llama-cpp alone gets
+# a llama-server that dies at load with "no backends are loaded", before the
+# daemon is involved at all, so the backend gets blamed for a missing package.
+# One of the ggml-* below is required for llama-cpp to do anything; pick the
+# one that matches the hardware.
 optdepends=(
-  'llama.cpp: GGUF inference via the llamacpp backend'
+  'llama-cpp: GGUF inference via the llamacpp backend'
+  'ggml-cpu: CPU kernels for llama-cpp (the baseline choice)'
+  'ggml-cuda: NVIDIA kernels for llama-cpp'
+  'ggml-hip: AMD ROCm kernels for llama-cpp'
+  'ggml-vulkan: Vulkan kernels for llama-cpp, vendor-neutral'
   'xdg-desktop-portal: consent and app identity for sandboxed apps'
 )
 backup=('etc/ai-daemon/config.toml')
@@ -121,6 +136,13 @@ package() {
   # sending prompts off this machine should be.
   install -Dm644 packaging/config/remote.toml.example \
     "$pkgdir/usr/share/doc/$pkgname/remote.toml.example"
+  # Also an example, and for the same reason: under WSL2 the accelerator is
+  # /dev/dxg rather than /dev/dri and PrivateDevices has to come off to reach
+  # it. That is a real loosening of this unit and it buys nothing on hardware
+  # that has a /dev/dri, so it ships as something to read and copy rather than
+  # as a drop-in that would apply everywhere.
+  install -Dm644 packaging/systemd/wsl.conf.example \
+    "$pkgdir/usr/share/doc/$pkgname/wsl.conf.example"
 
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 docs/protocol.md "$pkgdir/usr/share/doc/$pkgname/protocol.md"

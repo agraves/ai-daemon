@@ -113,10 +113,24 @@ allow_encoded = true
 # The reference backend. It drives llama-server, so it declares no formats and
 # no capabilities when llama.cpp is not installed, and the daemon routes around
 # it rather than failing at first token.
+#
+# `env` is the only way to configure a backend's process, and the GPU lives
+# behind it. The daemon spawns backends with the environment cleared —
+# deliberately, so a variable in the daemon's unit cannot change what a backend
+# does behind the administrator's back — which also means a systemd
+# `Environment=` never reaches one. This table does.
+#
+# Uncomment the line below to put the model on the GPU. Nothing here defaults
+# it, so an install with a working card and every driver in place still runs on
+# the CPU until somebody sets it; 99 means "every layer that fits", and
+# llama-server falls back to CPU for a machine with no device rather than
+# failing. Measured on one RTX 5090 with a 0.5B model: 227 tok/s with, 120
+# without.
 [[backend]]
 name = "llamacpp"
 exec = "/usr/lib/ai-daemon/backends/ai-daemon-backend-llamacpp"
 enabled = true
+# env = { AI_DAEMON_LLAMACPP_GPU_LAYERS = "99" }
 
 # The conformance backend: deterministic, no weights, no devices. It is what
 # the test suite runs against and what `aidctl` can exercise on a machine with

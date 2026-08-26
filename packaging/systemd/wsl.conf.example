@@ -1,0 +1,39 @@
+# Running ai-daemon under WSL2. An example, not a config.
+#
+# Copy to /etc/systemd/system/ai-daemon.service.d/10-wsl.conf and
+# `systemctl daemon-reload` if — and only if — this is a WSL2 install. On real
+# hardware it loosens the unit for no gain, which is why the package ships it
+# here as documentation rather than installing it.
+#
+# WSL2 does not pass the GPU through as a PCI device. There is no NVIDIA device
+# on the bus (`lspci` finds nothing), no /dev/dri, and no kernel driver to
+# install — the guest talks to a paravirtualised /dev/dxg and links against the
+# Windows driver's libraries, which WSL bind-mounts at /usr/lib/wsl/lib and
+# puts on the linker path itself. Installing nvidia-utils or an nvidia DKMS
+# package there is not merely unnecessary, it shadows the working libcuda with
+# one that does not match the host driver.
+#
+# So the unit's accelerator allowance names a device that does not exist here,
+# and the fix is two lines rather than one.
+
+[Service]
+# The device, which is a different file under WSL.
+DeviceAllow=/dev/dxg rw
+
+# And PrivateDevices off, which is the part that is not obvious. DeviceAllow
+# above is a cgroup rule and it does its job — /dev/dxg is present inside the
+# sandbox and has the right mode — but PrivateDevices=yes mounts a fresh
+# minimal /dev, and NVML still refuses on the far side of it with
+#
+#     Failed to initialize NVML: GPU access blocked by the operating system
+#
+# Verified as a matrix on WSL 2.7.12 / kernel 6.18.33: every combination with
+# PrivateDevices=yes fails regardless of what DeviceAllow says, including
+# char-misc, and PrivateDevices=no with the single DeviceAllow above succeeds.
+# Nothing else in the unit is implicated — ProtectSystem=strict,
+# SystemCallFilter=@system-service, MemoryDenyWriteExecute and an empty
+# CapabilityBoundingSet all load CUDA without complaint.
+#
+# The unit still reaches exactly one device: DeviceAllow remains an allowlist,
+# and /dev/dxg is the only entry that resolves on this platform.
+PrivateDevices=no

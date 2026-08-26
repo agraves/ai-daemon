@@ -110,9 +110,34 @@ Building the package on Arch (and so on Omarchy):
 
 ```
 ./packaging/arch/make-package.sh
-sudo pacman -U packaging/arch/ai-daemon-*.pkg.tar.zst
+sudo pacman -U packaging/arch/ai-daemon-0.1.0-1-*.pkg.tar.zst
 sudo usermod -aG ai "$USER"      # the outer gate; log back in afterwards
 ```
+
+`makepkg` emits an `ai-daemon-debug` package beside that one, which a bare
+`ai-daemon-*` glob would sweep up as well; the version in the name is what
+keeps it out.
+
+To actually run a model you need llama.cpp and, separately, kernels for it —
+Arch splits those out of `ggml`, which ships no compute backend of its own, so
+`llama-cpp` alone gets a `llama-server` that exits at load with "no backends
+are loaded":
+
+```
+sudo pacman -S llama-cpp ggml-cuda    # or ggml-cpu / ggml-hip / ggml-vulkan
+```
+
+Then put the model on the GPU, which is off until you say so — `/etc/ai-daemon/config.toml`
+carries the line commented out under the `llamacpp` backend:
+
+```toml
+env = { AI_DAEMON_LLAMACPP_GPU_LAYERS = "99" }
+```
+
+**Under WSL2** there is no `/dev/dri` and no NVIDIA PCI device; the GPU arrives
+as `/dev/dxg` with the driver bind-mounted from Windows, so the unit needs a
+drop-in and *no* NVIDIA packages installed inside the distro. See
+`/usr/share/doc/ai-daemon/wsl.conf.example`.
 
 Building and verifying it in a container, end to end — the package built by
 `makepkg`, installed by `pacman`, then exercised over the system bus with
