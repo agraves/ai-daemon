@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  Consent, through the mechanism the desktop already has.
+
+  Three of these are the first-contact prompt from §5: the first time an app
+  asks to generate, embed, or use tools, the user is asked, and the answer is
+  remembered per (identity, capability) until revoked. `allow_active` is
+  `auth_self_keep` rather than `yes` because "any program you run may quietly
+  use the model" is the localhost free-for-all this project exists to end —
+  though a distro shipping a single-user desktop may reasonably relax it in a
+  local authority rule, and that is the right place for that decision.
+
+  The fourth is administration, and it is `auth_admin` because installing a
+  model changes what every user of the machine will run.
+-->
+<policyconfig>
+  <vendor>ai-daemon</vendor>
+  <vendor_url>https://github.com/agraves/ai-daemon</vendor_url>
+
+  <action id="io.github.agraves.aidaemon.generate">
+    <description>Use the local AI model</description>
+    <message>An application wants to use the local AI model.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="io.github.agraves.aidaemon.generate-tools">
+    <description>Use the local AI model with tool calling</description>
+    <message>An application wants the local AI model to request actions it will then carry out.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="io.github.agraves.aidaemon.embed">
+    <description>Compute embeddings with the local AI model</description>
+    <message>An application wants to compute embeddings locally.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="io.github.agraves.aidaemon.model-admin">
+    <description>Install, remove, and pin AI models</description>
+    <message>Authentication is required to change the AI models installed on this machine.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

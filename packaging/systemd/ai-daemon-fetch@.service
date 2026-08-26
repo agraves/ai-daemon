@@ -1,0 +1,48 @@
+# The other half of §9: the only unit in this project with a network.
+#
+# It is a template because each download is one instance, started by the daemon
+# over D-Bus and gone when it finishes. The instance name is a job identifier
+# the daemon minted, not anything a caller supplied — the URL travels in the
+# job file, so a unit name can never carry a caller's string.
+#
+# What it can reach: the network, and one directory. What it cannot reach: the
+# model store, the session sockets, the grant table, any prompt.
+
+[Unit]
+Description=ai-daemon model fetch (%i)
+Documentation=https://github.com/agraves/ai-daemon
+
+[Service]
+Type=oneshot
+User=ai-daemon
+Group=ai-daemon
+ExecStart=/usr/lib/ai-daemon/ai-daemon-fetch --job /var/lib/ai-daemon/models/staging/%i.job
+
+# The point of the unit.
+PrivateNetwork=no
+
+# Everything else closed. ReadWritePaths is a single directory and the daemon
+# refuses to accept an artifact from anywhere else, so a compromised fetch can
+# put bytes in staging and nothing more — and those bytes still have to hash to
+# the digest the caller asked for.
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ai-daemon/models/staging
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+TimeoutStartSec=3600

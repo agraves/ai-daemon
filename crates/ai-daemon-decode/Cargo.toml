@@ -1,0 +1,13 @@
+[package]
+name = "ai-daemon-decode"
+description = "Per-request confined media decoder: no filesystem, no network, one request, then exit."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ai-daemon-proto.workspace = true
+libc.workspace = true
+serde.workspace = true

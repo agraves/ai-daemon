@@ -1,0 +1,53 @@
+# The adoption bridge (§12, §15), and off by default.
+#
+# It exists so that software already pointed at an OpenAI-compatible localhost
+# port keeps working while gaining arbitration and audit. It is a separate unit
+# under a separate user because it is the least trusted code in the project: an
+# HTTP parser reading from anything on the machine.
+
+[Unit]
+Description=OpenAI-compatible endpoint for ai-daemon (loopback only)
+Documentation=https://github.com/agraves/ai-daemon
+After=ai-daemon.service
+Wants=ai-daemon.service
+
+[Service]
+ExecStart=/usr/bin/ai-daemon-shim
+Restart=on-failure
+RestartSec=2
+
+User=ai-daemon-shim
+Group=ai-daemon-shim
+DynamicUser=no
+# It must talk to the daemon, so it needs the outer gate too.
+SupplementaryGroups=ai
+
+# It needs a network — a loopback one. The binary refuses to bind anything
+# other than 127.0.0.1; this is the second lock on the same door.
+IPAddressAllow=localhost
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX AF_INET
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

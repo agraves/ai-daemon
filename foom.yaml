@@ -1,0 +1,93 @@
+# What this repository deploys, installs, or runs somewhere other than a
+# checkout. The phone reads this: it is the Software section of the project in
+# Infra, and it is what people consult instead of looking for themselves — so
+# an entry that is only mostly true is worse than no entry.
+#
+# Rules:
+#   * Add, rename or remove an entry in the same commit as the code.
+#   * Libraries and test harnesses stay out: they ship inside the things listed
+#     here, or exist only to test them.
+#
+# type: service | image | cli | app | library
+#   service — runs as a managed process on a machine (systemd, container)
+#   cli     — installed onto a $PATH for a person or a script to invoke
+#   image   — a container image built and published from this repo
+#   app     — something with a user interface
+
+software:
+  - name: ai-daemon
+    path: crates/ai-daemon
+    type: service
+    language: rust
+    description: >
+      The inference service. Owns io.github.agraves.AIDaemon1 on the system
+      bus, hands each session a Unix socket, and holds the policy engine,
+      model registry and scheduler. Runs as the ai-daemon user with
+      PrivateNetwork=yes: it is the process that sees prompts, so it is the
+      process with no network.
+
+  - name: ai-daemon-shim
+    path: crates/ai-daemon-shim
+    type: service
+    language: rust
+    description: >
+      OpenAI-compatible HTTP endpoint on 127.0.0.1:11434, off by default. The
+      adoption bridge: software already pointed at a localhost inference port
+      keeps working, but under the daemon's policy engine and audit log. Its
+      own unprivileged unit, because it is the least trusted code here.
+
+  - name: ai-daemon-fetch
+    path: crates/ai-daemon-fetch
+    type: service
+    language: rust
+    description: >
+      One-shot download helper, started per install as
+      ai-daemon-fetch@<job>.service. The only unit in the project with a
+      network, and it never sees a prompt. Installed to /usr/lib/ai-daemon,
+      not onto $PATH: it is a helper, not a command.
+
+  - name: ai-daemon-decode
+    path: crates/ai-daemon-decode
+    type: service
+    language: rust
+    description: >
+      Per-attachment media decoder, spawned by the daemon and confined with
+      seccomp to read, write, memory and exit — no filesystem, no network, one
+      request, then exit. Exists so the privileged process links no codecs.
+
+  - name: ai-daemon-backend-llamacpp
+    path: crates/ai-daemon-backend-llamacpp
+    type: service
+    language: rust
+    description: >
+      Reference provider backend. Drives llama-server over loopback for GGUF
+      inference, and declares no capabilities when llama.cpp is absent so the
+      daemon routes around it. Out of process by design: a GPU stack fault
+      costs a backend, not the policy engine.
+
+  - name: ai-daemon-backend-mock
+    path: crates/ai-daemon-backend-mock
+    type: service
+    language: rust
+    description: >
+      Conformance backend: no weights, no devices, deterministic output. The
+      reference implementation of the provider protocol and the fixture the
+      daemon's own behaviour is tested against.
+
+  - name: aidctl
+    path: crates/aidctl
+    type: cli
+    language: rust
+    description: >
+      Administer and inspect the daemon — status, models, sessions, grants,
+      and generate/embed/tokenize against a live session. Goes through the
+      same D-Bus API and the same polkit actions as any other client, so
+      running it as root satisfies a check rather than skipping one.
+
+  - name: linux-test
+    path: .foom/agents/linux-test
+    type: image
+    language: shell
+    description: >
+      Arch Linux box with Claude Code resident, for developing and exercising
+      this project on the distribution family it targets. Omarchy's own base.

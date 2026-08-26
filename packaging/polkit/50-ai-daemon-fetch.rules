@@ -1,0 +1,25 @@
+// Let the daemon start its own download helper, and nothing else.
+//
+// This is what makes §9 work. The daemon runs with PrivateNetwork=yes, so a
+// process it forks has no network; the download has to be a unit systemd
+// starts, in a namespace that has one. Asking systemd to start a unit is an
+// authorised action, and without this rule the daemon's own installer is
+// refused by polkit — which is the correct default for every other service on
+// the machine.
+//
+// The grant is as narrow as the mechanism allows: one user, one action, one
+// unit name pattern, and that unit's ExecStart is a fixed path with a job file
+// the daemon wrote.
+polkit.addRule(function (action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units") {
+        return undefined;
+    }
+    if (subject.user !== "ai-daemon") {
+        return undefined;
+    }
+    var unit = action.lookup("unit");
+    if (unit && unit.indexOf("ai-daemon-fetch@") === 0 && /\.service$/.test(unit)) {
+        return polkit.Result.YES;
+    }
+    return undefined;
+});

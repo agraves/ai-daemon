@@ -1,0 +1,54 @@
+<?xml version="1.0"?>
+<!--
+  The proposed portal interface from §13, published here so it can be reviewed
+  and argued with before anybody depends on it.
+
+  This is a *proposal*, not an installed interface: the portal it belongs in is
+  xdg-desktop-portal, and getting it there is a review process rather than a
+  file drop. What ai-daemon implements today is the other side of the contract
+  — it accepts an app identity asserted over its own D-Bus API, but only from a
+  caller that is actually xdg-desktop-portal, and marks the resulting session
+  as the only strong app identity Linux offers (§5).
+
+  The shape mirrors the daemon's own CreateSession because the portal's job is
+  mediation, not translation: it renders consent in the user's session, asserts
+  who is asking, and passes the data-plane fd straight through. A portal that
+  reformatted the API would become a second API to keep in step.
+-->
+<node>
+  <interface name="org.freedesktop.portal.AI">
+    <!--
+      CreateSession:
+      @options: "model" (s), "priority" (s), "handle_token" (s)
+      @response: 0 on success, 1 if the user dismissed, 2 on error
+      @results: "session_handle" (o), "model" (s), "local" (b)
+      @fd: the data-plane socket, identical to the native API's
+
+      The app never learns which concrete model it got unless it asks, and
+      never learns a filesystem path at all.
+    -->
+    <method name="CreateSession">
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="h" name="fd" direction="out"/>
+      <arg type="o" name="handle" direction="out"/>
+    </method>
+
+    <!--
+      Attach a file the app already has open, by fd. This is the property worth
+      having: the app never sees a path, and the daemon never sees a network.
+    -->
+    <method name="AttachFile">
+      <arg type="o" name="session_handle" direction="in"/>
+      <arg type="h" name="fd" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="s" name="attachment_id" direction="out"/>
+    </method>
+
+    <method name="ListModels">
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="aa{sv}" name="models" direction="out"/>
+    </method>
+
+    <property name="version" type="u" access="read"/>
+  </interface>
+</node>

@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=io.github.agraves.AIDaemon1
+Exec=/usr/bin/ai-daemon
+User=root
+SystemdService=ai-daemon.service

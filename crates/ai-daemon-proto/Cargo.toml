@@ -1,0 +1,13 @@
+[package]
+name = "ai-daemon-proto"
+description = "Wire types for ai-daemon: data-plane frames, backend protocol, model manifests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ciborium.workspace = true
+serde.workspace = true
+serde_json.workspace = true

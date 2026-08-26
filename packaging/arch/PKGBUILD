@@ -1,0 +1,109 @@
+# Maintainer: Aaron Graves <aaron.graves@gmail.com>
+#
+# Omarchy is Arch underneath, so the package format that runs there is this
+# one. Build it with ../../packaging/arch/make-package.sh, which assembles the
+# source tarball this expects; `makepkg` on its own has nothing to fetch.
+
+pkgname=ai-daemon
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='System inference service for desktop Linux: D-Bus control plane, per-session data plane, per-app policy'
+arch=('x86_64' 'aarch64')
+url='https://github.com/agraves/ai-daemon'
+license=('Apache-2.0')
+# curl is the fetch helper's transport: TLS belongs to something the distro
+# already audits rather than to a stack this project would have to keep up
+# with. dbus and polkit are the control plane and the consent path.
+depends=('dbus' 'curl' 'polkit')
+makedepends=('rust' 'cargo')
+# The reference backend drives llama-server when it is there, and declares no
+# capabilities when it is not, so the daemon routes around it. Not a hard
+# dependency: an install with only the conformance backend is a legitimate one.
+optdepends=(
+  'llama.cpp: GGUF inference via the llamacpp backend'
+  'xdg-desktop-portal: consent and app identity for sandboxed apps'
+)
+backup=('etc/ai-daemon/config.toml')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+options=('!lto')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --workspace
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release --workspace
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  # Commands a person runs.
+  install -Dm755 target/release/ai-daemon      "$pkgdir/usr/bin/ai-daemon"
+  install -Dm755 target/release/aidctl         "$pkgdir/usr/bin/aidctl"
+  install -Dm755 target/release/ai-daemon-shim "$pkgdir/usr/bin/ai-daemon-shim"
+
+  # Private helpers. Not on $PATH, because they are not commands: one has a
+  # network and no prompts, the other parses hostile bytes in a cage, and
+  # neither is useful to invoke by hand.
+  install -Dm755 target/release/ai-daemon-fetch  "$pkgdir/usr/lib/$pkgname/ai-daemon-fetch"
+  install -Dm755 target/release/ai-daemon-decode "$pkgdir/usr/lib/$pkgname/ai-daemon-decode"
+
+  # Provider plugins.
+  install -Dm755 target/release/ai-daemon-backend-llamacpp \
+    "$pkgdir/usr/lib/$pkgname/backends/ai-daemon-backend-llamacpp"
+  install -Dm755 target/release/ai-daemon-backend-mock \
+    "$pkgdir/usr/lib/$pkgname/backends/ai-daemon-backend-mock"
+
+  # systemd.
+  install -Dm644 packaging/systemd/ai-daemon.service \
+    "$pkgdir/usr/lib/systemd/system/ai-daemon.service"
+  install -Dm644 packaging/systemd/ai-daemon-fetch@.service \
+    "$pkgdir/usr/lib/systemd/system/ai-daemon-fetch@.service"
+  install -Dm644 packaging/systemd/ai-daemon-shim.service \
+    "$pkgdir/usr/lib/systemd/system/ai-daemon-shim.service"
+
+  # sysusers.d and tmpfiles.d are processed by pacman's systemd hooks, so the
+  # ai-daemon user, the ai group and the model store all exist after install
+  # without this package running a script.
+  install -Dm644 packaging/sysusers.d/ai-daemon.conf \
+    "$pkgdir/usr/lib/sysusers.d/$pkgname.conf"
+  install -Dm644 packaging/tmpfiles.d/ai-daemon.conf \
+    "$pkgdir/usr/lib/tmpfiles.d/$pkgname.conf"
+
+  # D-Bus: the bus policy, and the activation file that starts the daemon on
+  # first use rather than at boot.
+  install -Dm644 packaging/dbus/io.github.agraves.AIDaemon1.conf \
+    "$pkgdir/usr/share/dbus-1/system.d/io.github.agraves.AIDaemon1.conf"
+  install -Dm644 packaging/dbus/io.github.agraves.AIDaemon1.service \
+    "$pkgdir/usr/share/dbus-1/system-services/io.github.agraves.AIDaemon1.service"
+
+  # polkit: the consent actions, and the one narrow rule that lets the daemon
+  # start its own download helper (the daemon has no network of its own).
+  install -Dm644 packaging/polkit/io.github.agraves.aidaemon.policy \
+    "$pkgdir/usr/share/polkit-1/actions/io.github.agraves.aidaemon.policy"
+  install -Dm644 packaging/polkit/50-ai-daemon-fetch.rules \
+    "$pkgdir/usr/share/polkit-1/rules.d/50-ai-daemon-fetch.rules"
+
+  install -Dm644 packaging/config/config.toml "$pkgdir/etc/ai-daemon/config.toml"
+  install -dm755 "$pkgdir/etc/ai-daemon/config.toml.d"
+
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 docs/protocol.md "$pkgdir/usr/share/doc/$pkgname/protocol.md"
+  install -Dm644 packaging/portal/org.freedesktop.portal.AI.xml \
+    "$pkgdir/usr/share/doc/$pkgname/org.freedesktop.portal.AI.xml"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

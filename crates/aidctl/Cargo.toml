@@ -1,0 +1,16 @@
+[package]
+name = "aidctl"
+description = "Administration and inspection CLI for ai-daemon."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ai-daemon-proto.workspace = true
+ciborium.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zbus.workspace = true

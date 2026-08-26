@@ -1,0 +1,13 @@
+[package]
+name = "ai-daemon-backend-llamacpp"
+description = "llama.cpp provider backend for ai-daemon (GGUF, CPU/Vulkan/CUDA/ROCm/SYCL)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ai-daemon-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true

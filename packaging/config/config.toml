@@ -1,0 +1,97 @@
+# ai-daemon configuration.
+#
+# Every value below is the built-in default, written out so that changing one
+# does not require reading the source to find out what the others were. Drop-in
+# files in /etc/ai-daemon/config.toml.d/*.conf replace whole tables, in name
+# order; [[backend]] and [[identity]] accumulate rather than replace, so a
+# package can add a backend without disowning yours.
+
+[daemon]
+state_dir = "/var/lib/ai-daemon"
+runtime_dir = "/run/ai-daemon"
+libexec_dir = "/usr/lib/ai-daemon"
+# Exit after this long with nothing loaded and nobody connected. Bus activation
+# brings the daemon straight back, so the only cost of a small number is a
+# model load; the benefit is not holding a GPU context all afternoon.
+idle_exit_seconds = 900
+model_idle_unload_seconds = 600
+
+[policy]
+# polkit | deny | allow
+#
+#   polkit — ask the user the first time each app asks. The install default.
+#   deny   — refuse anything not granted out of band. Right for a headless
+#            machine, where there is nobody to show a dialog to.
+#   allow  — grant on first contact. This is the localhost free-for-all with an
+#            audit log; it is offered so a test rig can choose it explicitly
+#            rather than a distro shipping it by accident.
+consent = "polkit"
+# The coarse outer gate: which *humans* may use local inference at all. It
+# answers nothing about which app — the grant table does that — and a
+# portal-introduced app bypasses it, because the portal has already passed
+# it. Empty disables the gate. Enrolment is the distro or admin decision:
+# put your desktop user in it the way they are in video, or keep it
+# explicit the way docker is.
+gate_group = "ai"
+# The user the OpenAI-compatible shim runs as. A caller with this uid may
+# introduce the HTTP client behind it, and only that: everything the shim
+# speaks for lands in the lowest trust class. Matched on uid rather than on
+# the executable, because a daemon running as its own user cannot read
+# another user's /proc/<pid>/exe — an exe check would never pass.
+shim_user = "ai-daemon-shim"
+max_context = 8192
+max_sessions = 4
+tokens_per_minute = 12000
+allowed_models = ["*"]
+
+[scheduler]
+# The daemon's own accounting, because VRAM is not cgroup-controllable on any
+# stack we can rely on (§14). Set it to what you are willing to lose to KV
+# cache, not to the size of the card.
+kv_budget_bytes = 2147483648
+max_concurrent_interactive = 2
+max_concurrent_background = 1
+
+[attachments]
+max_bytes = 16777216
+# Vision tokens are KV-expensive and would otherwise walk straight past a
+# tokens-per-minute limit written for text.
+max_pixels = 4194304
+max_samples = 960000
+max_per_session = 16
+# When true, encoded media is decoded by ai-daemon-decode: a confined,
+# per-request child with no filesystem and no network. When false, clients
+# send raw pixels or PCM and the daemon parses no media at all.
+allow_encoded = true
+
+# Apps should ask for a role, not a model, so the machine's owner decides what
+# fills it. Nothing is set here because nothing is installed by default; set
+# them with `aidctl alias default <model>`.
+[aliases]
+
+# The reference backend. It drives llama-server, so it declares no formats and
+# no capabilities when llama.cpp is not installed, and the daemon routes around
+# it rather than failing at first token.
+[[backend]]
+name = "llamacpp"
+exec = "/usr/lib/ai-daemon/backends/ai-daemon-backend-llamacpp"
+enabled = true
+
+# The conformance backend: deterministic, no weights, no devices. It is what
+# the test suite runs against and what `aidctl` can exercise on a machine with
+# no models installed. It cannot answer a question and does not pretend to.
+[[backend]]
+name = "mock"
+exec = "/usr/lib/ai-daemon/backends/ai-daemon-backend-mock"
+enabled = true
+
+# Per-identity overrides, keyed by the string `aidctl grants` prints. Listing
+# capabilities here is an administrator's decision and beats a remembered
+# consent click, so this is also how you revoke something permanently.
+#
+# [[identity]]
+# identity = "unit:app-org.gnome.Newelle.scope@1000"
+# capabilities = ["generate", "embed"]
+# max_context = 4096
+# tokens_per_minute = 3000
+# allowed_models = ["default", "fast"]

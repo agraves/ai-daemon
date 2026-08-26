@@ -1,0 +1,3 @@
+target/
+.git
+*.pkg.tar.zst

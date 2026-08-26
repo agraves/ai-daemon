@@ -1,0 +1,79 @@
+# The privileged half: it sees every prompt on this machine and has no network.
+#
+# Every hardening line below is load-bearing rather than decorative, so each
+# one says why it is here. Two of them are the design (§4, §9) and the rest are
+# the ordinary minimum for a system service that parses input from every
+# unprivileged process on the box.
+
+[Unit]
+Description=AI inference service
+Documentation=man:ai-daemon(8) https://github.com/agraves/ai-daemon
+# Bus-activated. Starting it at boot would hold a GPU context for a desktop
+# that has not asked anything yet.
+After=dbus.service
+Requires=dbus.service
+
+[Service]
+Type=dbus
+BusName=io.github.agraves.AIDaemon1
+ExecStart=/usr/bin/ai-daemon
+Restart=on-failure
+RestartSec=2
+
+# A stable uid, because the model store is owned by it. DynamicUser would mean
+# re-chowning gigabytes on every restart, or losing them.
+User=ai-daemon
+Group=ai-daemon
+DynamicUser=no
+# The outer gate (§4): membership in `ai` decides which humans may talk to the
+# daemon at all. It answers nothing about *which app* — that is the policy
+# engine's job — and it is here so the two are not confused.
+SupplementaryGroups=ai
+
+# The load-bearing privacy claim (§9). The process that touches prompts cannot
+# reach a network; downloads happen in ai-daemon-fetch@.service, which can, and
+# which never sees a prompt. This is not configurable off, and the daemon's own
+# installer path depends on it being true.
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+StateDirectory=ai-daemon
+RuntimeDirectory=ai-daemon
+ConfigurationDirectory=ai-daemon
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectProc=default
+ProcSubset=all
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# Accelerators, and nothing else. A backend that claims a device outside these
+# is refused at hello time rather than discovering it cannot open one later.
+PrivateDevices=yes
+DeviceAllow=/dev/dri rw
+DeviceAllow=char-drm rw
+DeviceAllow=char-accel rw
+
+# ProtectProc=default rather than invisible: identifying a caller means reading
+# /proc/<pid>/cgroup and /proc/<pid>/exe for processes owned by other users
+# (§5). Hiding them would make every native identity "uid:N" and quietly
+# destroy the policy model.
+
+[Install]
+Also=ai-daemon.socket
