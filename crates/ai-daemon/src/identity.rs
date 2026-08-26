@@ -132,14 +132,86 @@ pub fn unit_from_cgroup(text: &str) -> Option<String> {
     for line in text.lines() {
         let path = line.rsplit_once("::").map(|(_, p)| p).unwrap_or(line);
         let path = path.rsplit_once(':').map(|(_, p)| p).unwrap_or(path);
-        let unit = path
-            .split('/')
-            .rfind(|c| c.ends_with(".service") || c.ends_with(".scope"));
-        if let Some(unit) = unit {
-            return Some(unit.to_string());
+        // Innermost outwards, taking the first component that names something
+        // an app identity can be pinned to. Components that name a *launch*
+        // rather than an app yield `None` here and are skipped.
+        for component in path.split('/').rev() {
+            if let Some(unit) = normalise_unit(component) {
+                return Some(unit);
+            }
         }
     }
     None
+}
+
+/// Turn one cgroup path component into a stable identity, or nothing.
+///
+/// This is where the grant key is decided, so it is where the per-launch noise
+/// has to come off. Desktops mint a fresh transient scope for every launch and
+/// put the pid or a random number in its name — GNOME's
+/// `app-gnome-org.gnome.TextEditor-4242.scope` is a different string on every
+/// start of the same editor. Keying a remembered grant on that string means
+/// the grant dies with the process: the user is re-prompted every launch,
+/// which is how a consent dialog becomes something people click through, and
+/// `grants.json` grows a dead row per launch forever.
+///
+/// The rules, and what each is for:
+///
+/// * `*.service` — verbatim. A system service's unit name is already stable
+///   and already means what it says.
+/// * `app[-<launcher>]-<AppID>-<launch>.scope` — the XDG shape. Strip the
+///   launcher and the launch token, keep the application id.
+/// * `vte-spawn-*.scope`, `session-*.scope`, `user@*.service` — nothing. These
+///   name a terminal tab, a login session and a session manager respectively.
+///   None of them is an application, and a key built on one would either
+///   change per tab or be the uid wearing a disguise, so the caller falls back
+///   to executable-and-uid, which says the same thing more honestly.
+/// * anything else ending `.scope` — verbatim, which may be unstable but is at
+///   least never two applications sharing one key.
+pub fn normalise_unit(component: &str) -> Option<String> {
+    if let Some(name) = component.strip_suffix(".service") {
+        // `user@1000.service` is the per-user manager, not an app.
+        if name.starts_with("user@") {
+            return None;
+        }
+        return Some(component.to_string());
+    }
+
+    let name = component.strip_suffix(".scope")?;
+    if name.starts_with("vte-spawn-") || name.starts_with("session-") || name == "init" {
+        return None;
+    }
+    let Some(body) = name.strip_prefix("app-") else {
+        return Some(component.to_string());
+    };
+
+    let mut parts: Vec<&str> = body.split('-').collect();
+    // Trailing launch token. Only a plainly generated one is dropped: an
+    // application id is reverse-DNS and may itself contain digits and dashes,
+    // and trimming greedily would let two applications collide onto one key —
+    // which is worse than an unstable key, because it silently shares a grant.
+    if parts.len() > 1 && parts.last().is_some_and(|last| is_launch_token(last)) {
+        parts.pop();
+    }
+    // Leading launcher (`gnome`, `flatpak`, `KDE`), present only when what
+    // follows is the dotted application id.
+    if parts.len() > 1 && !parts[0].contains('.') && parts[1..].iter().any(|p| p.contains('.')) {
+        parts.remove(0);
+    }
+    if parts.is_empty() {
+        return Some(component.to_string());
+    }
+    Some(parts.join("-"))
+}
+
+/// A pid or a systemd `$RANDOM`: all digits, or a long hex string. Anything
+/// else is assumed to be part of the name.
+fn is_launch_token(part: &str) -> bool {
+    if part.is_empty() {
+        return false;
+    }
+    part.bytes().all(|b| b.is_ascii_digit())
+        || (part.len() >= 6 && part.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Every group a pid is in: its primary gid and its supplementary set.
@@ -237,10 +309,6 @@ mod tests {
     #[test]
     fn a_cgroup_v2_line_yields_the_unit() {
         assert_eq!(
-            unit_from_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-foo.scope\n"),
-            Some("app-foo.scope".to_string())
-        );
-        assert_eq!(
             unit_from_cgroup("0::/system.slice/ai-daemon.service\n"),
             Some("ai-daemon.service".to_string())
         );
@@ -248,11 +316,106 @@ mod tests {
 
     #[test]
     fn the_innermost_unit_wins_not_the_outermost() {
-        // user@1000.service is a real unit, but the app's own scope is the
-        // thing a grant should be remembered against.
+        // user@1000.service is a real unit, but it is the session manager
+        // rather than the app; the app's own scope is what a grant belongs to.
         assert_eq!(
-            unit_from_cgroup("0::/user.slice/user@1000.service/app.slice/app-gnome-editor.scope"),
-            Some("app-gnome-editor.scope".to_string())
+            unit_from_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-org.gnome.Nautilus-3312.scope"
+            ),
+            Some("org.gnome.Nautilus".to_string())
+        );
+    }
+
+    /// The finding this replaces: the old test used `app-foo.scope`, a shape
+    /// no desktop produces, so it passed while every real launch minted a new
+    /// key. These are the shapes GNOME, KDE and Flatpak actually write.
+    #[test]
+    fn a_launch_token_is_stripped_from_a_transient_app_scope() {
+        for (component, expected) in [
+            ("app-gnome-org.gnome.TextEditor-4242.scope", "org.gnome.TextEditor"),
+            ("app-org.gnome.Nautilus-1234.scope", "org.gnome.Nautilus"),
+            ("app-flatpak-org.telegram.desktop-7781.scope", "org.telegram.desktop"),
+            ("app-KDE-org.kde.dolphin-9012.scope", "org.kde.dolphin"),
+            ("app-flatpak-md.obsidian.Obsidian-3f9a1c.scope", "md.obsidian.Obsidian"),
+        ] {
+            assert_eq!(
+                normalise_unit(component).as_deref(),
+                Some(expected),
+                "{component}"
+            );
+        }
+    }
+
+    /// The property the whole key exists for, against the shape that broke it.
+    #[test]
+    fn the_same_app_launched_twice_has_one_key() {
+        let launch = |pid: i32, scope: &str| Identity {
+            class: Class::Native,
+            uid: 1000,
+            gid: 1000,
+            pid,
+            unit: unit_from_cgroup(&format!(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/{scope}"
+            )),
+            app_id: None,
+            exe: Some("gnome-text-editor".into()),
+        };
+        let monday = launch(4242, "app-gnome-org.gnome.TextEditor-4242.scope");
+        let tuesday = launch(9137, "app-gnome-org.gnome.TextEditor-9137.scope");
+
+        assert_eq!(monday.key(), tuesday.key());
+        assert_eq!(monday.key(), "unit:org.gnome.TextEditor@1000");
+    }
+
+    /// Two applications must never land on one key. A greedier strip would
+    /// take `org.gnome.Text-Editor` down to `org.gnome.Text` and quietly hand
+    /// one app's grant to another.
+    #[test]
+    fn two_applications_never_share_a_key() {
+        let editor = normalise_unit("app-gnome-org.gnome.Text-Editor-4242.scope");
+        let viewer = normalise_unit("app-gnome-org.gnome.Text-Viewer-4242.scope");
+        assert_eq!(editor.as_deref(), Some("org.gnome.Text-Editor"));
+        assert_eq!(viewer.as_deref(), Some("org.gnome.Text-Viewer"));
+        assert_ne!(editor, viewer);
+    }
+
+    /// A terminal tab, a login session and the user manager are not
+    /// applications. Keying on them would be per-tab noise or the uid in
+    /// disguise, so they yield nothing and the caller falls back.
+    #[test]
+    fn a_scope_that_names_a_launch_rather_than_an_app_yields_nothing() {
+        for component in [
+            "vte-spawn-1c1a2b3c4d5e6f70819a2b3c4d5e6f70.scope",
+            "session-2.scope",
+            "user@1000.service",
+            "init.scope",
+        ] {
+            assert_eq!(normalise_unit(component), None, "{component}");
+        }
+    }
+
+    #[test]
+    fn a_command_run_in_a_terminal_falls_back_to_the_executable() {
+        let identity = Identity {
+            class: Class::Native,
+            uid: 1000,
+            gid: 1000,
+            pid: 77,
+            unit: unit_from_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-org.gnome.Terminal.slice/vte-spawn-1c1a2b3c4d5e6f70819a2b3c4d5e6f70.scope"
+            ),
+            app_id: None,
+            exe: Some("aidctl".into()),
+        };
+        assert_eq!(identity.unit, None, "a terminal tab is not an app identity");
+        assert_eq!(identity.key(), "exe:aidctl@1000");
+    }
+
+    #[test]
+    fn a_system_service_keeps_its_own_name() {
+        assert_eq!(
+            normalise_unit("ai-daemon-shim.service").as_deref(),
+            Some("ai-daemon-shim.service")
         );
     }
 
@@ -266,9 +429,9 @@ mod tests {
     fn cgroup_v1_lines_are_understood_too() {
         assert_eq!(
             unit_from_cgroup(
-                "11:name=systemd:/user.slice/user-1000.slice/session-2.scope\n1:cpu:/\n"
+                "11:name=systemd:/user.slice/user-1000.slice/app.slice/app-org.kde.konsole-8123.scope\n1:cpu:/\n"
             ),
-            Some("session-2.scope".to_string())
+            Some("org.kde.konsole".to_string())
         );
     }
 
@@ -281,13 +444,13 @@ mod tests {
             uid: 1000,
             gid: 1000,
             pid: 4242,
-            unit: Some("app-foo.scope".into()),
+            unit: Some("ai-daemon-shim.service".into()),
             app_id: None,
             exe: Some("foo".into()),
         };
         let second = Identity { pid: 9999, ..first.clone() };
         assert_eq!(first.key(), second.key());
-        assert_eq!(first.key(), "unit:app-foo.scope@1000");
+        assert_eq!(first.key(), "unit:ai-daemon-shim.service@1000");
     }
 
     #[test]
