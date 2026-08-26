@@ -36,7 +36,30 @@ SupplementaryGroups=ai
 # installer path depends on it being true.
 PrivateNetwork=yes
 IPAddressDeny=any
-RestrictAddressFamilies=AF_UNIX
+#
+# The two exceptions below are loopback inside this namespace and nothing else,
+# and they are what makes the reference backend able to run at all. Backends are
+# children of this unit and inherit its sandbox, and ai-daemon-backend-llamacpp
+# drives llama-server over TCP loopback — it spawns the server on 127.0.0.1 and
+# speaks HTTP to it, because that is llama.cpp's only interface.
+#
+# Without AF_INET every TcpListener::bind in the backend's port scan returns
+# EAFNOSUPPORT, all sixty-four candidates "fail", and the user is told
+# "no free loopback port for llama-server" — which reads as port exhaustion and
+# sends them looking in the wrong place entirely.
+#
+# IPAddressAllow is the second half and easy to miss, because it fails in a
+# quieter way: IPAddressDeny is a BPF cgroup filter that covers loopback too,
+# so with AF_INET alone llama-server binds, logs "listening on 127.0.0.1:…",
+# and the backend's request is dropped on the way. The session then hangs until
+# backend_silence_seconds — fifteen minutes of nothing, for a working server.
+#
+# Neither line weakens §9. PrivateNetwork=yes means this namespace has one
+# interface, lo, with no route anywhere; localhost here is the daemon and its
+# own children talking to each other. Every address that is not loopback stays
+# denied by the line above.
+IPAddressAllow=localhost
+RestrictAddressFamilies=AF_UNIX AF_INET
 
 NoNewPrivileges=yes
 ProtectHome=yes
