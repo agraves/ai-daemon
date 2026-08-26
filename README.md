@@ -93,14 +93,24 @@ sudo pacman -U packaging/arch/ai-daemon-*.pkg.tar.zst
 sudo usermod -aG ai "$USER"      # the outer gate; log back in afterwards
 ```
 
-Building and verifying it in a container, end to end — package built by
-`makepkg`, installed by `pacman`, then exercised over the system bus:
+Building and verifying it in a container, end to end — the package built by
+`makepkg`, installed by `pacman`, then exercised over the system bus with
+polkit running:
 
 ```
 dev build -t ai-daemon-box .
-dev run -n verify ai-daemon-box
-dev logs verify
 ```
+
+The verification runs *during* the build, so a green build is a green run and a
+failing check fails the build. (It has to: containers started by `dev run` have
+every capability dropped, and the run needs to act as three different users.)
+The transcript is kept at `/verification.txt` in the resulting image, which is
+what the image prints if you run it.
+
+It checks ninety-one things, and is deliberately adversarial about most of
+them — a wrong digest, an oversized screenshot, a truncated PNG, a user outside
+the gate, a revoked identity, a remote `image_url` — because "it generated some
+text" is the easy half and the refusals are the point.
 
 ## Layout
 
