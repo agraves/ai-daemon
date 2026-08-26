@@ -36,22 +36,38 @@ pub fn check_authorization(
     subject_details.insert("start-time", Value::U64(start_time));
     let subject = ("unix-process", subject_details);
 
-    // Deliberately empty.
+    // Details reach the authentication dialog, so polkit accepts them only
+    // from uid 0 or from the action's declared owner — a mechanism that could
+    // set them freely could put words in front of a user about to type their
+    // password. This daemon is neither root nor, on an install whose polkit
+    // predates the owner annotation, an owner; so it asks with the details it
+    // would like and, if refused for that reason, asks again without them.
     //
-    // polkit only accepts `details` from uid 0 or the action's owner — and it
-    // is right to: details reach the authentication dialog, so a mechanism
-    // that could set them could put words in front of a user about to type
-    // their password. This daemon runs as its own unprivileged system user
-    // (section 4), so it does not get to write the prompt, and the wording
-    // lives in the .policy file the package installs where an administrator
-    // can read it.
-    //
-    // The cost is that the dialog cannot name the calling application. That is
-    // a real loss and the right trade: a prompt naming an app the daemon
-    // identified by spoofable means (section 5) would be more convincing than
-    // it is entitled to be.
-    let details: HashMap<&str, &str> = HashMap::new();
+    // Losing the app's name from the dialog is a real loss and the fallback is
+    // the right one anyway: the wording then comes from the .policy file the
+    // package installs, where an administrator can read it.
+    let display = identity.display();
+    let mut details: HashMap<&str, &str> = HashMap::new();
+    details.insert("application", &display);
+    details.insert("identity.class", identity.class.as_str());
 
+    match ask(conn, &subject, action_id, details) {
+        Ok(authorized) => Ok(authorized),
+        Err(e) if e.contains("pass details") => {
+            ask(conn, &subject, action_id, HashMap::new())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+type Subject<'a> = (&'a str, HashMap<&'a str, Value<'a>>);
+
+fn ask(
+    conn: &zbus::blocking::Connection,
+    subject: &Subject<'_>,
+    action_id: &str,
+    details: HashMap<&str, &str>,
+) -> Result<bool, String> {
     let reply = conn
         .call_method(
             Some(AUTHORITY_DEST),

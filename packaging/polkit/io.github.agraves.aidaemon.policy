@@ -22,6 +22,10 @@
   <action id="io.github.agraves.aidaemon.generate">
     <description>Use the local AI model</description>
     <message>An application wants to use the local AI model.</message>
+    <!-- The daemon runs as its own unprivileged system user, not as root.
+         Without this, polkit refuses to answer it about anybody else's
+         process and refuses the details it wants to show in the dialog. -->
+    <annotate key="org.freedesktop.policykit.owner">unix-user:ai-daemon</annotate>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
@@ -32,6 +36,10 @@
   <action id="io.github.agraves.aidaemon.generate-tools">
     <description>Use the local AI model with tool calling</description>
     <message>An application wants the local AI model to request actions it will then carry out.</message>
+    <!-- The daemon runs as its own unprivileged system user, not as root.
+         Without this, polkit refuses to answer it about anybody else's
+         process and refuses the details it wants to show in the dialog. -->
+    <annotate key="org.freedesktop.policykit.owner">unix-user:ai-daemon</annotate>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
@@ -42,6 +50,10 @@
   <action id="io.github.agraves.aidaemon.embed">
     <description>Compute embeddings with the local AI model</description>
     <message>An application wants to compute embeddings locally.</message>
+    <!-- The daemon runs as its own unprivileged system user, not as root.
+         Without this, polkit refuses to answer it about anybody else's
+         process and refuses the details it wants to show in the dialog. -->
+    <annotate key="org.freedesktop.policykit.owner">unix-user:ai-daemon</annotate>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
@@ -52,6 +64,10 @@
   <action id="io.github.agraves.aidaemon.model-admin">
     <description>Install, remove, and pin AI models</description>
     <message>Authentication is required to change the AI models installed on this machine.</message>
+    <!-- The daemon runs as its own unprivileged system user, not as root.
+         Without this, polkit refuses to answer it about anybody else's
+         process and refuses the details it wants to show in the dialog. -->
+    <annotate key="org.freedesktop.policykit.owner">unix-user:ai-daemon</annotate>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>

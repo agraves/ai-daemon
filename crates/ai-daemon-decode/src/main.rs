@@ -199,47 +199,75 @@ mod confine {
         const ALLOW: u32 = 0x7fff_0000;
         const KILL_PROCESS: u32 = 0x8000_0000;
 
-        // read, write, mmap/munmap/mremap/brk for the allocator, sigreturn,
-        // exit and exit_group, futex because the allocator may touch it, and
-        // fstat/lseek so a buffered reader can behave normally.
+        // The allow-list. It is generous about the boring calls and silent
+        // about every interesting one: there is no openat, no socket, no
+        // execve, no clone, no ptrace, so the decoder cannot touch a file, a
+        // network or another process however badly it is fooled.
+        //
+        // Being generous here is deliberate. The default action is to kill,
+        // and a filter that omits something the allocator needs turns every
+        // attachment into a dead child — which looks like a broken feature
+        // rather than a security boundary doing its job. Everything below is
+        // something a Rust program does to its own memory, its own already-open
+        // descriptors, or its own exit.
         let allowed: &[libc::c_long] = &[
+            // Already-open descriptors: stdin in, stdout out.
             libc::SYS_read,
             libc::SYS_write,
+            libc::SYS_readv,
+            libc::SYS_writev,
+            libc::SYS_lseek,
+            libc::SYS_close,
+            libc::SYS_fstat,
+            libc::SYS_statx,
+            libc::SYS_poll,
+            libc::SYS_ppoll,
+            // The allocator.
             libc::SYS_mmap,
             libc::SYS_munmap,
             libc::SYS_mremap,
+            libc::SYS_mprotect,
             libc::SYS_brk,
+            libc::SYS_madvise,
+            // Threads and signals the runtime sets up for itself.
+            libc::SYS_futex,
             libc::SYS_rt_sigreturn,
             libc::SYS_rt_sigprocmask,
-            libc::SYS_exit,
-            libc::SYS_exit_group,
-            libc::SYS_futex,
-            libc::SYS_lseek,
-            libc::SYS_madvise,
+            libc::SYS_rt_sigaction,
+            libc::SYS_sigaltstack,
+            libc::SYS_set_robust_list,
+            libc::SYS_rseq,
+            libc::SYS_getpid,
+            libc::SYS_gettid,
+            // A panic in the decoder must be able to abort the decoder.
+            libc::SYS_tgkill,
             libc::SYS_getrandom,
             libc::SYS_sched_yield,
             libc::SYS_clock_gettime,
+            libc::SYS_clock_nanosleep,
+            libc::SYS_nanosleep,
+            libc::SYS_restart_syscall,
+            libc::SYS_prlimit64,
+            libc::SYS_exit,
+            libc::SYS_exit_group,
         ];
-
-        let mut program: Vec<SockFilter> = Vec::with_capacity(allowed.len() + 4);
-        program.push(SockFilter { code: LD_W_ABS, jt: 0, jf: 0, k: ARCH_OFFSET });
-        program.push(SockFilter { code: JMP_JEQ_K, jt: 1, jf: 0, k: AUDIT_ARCH });
-        program.push(SockFilter { code: RET_K, jt: 0, jf: 0, k: KILL_PROCESS });
-        program.push(SockFilter { code: LD_W_ABS, jt: 0, jf: 0, k: NR_OFFSET });
-        for nr in allowed {
-            program.push(SockFilter { code: JMP_JEQ_K, jt: 0, jf: 1, k: *nr as u32 });
-            program.push(SockFilter { code: RET_K, jt: 0, jf: 0, k: ALLOW });
-        }
-        program.push(SockFilter { code: RET_K, jt: 0, jf: 0, k: KILL_PROCESS });
 
         let prog = SockFprog {
             len: u16::try_from(program.len()).map_err(|_| "filter too long")?,
             filter: program.as_ptr(),
         };
         let _ = size_of::<SockFprog>();
-        // SAFETY: `prog` points at a filter that outlives the call, and
-        // SECCOMP_SET_MODE_FILTER copies it into the kernel.
-        let rc = unsafe {
+
+        // Two ways in, because the newer one is not always reachable. The
+        // `seccomp()` syscall is itself filtered by some container runtimes'
+        // own profiles, while `prctl(PR_SET_SECCOMP)` — the original
+        // interface, doing the same thing without the flags we do not use — is
+        // not. Trying both means the confinement holds in a container as well
+        // as on a desktop, rather than the decoder refusing to run in one.
+        //
+        // SAFETY: `prog` points at a filter that outlives the call, and both
+        // interfaces copy it into the kernel.
+        let via_seccomp = unsafe {
             libc::syscall(
                 libc::SYS_seccomp,
                 1, // SECCOMP_SET_MODE_FILTER
@@ -247,8 +275,23 @@ mod confine {
                 &prog as *const SockFprog,
             )
         };
-        if rc != 0 {
-            return Err(format!("seccomp filter rejected: {}", std::io::Error::last_os_error()));
+        if via_seccomp == 0 {
+            return Ok(());
+        }
+        let first = std::io::Error::last_os_error();
+        // SAFETY: as above.
+        let via_prctl = unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &prog as *const SockFprog,
+            )
+        };
+        if via_prctl != 0 {
+            return Err(format!(
+                "seccomp filter rejected: seccomp() said {first}, prctl() said {}",
+                std::io::Error::last_os_error()
+            ));
         }
         Ok(())
     }

@@ -110,7 +110,24 @@ pub fn decode(
         return Err("the decoder exceeded its deadline".into());
     }
     let status = child.wait().map_err(|e| format!("waiting for the decoder: {e}"))?;
-    let decoded = outcome?;
+    let decoded = match outcome {
+        Ok(decoded) => decoded,
+        // A decoder killed by SIGSYS is the confinement working, and it is
+        // worth saying so by name: without this the message is "the decoder
+        // produced nothing", which reads like a bug in the codec rather than a
+        // syscall the cage did not allow.
+        Err(e) => {
+            use std::os::unix::process::ExitStatusExt;
+            return Err(match status.signal() {
+                Some(libc::SIGSYS) => format!(
+                    "the decoder was killed by its own seccomp filter, which means it \
+                     attempted a syscall the filter does not allow: {e}"
+                ),
+                Some(signal) => format!("the decoder died on signal {signal}: {e}"),
+                None => e,
+            });
+        }
+    };
     if !status.success() {
         debug!("decoder exited with {status} after answering");
     }
