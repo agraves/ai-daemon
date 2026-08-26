@@ -28,48 +28,103 @@ use crate::{debug, info, warn};
 pub type Sink = Arc<Mutex<UnixStream>>;
 
 /// Take over `socket` for the life of `session`.
-pub fn spawn(daemon: Arc<Daemon>, session: Arc<Session>, socket: UnixStream, limits: Limits) {
+///
+/// Failing here is the caller's problem, not a line in the journal: at this
+/// point the session is counted against its identity's limit and sitting in
+/// the daemon's map, and only the caller knows how to give those back.
+pub fn spawn(
+    daemon: Arc<Daemon>,
+    session: Arc<Session>,
+    socket: UnixStream,
+    limits: Limits,
+) -> Result<(), String> {
     let name = format!("session-{}", session.id);
-    let result = std::thread::Builder::new().name(name).spawn(move || {
-        let sink: Sink = match socket.try_clone() {
-            Ok(clone) => Arc::new(Mutex::new(clone)),
-            Err(e) => {
-                warn!("session {}: cannot dup its socket ({e}); closing", session.id);
+    std::thread::Builder::new()
+        .name(name)
+        .spawn(move || {
+            let sink: Sink = match socket.try_clone() {
+                Ok(clone) => Arc::new(Mutex::new(clone)),
+                Err(e) => {
+                    // Nothing to serve this session with, and it is already
+                    // counted and registered — so retire it properly rather
+                    // than leaving a row nobody will ever remove.
+                    warn!("session {}: cannot dup its socket ({e}); closing", session.id);
+                    retire(&daemon, &session);
+                    return;
+                }
+            };
+            *session.sink.lock().unwrap() = Some(sink.clone());
+
+            let (sender, frames) = mpsc::sync_channel::<Frame>(0);
+            let reader = std::thread::Builder::new()
+                .name(format!("session-{}-read", session.id))
+                .spawn({
+                    let daemon = daemon.clone();
+                    let session = session.clone();
+                    move || read_socket(daemon, session, socket, sender)
+                });
+            if let Err(e) = reader {
+                warn!("could not start a reader for session {}: {e}", session.id);
+                retire(&daemon, &session);
                 return;
             }
-        };
-        *session.sink.lock().unwrap() = Some(sink.clone());
 
-        let (sender, frames) = mpsc::sync_channel::<Frame>(0);
-        let reader = std::thread::Builder::new()
-            .name(format!("session-{}-read", session.id))
-            .spawn({
-                let daemon = daemon.clone();
-                let session = session.clone();
-                move || read_socket(daemon, session, socket, sender)
-            });
-        if let Err(e) = reader {
-            warn!("could not start a reader for session {}: {e}", session.id);
-            return;
-        }
+            let mut worker = Worker {
+                daemon: daemon.clone(),
+                session: session.clone(),
+                limits,
+                sink,
+                history: Vec::new(),
+                tools: None,
+                params: Params::default(),
+                grammar: None,
+                pending_tool_call: None,
+            };
+            worker.run(frames);
+            worker.teardown();
+        })
+        .map(|_| ())
+        .map_err(|e| format!("could not start a thread for session: {e}"))
+}
 
-        let mut worker = Worker {
-            daemon: daemon.clone(),
-            session: session.clone(),
-            limits,
-            sink,
-            history: Vec::new(),
-            tools: None,
-            params: Params::default(),
-            grammar: None,
-            pending_tool_call: None,
-        };
-        worker.run(frames);
-        worker.teardown();
-    });
-    if let Err(e) = result {
-        warn!("could not start a thread for session: {e}");
+/// Everything that must happen when a session stops existing, wherever that
+/// was noticed — the worker finishing, the worker never starting, or
+/// `CreateSession` giving up half way through building it.
+///
+/// One function because these must not drift: the count against the
+/// identity's limit, the entry in the daemon's map, the object on the bus and
+/// the audit record are four pieces of state that are only correct together.
+pub fn retire(daemon: &Daemon, session: &Session) {
+    let usage = session.usage.lock().unwrap().clone();
+    daemon.audit.session_end(
+        &session.identity,
+        &session.id,
+        &session.model,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        session.attachment_bytes.load(Ordering::Relaxed),
+    );
+    session.closed.store(true, Ordering::Relaxed);
+    daemon.scheduler.release_kv(&session.id);
+    daemon.policy.close_session(&session.identity);
+    daemon.remove_session(&session.id);
+    crate::dbusapi::unregister(daemon, &session.object_path);
+    if let Ok(backend) = daemon.backends.get(&session.backend) {
+        backend.drop_cache(&session.id);
     }
+    // Shut the socket, or the reader thread outlives us.
+    //
+    // The worker used to own the socket, so returning from `run` dropped it
+    // and the client saw EOF. The reader thread owns it now, and it is blocked
+    // in a read that only the client can end — so every fatal protocol exit
+    // would otherwise leave a thread and this Session alive until the client
+    // felt like disconnecting. The session count has already been given back
+    // by then, so max_sessions does not bound it.
+    let sink = session.sink.lock().unwrap().clone();
+    if let Some(sink) = sink {
+        let _ = sink.lock().unwrap().shutdown(std::net::Shutdown::Both);
+    }
+    info!("session {} closed", session.id);
 }
 
 /// Read the socket, and be the only thing that does.
@@ -797,39 +852,7 @@ impl Worker {
     }
 
     fn teardown(&mut self) {
-        let usage = self.session.usage.lock().unwrap().clone();
-        self.daemon.audit.session_end(
-            &self.session.identity,
-            &self.session.id,
-            &self.session.model,
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            self.session.attachment_bytes.load(Ordering::Relaxed),
-        );
-        self.session.closed.store(true, Ordering::Relaxed);
-        self.daemon.scheduler.release_kv(&self.session.id);
-        self.daemon.policy.close_session(&self.session.identity);
-        self.daemon.remove_session(&self.session.id);
-        crate::dbusapi::unregister(&self.daemon, &self.session.object_path);
-        if let Ok(backend) = self.daemon.backends.get(&self.session.backend) {
-            backend.drop_cache(&self.session.id);
-        }
-
-        // Shut the socket, or the reader thread outlives us.
-        //
-        // The worker used to own the socket, so returning from `run` dropped it
-        // and the client saw EOF. The reader thread owns it now, and it is
-        // blocked in a read that only the client can end — so every fatal
-        // protocol exit above (a bare BLOB, a wrong protocol version, an
-        // interrupted attachment) would leave a thread and this Session alive
-        // until the client felt like disconnecting. The session count has
-        // already been given back by then, so max_sessions does not bound it:
-        // one client in the ai group could mint them in a loop.
-        let sink = self.session.sink.lock().unwrap().clone();
-        if let Some(sink) = sink {
-            let _ = sink.lock().unwrap().shutdown(std::net::Shutdown::Both);
-        }
-        info!("session {} closed", self.session.id);
+        retire(&self.daemon, &self.session);
     }
 }
 
@@ -939,7 +962,8 @@ mod tests {
                 tokens_per_minute: 1000,
                 allowed_models: vec!["*".into()],
             },
-        );
+        )
+        .expect("the worker thread must start for this test to mean anything");
 
         // A BLOB with no attachment to own it: one of the fatal arms.
         let mut client = theirs;

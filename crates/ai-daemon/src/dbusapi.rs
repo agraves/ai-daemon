@@ -129,6 +129,16 @@ impl Manager {
             .policy
             .open_session(&identity, &limits)
             .map_err(zbus::fdo::Error::AccessDenied)?;
+        // Armed from here to the last line. Everything below can fail, and
+        // most of it fails only under resource exhaustion — which is exactly
+        // when the accounting it would corrupt is the thing protecting the
+        // daemon. sched.rs's Slot makes the same argument for decode slots.
+        let mut slot = SessionSlot {
+            daemon: &self.daemon,
+            identity: &identity,
+            session: None,
+            armed: true,
+        };
 
         let class = options
             .get("priority")
@@ -170,6 +180,11 @@ impl Manager {
 
         let id = self.daemon.next_session_id();
         let path = session_path(&id);
+        // Built here rather than at the return: it is fallible, and a fallible
+        // step after the worker has started is one the guard has already been
+        // disarmed for.
+        let object_path = zbus::zvariant::OwnedObjectPath::try_from(path.clone())
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let session = Arc::new(Session {
             id: id.clone(),
             object_path: path.clone(),
@@ -199,13 +214,17 @@ impl Manager {
             backend.info.local,
         );
         self.daemon.insert_session(session.clone());
+        // The guard owns it from here: a failure below now gives back the
+        // count, the map entry, the bus object and a closing audit record.
+        slot.session = Some(session.clone());
 
         object_server
             .at(path.as_str(), SessionObject { daemon: self.daemon.clone(), session: session.clone() })
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("registering the session object: {e}")))?;
 
-        session::spawn(self.daemon.clone(), session, daemon_end, limits);
+        session::spawn(self.daemon.clone(), session, daemon_end, limits)
+            .map_err(zbus::fdo::Error::Failed)?;
 
         info!(
             "session {id}: {} ({}) on {} via {} ({}, {})",
@@ -220,9 +239,8 @@ impl Manager {
             }
         );
 
-        let object_path = zbus::zvariant::OwnedObjectPath::try_from(path)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         let fd = zbus::zvariant::OwnedFd::from(std::os::fd::OwnedFd::from(client_end));
+        slot.disarm();
         Ok((object_path, fd))
     }
 
@@ -589,6 +607,52 @@ impl Manager {
     }
 }
 
+/// Undoes a half-built session.
+///
+/// `CreateSession` takes a slot against the caller's `max_sessions` and then
+/// does five more things that can fail: a socketpair, a session id, a bus
+/// object, a worker thread. Every one of those used to return without giving
+/// the slot back, and two of them left the session in the daemon's map with no
+/// thread to serve it and an audit record saying it had started and never
+/// ended — visible in `aidctl sessions` forever.
+///
+/// They are all resource-exhaustion paths, so they fire together, and after
+/// `max_sessions` of them that identity is refused until the daemon restarts
+/// even though nothing is actually open. Explicit cleanup at each `?` would
+/// work today and would not survive the next step somebody adds in the middle,
+/// which is the argument sched.rs's Slot already makes for decode slots.
+struct SessionSlot<'a> {
+    daemon: &'a Arc<Daemon>,
+    identity: &'a Identity,
+    /// Set once the session exists and is in the map; before that there is
+    /// nothing to undo but the count.
+    session: Option<Arc<Session>>,
+    armed: bool,
+}
+
+impl SessionSlot<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionSlot<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match &self.session {
+            // retire gives back the count as part of undoing everything else,
+            // so the two branches are not doing different amounts of work.
+            Some(session) => {
+                warn!("session {} was abandoned before it began serving", session.id);
+                session::retire(self.daemon, session);
+            }
+            None => self.daemon.policy.close_session(self.identity),
+        }
+    }
+}
+
 pub struct SessionObject {
     pub daemon: Arc<Daemon>,
     pub session: Arc<Session>,
@@ -725,4 +789,157 @@ fn dict<const N: usize>(entries: [(&str, OwnedValue); N]) -> HashMap<String, Own
 
 fn str_value(text: &str) -> OwnedValue {
     Value::Str(text.into()).try_into().expect("a string is always convertible")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Class;
+    use crate::policy::Limits;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ai-daemon-slot-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn daemon_in(dir: &std::path::Path) -> Arc<Daemon> {
+        let mut config = crate::config::Config::default();
+        config.daemon.state_dir = dir.to_path_buf();
+        config.policy.gate_group = String::new();
+        Daemon::new(config)
+    }
+
+    fn identity() -> Identity {
+        Identity {
+            class: Class::Native,
+            uid: 4001,
+            gid: 4001,
+            pid: std::process::id() as i32,
+            unit: None,
+            app_id: None,
+            exe: Some("test".into()),
+        }
+    }
+
+    fn one_session_only() -> Limits {
+        Limits {
+            max_context: 1024,
+            max_sessions: 1,
+            tokens_per_minute: 1000,
+            allowed_models: vec!["*".into()],
+        }
+    }
+
+    /// The leak. CreateSession takes a slot against max_sessions and then does
+    /// several things that can fail; every one of them used to return without
+    /// giving it back, so after max_sessions failures the identity was refused
+    /// until the daemon restarted even though nothing was open. They are all
+    /// resource-exhaustion paths, so they fail together.
+    #[test]
+    fn abandoning_a_half_built_session_gives_the_slot_back() {
+        let dir = scratch("count");
+        let daemon = daemon_in(&dir);
+        let who = identity();
+        let limits = one_session_only();
+
+        daemon.policy.open_session(&who, &limits).unwrap();
+        assert!(
+            daemon.policy.open_session(&who, &limits).is_err(),
+            "the limit is one, so the second must be refused"
+        );
+
+        // Fail before the session object even exists — the socketpair path.
+        {
+            let _slot = SessionSlot { daemon: &daemon, identity: &who, session: None, armed: true };
+        }
+
+        daemon
+            .policy
+            .open_session(&who, &limits)
+            .expect("the abandoned slot must be available again");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// And a slot that was disarmed is a session that really is open, so it
+    /// must still count. Without this the guard would just disable the limit.
+    #[test]
+    fn a_session_that_started_keeps_its_slot() {
+        let dir = scratch("armed");
+        let daemon = daemon_in(&dir);
+        let who = identity();
+        let limits = one_session_only();
+
+        daemon.policy.open_session(&who, &limits).unwrap();
+        {
+            let mut slot =
+                SessionSlot { daemon: &daemon, identity: &who, session: None, armed: true };
+            slot.disarm();
+        }
+        assert!(
+            daemon.policy.open_session(&who, &limits).is_err(),
+            "a session that is actually running must still count against the limit"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Failing after the session is in the map left a phantom: no worker
+    /// thread, no teardown, visible in list_sessions forever, holding an audit
+    /// record that said it had started and never ended.
+    #[test]
+    fn abandoning_after_insertion_leaves_no_phantom() {
+        let dir = scratch("phantom");
+        let daemon = daemon_in(&dir);
+        let who = identity();
+        let limits = one_session_only();
+        daemon.policy.open_session(&who, &limits).unwrap();
+
+        let session = Arc::new(Session {
+            id: "s-phantom".into(),
+            object_path: "/test/s-phantom".into(),
+            identity: who.clone(),
+            model: "none".into(),
+            digest: "sha256:0".into(),
+            backend: "none".into(),
+            local: true,
+            class: sched::Class::Interactive,
+            max_context: 1024,
+            created: std::time::Instant::now(),
+            blob: dir.join("weights"),
+            usage: Mutex::new(Usage::default()),
+            attachment_bytes: AtomicU64::new(0),
+            attachments: Mutex::new(HashMap::new()),
+            current_req: Mutex::new(None),
+            sink: Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+        });
+        daemon.audit.session_start(&who, "s-phantom", "none", "sha256:0", true);
+        daemon.insert_session(session.clone());
+        assert_eq!(daemon.session_list().len(), 1);
+
+        {
+            let _slot = SessionSlot {
+                daemon: &daemon,
+                identity: &who,
+                session: Some(session),
+                armed: true,
+            };
+        }
+
+        assert!(daemon.session_list().is_empty(), "it must not linger in list_sessions");
+        assert!(daemon.session("s-phantom").is_none());
+        daemon
+            .policy
+            .open_session(&who, &limits)
+            .expect("and the slot must come back with it");
+
+        // Every start gets an end, so an auditor never sees a session that
+        // began and did not finish.
+        let audit = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert_eq!(audit.matches("\"event\":\"session-start\"").count(), 1, "{audit}");
+        assert_eq!(audit.matches("\"event\":\"session-end\"").count(), 1, "{audit}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
