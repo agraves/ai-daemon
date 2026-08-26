@@ -225,6 +225,12 @@ impl Config {
                 config.merge(dropin, &text);
             }
         }
+        // Lists accumulate while merging and are collapsed here, so that
+        // redeclaring a name overrides it rather than appending a twin that
+        // nothing will ever reach.
+        config.backends = last_wins(std::mem::take(&mut config.backends), |b| b.name.clone());
+        config.identities =
+            last_wins(std::mem::take(&mut config.identities), |r| r.identity.clone());
         config.validate()?;
         Ok(config)
     }
@@ -292,15 +298,58 @@ impl Config {
         if mentions("aliases") {
             self.aliases.extend(other.aliases);
         }
-        // Lists accumulate: a drop-in adds a backend or an identity rule, it
-        // does not silently disown the ones already declared.
+        // Lists accumulate here and are de-duplicated once every file has been
+        // read; see `last_wins`. A drop-in adds a backend or an identity rule
+        // without disowning the others, and replaces one that shares its name.
         self.backends.extend(other.backends);
         self.identities.extend(other.identities);
     }
 
+    /// At most one rule can match, because `last_wins` has already collapsed
+    /// the list, so first-match and last-match are the same answer.
     pub fn rule_for(&self, identity: &str) -> Option<&IdentityRule> {
         self.identities.iter().find(|r| r.identity == identity)
     }
+}
+
+/// Collapse a list so that a repeated key keeps the last value at the first
+/// position.
+///
+/// The last value, because that is what every other part of this file already
+/// does — a drop-in replaces `[policy]`, and a repeated alias key overwrites
+/// through the map — and because the alternative is the one that bites. Both
+/// consumers of these lists take the first match: `rule_for` is a `find`, and
+/// `Backends` scans its specs in order. So an admin landing a drop-in that
+/// re-declares an identity to tighten its rate limit appended a rule nothing
+/// would ever consult, and was told nothing. A tightening that reports success
+/// and changes nothing is the failure the policy engine refuses one level
+/// down; the loader should not be creating it.
+///
+/// Backends have the same shape with a sharper edge: `enabled = false` in a
+/// drop-in used to append a disabled twin, which construction filtered away
+/// while the enabled original kept running — so there was no way to turn a
+/// packaged backend off, and no error saying so.
+///
+/// The first *position*, because order is meaningful for backends —
+/// `for_manifest` picks the first one that can serve a model — and a drop-in
+/// changing a backend's settings should not also silently reorder which
+/// backend is preferred.
+fn last_wins<T, K>(items: Vec<T>, key: impl Fn(&T) -> K) -> Vec<T>
+where
+    K: Ord,
+{
+    let mut positions: BTreeMap<K, usize> = BTreeMap::new();
+    let mut kept: Vec<Option<T>> = Vec::with_capacity(items.len());
+    for item in items {
+        match positions.get(&key(&item)) {
+            Some(&at) => kept[at] = Some(item),
+            None => {
+                positions.insert(key(&item), kept.len());
+                kept.push(Some(item));
+            }
+        }
+    }
+    kept.into_iter().flatten().collect()
 }
 
 #[cfg(test)]
@@ -381,6 +430,77 @@ mod tests {
         config.attachments.max_samples = 40_000_000;
         let error = config.validate().unwrap_err();
         assert!(error.contains("max_samples"), "{error}");
+    }
+
+    /// The finding, in the shape an admin hits it: a packaged main file, a
+    /// local drop-in that tightens one identity and turns one backend off.
+    /// Both used to be appended after the originals and never reached — the
+    /// rate limit stayed loose and the backend kept running, silently.
+    #[test]
+    fn a_drop_in_overrides_what_the_main_file_declared() {
+        let dir = std::env::temp_dir().join(format!("ai-daemon-dropin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config.toml.d")).unwrap();
+        let main = dir.join("config.toml");
+        std::fs::write(
+            &main,
+            r#"
+[[identity]]
+identity = "unit:app@1000"
+tokens_per_minute = 100
+capabilities = ["generate", "embed"]
+
+[[backend]]
+name = "llamacpp"
+exec = "/usr/lib/ai-daemon/backends/llamacpp"
+
+[[backend]]
+name = "mock"
+exec = "/usr/lib/ai-daemon/backends/mock"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config.toml.d/50-tighten.conf"),
+            r#"
+[[identity]]
+identity = "unit:app@1000"
+tokens_per_minute = 10
+capabilities = ["generate"]
+
+[[backend]]
+name = "llamacpp"
+exec = "/usr/lib/ai-daemon/backends/llamacpp"
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&main).unwrap();
+
+        let rule = config.rule_for("unit:app@1000").expect("the rule must still exist");
+        assert_eq!(rule.tokens_per_minute, Some(10), "the tightening must be what applies");
+        assert_eq!(rule.capabilities, vec!["generate"], "and so must the narrower capabilities");
+        assert_eq!(config.identities.len(), 1, "one identity declared twice is one rule");
+
+        let names: Vec<&str> = config.backends.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["llamacpp", "mock"], "the main file's ordering is preserved");
+        let llamacpp = config.backends.iter().find(|b| b.name == "llamacpp").unwrap();
+        assert!(!llamacpp.enabled, "a drop-in must be able to turn a packaged backend off");
+
+        // And the disable must survive into what actually runs.
+        let live = crate::state::Backends::new(config.backends.clone());
+        assert_eq!(live.configured(), vec!["mock".to_string()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_repeated_key_keeps_the_last_value_at_the_first_position() {
+        let collapsed = last_wins(
+            vec![("a", 1), ("b", 2), ("a", 3), ("c", 4), ("b", 5)],
+            |(k, _)| k.to_string(),
+        );
+        assert_eq!(collapsed, vec![("a", 3), ("b", 5), ("c", 4)]);
     }
 
     #[test]
