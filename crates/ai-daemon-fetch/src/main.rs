@@ -103,11 +103,35 @@ fn main() {
     }
 }
 
+/// A failed local copy, explained.
+///
+/// This unit runs with `ProtectHome=yes` — it is the one process in the
+/// project with a network, and a home directory is the last thing it should be
+/// able to read. The consequence is that `file:///home/…`, which is the most
+/// natural thing to type and which `--help` advertises without qualification,
+/// cannot ever work: every home is empty in this namespace, so the copy fails
+/// with a bare ENOENT or EACCES naming a file the user can plainly see.
+///
+/// The sandbox is right and stays. Saying so is the fix.
+fn local_copy_error(path: &str, e: &std::io::Error) -> String {
+    let base = format!("copying {path}: {e}");
+    if path.starts_with("/home/") || path.starts_with("/root/") {
+        return format!(
+            "{base}\n\
+             this helper runs with ProtectHome=yes and cannot read home directories, \
+             so a file:// source under one is never visible to it regardless of its \
+             permissions; stage the file somewhere outside /home (/var/cache, /srv \
+             and /tmp all work) and install from there, or serve it over https://"
+        );
+    }
+    base
+}
+
 fn fetch(source: &str, output: &Path) -> Result<u64, String> {
     if let Some(path) = source.strip_prefix("file://").or_else(|| {
         source.starts_with('/').then_some(source)
     }) {
-        let bytes = std::fs::copy(path, output).map_err(|e| format!("copying {path}: {e}"))?;
+        let bytes = std::fs::copy(path, output).map_err(|e| local_copy_error(path, &e))?;
         return Ok(bytes);
     }
     if let Some(reference) = source.strip_prefix("oci://") {

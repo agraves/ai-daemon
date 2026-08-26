@@ -280,7 +280,10 @@ fn install(args: &[String]) -> Result<(), String> {
 Sources: https://…, file:///…, oci://registry/repo@sha256:…, remote:MODEL-ID
 The digest is mandatory except for a remote: source. The download runs in
 ai-daemon-fetch, which has a network and no access to the model store; the
-daemon verifies the bytes and moves them in. --format gguf (the default) is
+daemon verifies the bytes and moves them in. That helper also runs with
+ProtectHome=yes, so a file:// path under /home or /root is invisible to it
+however the file is permissioned — stage those outside home (/var/cache, /srv
+and /tmp all work) and install from there. --format gguf (the default) is
 checked against the file's magic, so a mislabelled file is refused rather
 than handed to a backend.
 
