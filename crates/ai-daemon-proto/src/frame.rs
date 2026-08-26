@@ -27,6 +27,25 @@ pub const KIND_BLOB: u8 = 0x02;
 /// memory.
 pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
 
+/// The most BLOB payload put in any one frame. Longer payloads are split
+/// across several, which every reader already absorbs: a BLOB is always
+/// preceded by a header declaring its total length, and the loops that consume
+/// them read until they have that many bytes rather than assuming one frame.
+///
+/// Well under [`MAX_FRAME`] on purpose. The limit is what a peer will accept;
+/// this is what we choose to send, and leaving room between them means a
+/// writer cannot produce a frame its own reader would refuse.
+pub const BLOB_CHUNK: usize = 8 * 1024 * 1024;
+
+/// The most *decoded* attachment payload one request can carry.
+///
+/// Chunking does not help here and this is the ceiling that matters. Decoded
+/// attachments travel to a backend inside the CBOR of a single `generate`
+/// request, not as BLOBs, so they are bounded by [`MAX_FRAME`] however the
+/// blob writers behave — with room left for the rest of the request, which is
+/// what the subtraction is.
+pub const MAX_ATTACHMENT_PAYLOAD: u64 = MAX_FRAME as u64 - 4 * 1024 * 1024;
+
 #[derive(Debug)]
 pub enum Frame {
     Cbor(ciborium::Value),
@@ -39,8 +58,26 @@ pub fn write_cbor<W: Write, T: Serialize>(w: &mut W, value: &T) -> io::Result<()
     write_raw(w, KIND_CBOR, &buf)
 }
 
+/// Write a BLOB payload, splitting it across frames if it is large.
+///
+/// Two things this gets right that writing one frame did not.
+///
+/// A payload longer than [`MAX_FRAME`] used to fail on the write — after the
+/// header announcing its length had already gone out. The reader would take
+/// the header, loop for the bytes, hit EOF and report the peer as having
+/// stopped mid-payload: a crash diagnosis for a framing limit. `MAX_DECODED`
+/// in the decoder is four times `MAX_FRAME`, so the two constants promised
+/// different things and the failure lied about which one had been hit.
+///
+/// And an empty payload writes *no* frames rather than one empty one. The
+/// reader stops as soon as it has the declared length, so at zero it reads
+/// nothing — an empty frame would be left in the stream and desynchronise
+/// every frame after it.
 pub fn write_blob<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
-    write_raw(w, KIND_BLOB, bytes)
+    for chunk in bytes.chunks(BLOB_CHUNK) {
+        write_raw(w, KIND_BLOB, chunk)?;
+    }
+    Ok(())
 }
 
 fn write_raw<W: Write>(w: &mut W, kind: u8, payload: &[u8]) -> io::Result<()> {
@@ -387,5 +424,74 @@ mod tests {
                 "{event:?} came back as {back:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod chunking_tests {
+    use super::*;
+
+    /// The contradiction: the decoder is handed a 256 MiB output budget and a
+    /// frame caps at 64 MiB, so a legal decode used to fail on the write —
+    /// after its header had gone out, which made the reader report the peer as
+    /// having stopped mid-payload.
+    #[test]
+    fn a_payload_larger_than_one_frame_round_trips() {
+        let payload = vec![0x5au8; (MAX_FRAME as usize) + 1024];
+        let mut buffer = Vec::new();
+        write_blob(&mut buffer, &payload).expect("a long payload must be writable");
+
+        // Read it the way every consumer does: until the declared length.
+        let mut cursor = &buffer[..];
+        let mut received: Vec<u8> = Vec::new();
+        while received.len() < payload.len() {
+            match read_frame(&mut cursor).unwrap() {
+                Some(Frame::Blob(mut chunk)) => received.append(&mut chunk),
+                other => panic!("expected a BLOB, got {other:?}"),
+            }
+        }
+        assert_eq!(received, payload);
+        assert!(read_frame(&mut cursor).unwrap().is_none(), "nothing left over");
+    }
+
+    #[test]
+    fn no_frame_written_is_larger_than_one_can_be_read() {
+        let mut buffer = Vec::new();
+        write_blob(&mut buffer, &vec![7u8; 3 * BLOB_CHUNK + 5]).unwrap();
+        let mut cursor = &buffer[..];
+        let mut frames = 0;
+        while let Some(frame) = read_frame(&mut cursor).unwrap() {
+            match frame {
+                Frame::Blob(chunk) => {
+                    assert!(chunk.len() as u32 <= MAX_FRAME, "{} bytes", chunk.len());
+                    frames += 1;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(frames, 4);
+    }
+
+    /// An empty payload must write nothing at all. The reader stops as soon as
+    /// it has the declared length, so at zero it reads nothing — one empty
+    /// frame would sit unread and desynchronise every frame after it.
+    #[test]
+    fn an_empty_payload_leaves_nothing_in_the_stream() {
+        let mut buffer = Vec::new();
+        write_blob(&mut buffer, b"").unwrap();
+        assert!(buffer.is_empty(), "an empty attachment must not emit a frame");
+
+        // The shape that used to desynchronise: empty attachment, then a request.
+        let mut stream = Vec::new();
+        write_blob(&mut stream, b"").unwrap();
+        write_cbor(&mut stream, &Request::Cancel).unwrap();
+        let next: Option<Request> = read_typed(&mut &stream[..]).unwrap();
+        assert!(matches!(next, Some(Request::Cancel)), "got {next:?}");
+    }
+
+    #[test]
+    fn the_attachment_ceiling_leaves_room_inside_a_frame() {
+        assert!(MAX_ATTACHMENT_PAYLOAD < MAX_FRAME as u64);
+        assert!(BLOB_CHUNK as u32 <= MAX_FRAME);
     }
 }

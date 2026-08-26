@@ -613,6 +613,25 @@ impl Worker {
                 return;
             }
         }
+        // One attachment fitting is checked at config load; several of them in
+        // one request is a client's choice and has to be checked here. They all
+        // travel to the backend inside a single CBOR frame, so the sum is what
+        // matters — and at the shipped budgets sixteen full-size images exceed
+        // it, which would otherwise fail as a framing error on the backend
+        // socket and reach the client as "backend-failed".
+        let attachment_bytes: u64 = attachments.iter().map(|a| a.data.len() as u64).sum();
+        if attachment_bytes > ai_daemon_proto::frame::MAX_ATTACHMENT_PAYLOAD {
+            self.send(&Event::error(
+                "policy-denied",
+                format!(
+                    "{} attachment(s) totalling {attachment_bytes} decoded bytes exceed the {} \
+                     bytes one request can carry; send fewer, or smaller ones",
+                    attachments.len(),
+                    ai_daemon_proto::frame::MAX_ATTACHMENT_PAYLOAD
+                ),
+            ));
+            return;
+        }
         let attachment_tokens: u64 = attachments.iter().map(estimate_attachment_tokens).sum();
 
         self.session.cancelled.store(false, Ordering::Relaxed);

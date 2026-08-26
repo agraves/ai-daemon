@@ -225,7 +225,46 @@ impl Config {
                 config.merge(dropin, &text);
             }
         }
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Refuse a configuration the wire cannot carry.
+    ///
+    /// The attachment budgets are the admin's to set and a vision model is
+    /// exactly the reason to raise them — but a decoded attachment reaches the
+    /// backend inside one CBOR frame, so there is a ceiling no configuration
+    /// can lift. Left unchecked, exceeding it surfaced much later as a framing
+    /// error on the backend socket, reported to the client as a backend
+    /// failure: a diagnosis pointing at the wrong component, on a
+    /// configuration the daemon had accepted without a word.
+    ///
+    /// Refusing at load says it once, to the person who can act on it.
+    fn validate(&self) -> Result<(), String> {
+        let ceiling = ai_daemon_proto::frame::MAX_ATTACHMENT_PAYLOAD;
+        // Worst case per attachment: RGBA is four bytes a pixel, PCM is four
+        // bytes a sample.
+        let widest_image = self.attachments.max_pixels.saturating_mul(4);
+        if widest_image > ceiling {
+            return Err(format!(
+                "attachments.max_pixels = {} allows a {widest_image} byte image, and a decoded \
+                 attachment travels to the backend in one frame capped at {ceiling} bytes; \
+                 the most pixels that can fit is {}",
+                self.attachments.max_pixels,
+                ceiling / 4
+            ));
+        }
+        let longest_audio = self.attachments.max_samples.saturating_mul(4);
+        if longest_audio > ceiling {
+            return Err(format!(
+                "attachments.max_samples = {} allows a {longest_audio} byte clip, and a decoded \
+                 attachment travels to the backend in one frame capped at {ceiling} bytes; \
+                 the most samples that can fit is {}",
+                self.attachments.max_samples,
+                ceiling / 4
+            ));
+        }
+        Ok(())
     }
 
     /// Replace only the tables the drop-in actually mentions. We check the
@@ -316,6 +355,32 @@ mod tests {
         let names: Vec<&str> = config.backends.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(names, vec!["mock", "llamacpp"], "lists accumulate");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The shipped defaults must not be a configuration the daemon refuses.
+    #[test]
+    fn the_defaults_are_carryable() {
+        Config::default().validate().expect("the built-in defaults must load");
+    }
+
+    /// The week it breaks: an admin raises the pixel budget for a document
+    /// vision model. It used to be accepted in silence and then fail as a
+    /// framing error attributed to the backend.
+    #[test]
+    fn a_pixel_budget_the_wire_cannot_carry_is_refused_at_load() {
+        let mut config = Config::default();
+        config.attachments.max_pixels = 17_000_000;
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("max_pixels"), "{error}");
+        assert!(error.contains("one frame"), "it must name the real limit: {error}");
+    }
+
+    #[test]
+    fn an_audio_budget_the_wire_cannot_carry_is_refused_at_load() {
+        let mut config = Config::default();
+        config.attachments.max_samples = 40_000_000;
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("max_samples"), "{error}");
     }
 
     #[test]
