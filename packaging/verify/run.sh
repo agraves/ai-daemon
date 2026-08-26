@@ -122,6 +122,25 @@ grep -E 'PrivateNetwork|IPAddress|RestrictAddressFamilies|DeviceAllow' /usr/lib/
 contains "the daemon unit denies the daemon a network" /usr/lib/systemd/system/ai-daemon.service '^PrivateNetwork=yes'
 contains "the fetch unit is the one with a network" /usr/lib/systemd/system/ai-daemon-fetch@.service '^PrivateNetwork=no'
 contains "the fetch unit can write only the staging directory" /usr/lib/systemd/system/ai-daemon-fetch@.service '^ReadWritePaths=/var/lib/ai-daemon/models/staging$'
+note "The unit with a network must not be able to *read* the daemon's state"
+note "either. Read-only is not absent, and it runs as the daemon's own uid, so"
+note "permissions alone would let it read the grant table it owns."
+FETCH=/usr/lib/systemd/system/ai-daemon-fetch@.service
+contains "the state directory is replaced, not merely made read-only" "$FETCH" \
+  '^TemporaryFileSystem=/var/lib/ai-daemon$'
+# Whatever is bound back in is the whole of what this unit can see under the
+# state directory, so that list is the claim — assert the list, rather than
+# assert one line is present and let a later addition widen it unnoticed.
+EXPOSED=$(sed -n 's/^Bind\(ReadOnly\)\?Paths=//p' "$FETCH" | tr ' ' '\n' \
+          | grep '^/var/lib/ai-daemon' | sort | tr '\n' ' ')
+note "exposed under the state directory: ${EXPOSED:-nothing}"
+check "only the staging directory is bound back in" \
+  test "$EXPOSED" = "/var/lib/ai-daemon/models/staging "
+printf %s "$EXPOSED" > /tmp/exposed.txt
+for secret in grants.json audit.jsonl models/blobs models/manifests; do
+  refute "the fetch unit does not re-expose $secret" \
+    grep -q "/var/lib/ai-daemon/$secret" /tmp/exposed.txt
+done
 
 # ---------------------------------------------------------------------------
 section "2. Users, groups and the store"

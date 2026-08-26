@@ -6,7 +6,21 @@
 # job file, so a unit name can never carry a caller's string.
 #
 # What it can reach: the network, and one directory. What it cannot reach: the
-# model store, the session sockets, the grant table, any prompt.
+# model store, the grant table, the audit log, any prompt, the session sockets.
+#
+# That list used to be three-quarters false, and worth writing down because the
+# reasoning is easy to repeat. This unit runs as `ai-daemon` — the uid that
+# owns everything the daemon writes — and `ProtectSystem=strict` mounts the
+# hierarchy read-only, which is no obstacle at all to *reading*. So the grant
+# table and the audit log, mode 0600 and owned by this very uid, were readable;
+# the state directory is 0750 owned by the same user, so traversal passed; and
+# model blobs are deliberately 0444. The one process in the project with a
+# network could read all of it and had somewhere to send it.
+#
+# `TemporaryFileSystem=` below is what makes the claim true: the state
+# directory is replaced by an empty tmpfs in this unit's namespace and the one
+# directory it exists to write is bound back in. Nothing else under there is
+# hidden by permission — it is not there.
 
 [Unit]
 Description=ai-daemon model fetch (%i)
@@ -14,6 +28,19 @@ Documentation=https://github.com/agraves/ai-daemon
 
 [Service]
 Type=oneshot
+# Still the daemon's own user, which is the weaker half of this and is a
+# deliberate deferral rather than an oversight. A separate uid is the
+# structural answer, and it is not a unit-file change: staging is 0700, and
+# `accept_staged` renames out of it and then chmods the blob to 0444 — a chmod
+# on a file you do not own fails with EPERM, the failure is currently ignored,
+# and the blob would land 0600 owned by the fetcher where the backend, running
+# as ai-daemon, could not read it. Doing it properly means a shared-group
+# staging directory and changes in registry.rs, in a path no test here can
+# exercise because the verification box has no systemd.
+#
+# What same-uid would otherwise buy an attacker beyond the filesystem is
+# already closed: SystemCallFilter=@system-service excludes @debug, so ptrace
+# and process_vm_readv are not available to this unit.
 User=ai-daemon
 Group=ai-daemon
 ExecStart=/usr/lib/ai-daemon/ai-daemon-fetch --job /var/lib/ai-daemon/models/staging/%i.job
@@ -28,7 +55,16 @@ PrivateNetwork=no
 NoNewPrivileges=yes
 ProtectHome=yes
 ProtectSystem=strict
+# Read-only is not the same as absent, and for the state directory only absent
+# will do. An empty tmpfs over it, then the one directory this unit writes
+# bound back in: the grant table, the audit log and the model store are not
+# merely unwritable here, they do not exist.
+TemporaryFileSystem=/var/lib/ai-daemon
+BindPaths=/var/lib/ai-daemon/models/staging
 ReadWritePaths=/var/lib/ai-daemon/models/staging
+# It has no business seeing the daemon's process either.
+ProtectProc=invisible
+ProcSubset=pid
 PrivateDevices=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes
