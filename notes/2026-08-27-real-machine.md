@@ -85,3 +85,36 @@ run — the box has secrets and state the verification would trample, so the
 adversarial checks stay in the disposable box and the namespace demo lives
 here. Between the two, every section of `run.sh` now has somewhere it runs
 for real.
+
+## Addendum, same day: standing identities and the meter
+
+The second session on this rig, after `ai-run --as`, `Usage()` and the
+journald fields landed. All four claims exercised for real:
+
+```
+$ ai-run --as demo-agent -- python /usr/share/doc/ai-daemon/examples/think.py "..."
+[qwen-0.5b, you are unit:demo-agent@1000]        ← the standing name, confined
+
+audit.jsonl, same minute:
+  2 × "identity":"unit:demo-agent@1000"          ← native, through the scope
+  2 × "identity":"shim:unit:demo-agent@1000"     ← same name over the socket
+
+$ journalctl -t ai-daemon -o json | …            ← AI_EVENT/AI_IDENTITY/AI_*_TOKENS
+session-end shim:unit:demo-agent@1000 qwen-0.5b 5 8
+
+$ aidctl meter
+shim:unit:demo-agent@1000     13    -    -
+unit:demo-agent@1000          12    -    -
+```
+
+And the half that makes it policy rather than labelling: a drop-in rule
+`tokens_per_minute = 5` against `unit:demo-agent@1000`, daemon restarted, and
+the named launch is refused — `over its 5 tokens/minute allowance` — while an
+anonymous `ai-run` of the same program is untouched. One rule, one name,
+every launch.
+
+What this session's mistake taught: the rule was first written as
+`50-demo.toml`, which `config.toml.d/` silently ignores — drop-ins are
+`*.conf`, systemd's convention under a directory whose name says `.toml`.
+The daemon now says so at startup instead of letting a rule that does not
+apply read as policy being ignored.

@@ -61,6 +61,7 @@ fn main() {
         "install" => install(rest),
         "portal" => portal(rest),
         "spend" => spend(),
+        "meter" => meter(rest),
         "audit" => audit(rest),
         "remove" => remove(rest),
         "alias" => set_alias(rest),
@@ -220,6 +221,93 @@ fn spend() -> Result<(), String> {
     }
     println!();
     println!("A rolling 24 hours, not a calendar day: the oldest requests age out.");
+    Ok(())
+}
+
+/// Money from the daemon's integer micros, matching what `spend` prints.
+fn render_micros(micros: u64) -> String {
+    format!("{:.3}", micros as f64 / 1_000_000.0)
+}
+
+/// Human-scale token counts: 12345 reads better as "12.3k" on a status bar.
+fn render_tokens(n: u64) -> String {
+    match n {
+        0..=9_999 => n.to_string(),
+        10_000..=999_999 => format!("{:.1}k", n as f64 / 1_000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
+/// The live meter: tokens and money per identity over the rolling day.
+///
+/// `--waybar` prints the one-line JSON a waybar `custom` module wants — the
+/// visible half of the accounting story, a token count in the corner of the
+/// screen where a dozen agents' worth of usage used to be invisible. The
+/// default output is the same rows for a person at a terminal.
+fn meter(args: &[String]) -> Result<(), String> {
+    let waybar = args.iter().any(|a| a == "--waybar");
+    if args.iter().any(|a| a == "--help") {
+        println!(
+            "usage: aidctl meter [--waybar]
+
+Tokens and spend per identity, rolling 24 hours, heaviest first. --waybar
+emits one line of JSON for a waybar custom module; see the example in
+/usr/share/doc/ai-daemon/waybar.jsonc.example."
+        );
+        return Ok(());
+    }
+    let rows: Vec<(String, u64, u64, u64)> = call("Usage", &())?;
+    let tokens: u64 = rows.iter().map(|r| r.1).sum();
+    let spent: u64 = rows.iter().map(|r| r.2).sum();
+    if waybar {
+        // Assembled by hand because the shape is four fixed keys, and the
+        // identity strings are the only content that needs escaping — they
+        // are unit names and tokens, but a quote in one must not break the
+        // bar.
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let text = if spent > 0 {
+            format!("{} · {}", render_tokens(tokens), render_micros(spent))
+        } else {
+            render_tokens(tokens)
+        };
+        let tooltip = if rows.is_empty() {
+            "nothing has thought anything today".to_string()
+        } else {
+            rows.iter()
+                .take(8)
+                .map(|(identity, tokens, spent, _)| {
+                    if *spent > 0 {
+                        format!("{identity}: {} · {}", render_tokens(*tokens), render_micros(*spent))
+                    } else {
+                        format!("{identity}: {}", render_tokens(*tokens))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\\n")
+        };
+        println!(
+            "{{\"text\": \"{}\", \"tooltip\": \"{}\", \"class\": \"ai-daemon\"}}",
+            esc(&text),
+            tooltip.split("\\n").map(esc).collect::<Vec<_>>().join("\\n"),
+        );
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("nothing in the last 24 hours");
+        return Ok(());
+    }
+    println!("{:<38} {:>10} {:>12} {:>12}", "IDENTITY", "TOKENS", "SPENT", "PER DAY");
+    for (identity, tokens, spent, ceiling) in &rows {
+        println!(
+            "{identity:<38} {:>10} {:>12} {:>12}",
+            render_tokens(*tokens),
+            if *spent > 0 { render_micros(*spent) } else { "-".to_string() },
+            if *ceiling > 0 { render_micros(*ceiling) } else { "-".to_string() },
+        );
+    }
+    println!();
+    println!("A rolling 24 hours. Tokens count local and remote alike; SPENT is only");
+    println!("what the price table bills, so it stays '-' with no remote provider.");
     Ok(())
 }
 
@@ -1203,6 +1291,8 @@ administration (polkit action io.github.agraves.aidaemon.model-admin)
   alias ALIAS MODEL
   pin MODEL | unpin MODEL
   spend                       what each identity has spent today, and its ceiling
+  meter [--waybar]            tokens and spend per identity, rolling 24 hours;
+                              --waybar emits JSON for a status-bar module
   audit --verify              walk the audit log's hash chain and report the first break
   grant IDENTITY CAPABILITY   capabilities: generate, generate-tools, generate-media, embed, model-admin
   deny IDENTITY CAPABILITY

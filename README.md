@@ -117,7 +117,18 @@ aidctl models                    # what is installed, and where it came from
 aidctl generate "hello"          # open a session and stream an answer
 aidctl sessions                  # who else is using it right now
 aidctl grants                    # every consent decision, and when
+aidctl meter                     # tokens and spend per identity, rolling 24h
 ```
+
+An agent gets a standing identity in one flag, and a standing policy in one
+rule: `ai-run --as claude-code -- claude …` makes every launch arrive as
+`unit:claude-code@1000`, and an `[[identity]]` rule in
+`/etc/ai-daemon/config.toml` — models, rate, spend ceiling — then holds for
+good. `aidctl meter --waybar` is the same accounting as a status-bar module
+(`waybar.jsonc.example` ships with the docs), and on a machine with a journal
+every audit record carries structured fields, so
+`journalctl -t ai-daemon AI_IDENTITY=unit:claude-code@1000 -o json` is a
+query rather than a grep.
 
 Building an application on it is the same session opened from your own code:
 one D-Bus call returns a socket, and frames on the socket are length-prefixed

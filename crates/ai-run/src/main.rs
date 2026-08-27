@@ -49,6 +49,7 @@ const SOCKET: &str = "/run/ai-daemon-shim/shim.sock";
 fn main() {
     let mut socket = std::env::var("AI_DAEMON_SHIM_SOCKET").unwrap_or_else(|_| SOCKET.to_string());
     let mut keep_network = false;
+    let mut as_name: Option<String> = None;
     let mut program: Vec<String> = Vec::new();
 
     let mut args = std::env::args().skip(1);
@@ -60,6 +61,26 @@ fn main() {
             // is at fault. Named for what it does rather than something
             // reassuring, because it is the switch that turns this off.
             "--keep-network" => keep_network = true,
+            "--as" => {
+                let Some(name) = args.next() else {
+                    eprintln!("ai-run: --as needs a name; try --help");
+                    std::process::exit(2);
+                };
+                if name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
+                {
+                    // The name becomes part of a systemd unit name and of the
+                    // policy key an administrator writes; a character set this
+                    // small means neither ever needs escaping.
+                    eprintln!(
+                        "ai-run: --as takes letters, digits, '-', '.' and '_'; {name:?} is not that"
+                    );
+                    std::process::exit(2);
+                }
+                as_name = Some(name);
+            }
             "--version" | "-V" => {
                 println!("ai-run {}", env!("CARGO_PKG_VERSION"));
                 return;
@@ -112,6 +133,43 @@ fn main() {
     // The base URL an HTTP client wants, in the form curl and most libraries
     // accept for a Unix socket.
     std::env::set_var("AI_DAEMON_SHIM_URL", "http://localhost");
+
+    // A standing identity, so a standing policy has something to attach to.
+    //
+    // The daemon identifies a native or socket caller by its systemd unit, and
+    // a terminal-launched process has none worth keying on — a terminal tab is
+    // deliberately not an app identity — so every such caller collapses to
+    // `uid:<n>` and per-app policy has nothing to grip. `--as <name>` wraps
+    // the program in a transient scope, `app-airun-<name>-<pid>.scope`, which
+    // the daemon normalises back to exactly <name>. An administrator then
+    // writes one `[[identity]]` rule against `unit:<name>@<uid>` (or
+    // `shim:unit:<name>@<uid>` for an HTTP caller) and it holds across every
+    // launch. The name is the caller's own claim, as every user-scope name is;
+    // the uid in the key is what keeps it honest.
+    //
+    // Via systemd-run rather than D-Bus from here: creating the scope is the
+    // user manager's job either way, and the shell-out keeps this binary free
+    // of a bus stack. The scope survives the namespace because the manager's
+    // socket is a filesystem object — the same reason the shim socket works.
+    // If systemd-run cannot deliver the scope it exits without running the
+    // program, which is the right failure: a program that ran anyway would
+    // carry the anonymous identity the flag existed to replace.
+    let program = match &as_name {
+        Some(name) => {
+            let mut wrapped = vec![
+                "systemd-run".to_string(),
+                "--user".to_string(),
+                "--scope".to_string(),
+                "--quiet".to_string(),
+                "--collect".to_string(),
+                format!("--unit=app-airun-{name}-{}", std::process::id()),
+                "--".to_string(),
+            ];
+            wrapped.extend(program);
+            wrapped
+        }
+        None => program,
+    };
 
     let error = exec(&program);
     eprintln!("ai-run: cannot run {}: {error}", program[0]);
@@ -206,6 +264,14 @@ usage: ai-run [options] -- PROGRAM [ARGS...]
                    (default {SOCKET}, or $AI_DAEMON_SHIM_SOCKET)
   --keep-network   do not take the network away. For showing the difference,
                    and for telling a broken program from a confined one.
+  --as NAME        run the program under a standing identity: the daemon sees
+                   it as exactly NAME (unit:NAME@uid, or shim:unit:NAME@uid
+                   over the socket) on every launch, so one [[identity]] rule
+                   in /etc/ai-daemon/config.toml — models, rate, spend — holds
+                   for good. Without this a terminal-launched program is just
+                   its uid. The name is your claim, scoped to your uid; it
+                   needs a systemd user session, and refuses rather than
+                   running anonymously without one.
 
 The program runs in a network namespace containing only a loopback interface
 that is down: no route off the machine, no DNS, nothing listening. It reaches

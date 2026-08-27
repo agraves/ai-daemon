@@ -58,6 +58,8 @@ CreateSession(model: s, options: a{sv})
 ListSessions()                   → aa{sv}
 ListGrants()                     → a(sssts)      identity, capability,
                                                  decision, when, via
+Usage()                          → a(sttt)       identity, tokens, spent µ,
+                                                 ceiling µ — rolling 24h
 SetGrant(identity: s, capability: s, allow: b)          [model-admin]
 Revoke(identity: s)              → u                    [model-admin]
 InstallModel(source: s, digest: s, name: s, options: a{sv})
@@ -425,7 +427,7 @@ that cannot.
 ## ai-run
 
 ```
-ai-run [--socket PATH] [--keep-network] -- PROGRAM [ARGS...]
+ai-run [--socket PATH] [--keep-network] [--as NAME] -- PROGRAM [ARGS...]
 ```
 
 Runs a program in a network namespace containing one interface that is down:
@@ -449,6 +451,20 @@ it, that is the program's bug and nothing at this layer can catch it. It is
 also not a container — filesystem, pids and everything else are untouched,
 deliberately. One capability taken away, not a sandbox pretending to be
 complete. Compose it with `systemd-run` or `bwrap` for the rest.
+
+**`--as NAME` gives the program a standing identity.** A terminal-launched
+process has no unit worth keying on — a shell is deliberately not an app — so
+it reaches the daemon as its bare uid and per-app policy has nothing to grip.
+`--as` wraps the program in a transient scope (`app-airun-NAME-<pid>.scope`,
+via the systemd user manager, whose socket survives the namespace like every
+other filesystem object), and the daemon normalises that back to exactly
+`NAME`: the caller is `unit:NAME@<uid>` natively, `shim:unit:NAME@<uid>` over
+the socket, on every launch. One `[[identity]]` rule in the daemon's config
+then holds for good — models, rate, spend ceiling — which is the standing
+per-app grant story. The name is the caller's own claim, scoped to its uid,
+exactly as every user-scope unit name always has been; if the scope cannot be
+created the program is not run, because running it anonymously is what the
+flag exists to prevent.
 
 ## Portal
 

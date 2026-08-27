@@ -80,6 +80,17 @@ pub struct Audit {
     /// daemon restart would be an unexplained break in the chain and the
     /// verifier would cry wolf at the one event that happens most.
     head: Mutex<Option<String>>,
+    /// The journal's native socket, when this machine has one.
+    ///
+    /// Structured fields (`AI_IDENTITY=`, `AI_MODEL=`, …) make
+    /// `journalctl -t ai-daemon AI_IDENTITY=unit:claude-code@1000 -o json`
+    /// a query instead of a grep, which is what per-app accounting is for.
+    /// When a record is delivered this way the stderr line is *not* also
+    /// written — both land in the same journal under the same unit, and a
+    /// meter that shows every turn twice is wrong in the way that spreads.
+    /// Where there is no journal (a container, a dev run) or a send fails,
+    /// stderr carries the same line it always has.
+    journal: Option<std::os::unix::net::UnixDatagram>,
 }
 
 impl Audit {
@@ -88,16 +99,22 @@ impl Audit {
         // Read the tail before opening for append, so the chain continues
         // across a restart instead of starting a second one in the same file.
         let head = head_of(&path);
+        let journal = journal_socket();
         match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             Ok(file) => {
                 if let Some(h) = &head {
                     info!("audit: continuing the chain from {}", &h[..16.min(h.len())]);
                 }
-                Audit { file: Mutex::new(Some(file)), path: Some(path), head: Mutex::new(head) }
+                Audit {
+                    file: Mutex::new(Some(file)),
+                    path: Some(path),
+                    head: Mutex::new(head),
+                    journal,
+                }
             }
             Err(e) => {
                 warn!("audit: cannot open {} ({e}); journal only", path.display());
-                Audit { file: Mutex::new(None), path: None, head: Mutex::new(None) }
+                Audit { file: Mutex::new(None), path: None, head: Mutex::new(None), journal }
             }
         }
     }
@@ -107,6 +124,17 @@ impl Audit {
     }
 
     pub fn write(&self, record: Record<'_>) {
+        // Structured first: on a machine with a journal, fields make the
+        // record queryable and the terse line below is not also written —
+        // same unit, same journal, and a meter that counts every turn twice
+        // is wrong in the way that spreads.
+        let delivered = self
+            .journal
+            .as_ref()
+            .is_some_and(|socket| socket.send(&journal_payload(&record)).is_ok());
+        if delivered {
+            return self.append(record);
+        }
         // The journal line is deliberately terse and fixed-shape: it is read by
         // humans looking for "who used what", and grep is the query language.
         info!(
@@ -124,6 +152,12 @@ impl Audit {
             },
             record.detail.map(|d| format!(" detail={d}")).unwrap_or_default(),
         );
+        self.append(record);
+    }
+
+    /// The chained file, which every record reaches however the journal half
+    /// went.
+    fn append(&self, record: Record<'_>) {
         let mut guard = self.file.lock().unwrap();
         if let Some(file) = guard.as_mut() {
             // The link is taken and replaced under the file lock, so two
@@ -218,6 +252,79 @@ impl Audit {
 /// a re-serialisation: nothing depends on serde emitting fields in the same
 /// order next release, and a verifier written in another language can check
 /// the file with sha256sum and a text editor.
+/// A datagram socket aimed at journald's native endpoint, or nothing.
+///
+/// Unconnected sends to a path would need `sendto` per record; connecting once
+/// here means a machine without a journal costs one failed connect at startup
+/// and nothing after.
+fn journal_socket() -> Option<std::os::unix::net::UnixDatagram> {
+    let socket = std::os::unix::net::UnixDatagram::unbound().ok()?;
+    socket.connect("/run/systemd/journal/socket").ok()?;
+    Some(socket)
+}
+
+/// One record in the journal's native protocol.
+///
+/// Every field uses the length-prefixed form (`NAME\n` + little-endian u64
+/// length + bytes + `\n`) rather than `NAME=value\n`, because the simple form
+/// is only legal for values without newlines and a `detail` is prose from an
+/// error path — encoding by shape of content is how a log format grows a
+/// parser bug. Field names are the query surface and are stable:
+/// `journalctl -t ai-daemon AI_IDENTITY=... -o json` is the interface.
+fn journal_payload(record: &Record<'_>) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(512);
+    let mut field = |name: &str, value: &str| {
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(b'\n');
+        buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        buf.extend_from_slice(value.as_bytes());
+        buf.push(b'\n');
+    };
+    field(
+        "MESSAGE",
+        &format!(
+            "audit {} identity={} model={} tokens={}/{}",
+            record.event,
+            record.identity,
+            record.model.unwrap_or("-"),
+            record.prompt_tokens.unwrap_or(0),
+            record.completion_tokens.unwrap_or(0),
+        ),
+    );
+    field("PRIORITY", "6");
+    field("SYSLOG_IDENTIFIER", "ai-daemon");
+    field("AI_EVENT", record.event);
+    field("AI_IDENTITY", record.identity);
+    field("AI_CLASS", record.class);
+    field("AI_UID", &record.uid.to_string());
+    field("AI_PID", &record.pid.to_string());
+    if let Some(session) = record.session {
+        field("AI_SESSION", session);
+    }
+    if let Some(model) = record.model {
+        field("AI_MODEL", model);
+    }
+    if let Some(digest) = record.digest {
+        field("AI_DIGEST", digest);
+    }
+    if let Some(local) = record.local {
+        field("AI_LOCAL", if local { "true" } else { "false" });
+    }
+    if let Some(n) = record.prompt_tokens {
+        field("AI_PROMPT_TOKENS", &n.to_string());
+    }
+    if let Some(n) = record.completion_tokens {
+        field("AI_COMPLETION_TOKENS", &n.to_string());
+    }
+    if let Some(n) = record.attachment_bytes {
+        field("AI_ATTACHMENT_BYTES", &n.to_string());
+    }
+    if let Some(detail) = record.detail {
+        field("AI_DETAIL", detail);
+    }
+    buf
+}
+
 fn hash_line(line: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

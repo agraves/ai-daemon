@@ -359,10 +359,24 @@ impl Config {
 
         let dropin_dir = PathBuf::from(format!("{}.d", path.display()));
         if let Ok(entries) = std::fs::read_dir(&dropin_dir) {
-            let mut files: Vec<PathBuf> = entries
-                .filter_map(|e| e.ok().map(|e| e.path()))
+            let all: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+            let mut files: Vec<PathBuf> = all
+                .iter()
                 .filter(|p| p.extension().is_some_and(|x| x == "conf"))
+                .cloned()
                 .collect();
+            // Said out loud, because the directory is named `config.toml.d`
+            // and the first thing anyone drops in it is a `.toml` file — which
+            // was silently ignored, and a rule that silently does not apply
+            // reads as the daemon ignoring policy. systemd's convention is
+            // `.conf` and this follows it; the diagnosis is the part systemd
+            // forgot.
+            for other in all.iter().filter(|p| !files.contains(p)) {
+                crate::warn!(
+                    "config: {} is not read — drop-ins here must end in .conf",
+                    other.display()
+                );
+            }
             files.sort();
             for file in files {
                 let text = std::fs::read_to_string(&file)

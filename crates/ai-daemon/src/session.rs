@@ -702,6 +702,11 @@ impl Worker {
     /// never configured a remote provider — the call still happens so the one
     /// that does configure one needs no other change.
     fn charge_for(&self, prompt_tokens: u64, completion_tokens: u64) {
+        // Before the early return: the meter counts what a free model did too,
+        // and on most machines every model is free.
+        self.daemon
+            .policy
+            .record_usage(&self.session.identity, prompt_tokens + completion_tokens);
         let micros = self.daemon.policy.price_of(
             &self.session.model,
             prompt_tokens,

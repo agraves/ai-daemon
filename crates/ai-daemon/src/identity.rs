@@ -236,6 +236,25 @@ pub fn normalise_unit(component: &str) -> Option<String> {
         return Some(strip_launch_uuid(name).unwrap_or(name).to_string());
     }
 
+    // `ai-run --as <name>` wraps its child in `app-airun-<name>-<pid>.scope`,
+    // and the contract printed in its --help is that the identity is exactly
+    // the name given. The generic app- arm below cannot deliver that: it only
+    // strips a leading launcher when a dotted application id follows, so
+    // `--as claude-code` would key as `airun-claude-code` while
+    // `--as org.gnome.App` keyed as `org.gnome.App` — one flag, two shapes.
+    // An explicit arm for a convention we mint keeps the promise literal.
+    //
+    // The name is the caller's own claim, like every user-scope unit: any
+    // process of the uid can mint any scope name, which is why the key still
+    // carries the uid and why cross-user impersonation stays impossible.
+    if let Some(body) = name.strip_prefix("app-airun-") {
+        let mut parts: Vec<&str> = body.split('-').collect();
+        if parts.len() > 1 && parts.last().is_some_and(|last| is_launch_token(last)) {
+            parts.pop();
+        }
+        return Some(parts.join("-"));
+    }
+
     let Some(body) = name.strip_prefix("app-") else {
         return Some(component.to_string());
     };
@@ -415,6 +434,11 @@ mod tests {
             ("app-flatpak-org.telegram.desktop-7781.scope", "org.telegram.desktop"),
             ("app-KDE-org.kde.dolphin-9012.scope", "org.kde.dolphin"),
             ("app-flatpak-md.obsidian.Obsidian-3f9a1c.scope", "md.obsidian.Obsidian"),
+            // ai-run --as: the identity is exactly the name given, dotted or
+            // not — the generic arm below would have keyed the dotless one as
+            // `airun-claude-code` and the dotted one as `org.gnome.App`.
+            ("app-airun-claude-code-8871.scope", "claude-code"),
+            ("app-airun-org.gnome.App-8871.scope", "org.gnome.App"),
         ] {
             assert_eq!(
                 normalise_unit(component).as_deref(),

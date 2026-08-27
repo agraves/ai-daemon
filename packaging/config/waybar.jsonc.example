@@ -1,0 +1,18 @@
+// The machine's inference meter, in the corner of the screen.
+//
+// Merge the block below into ~/.config/waybar/config.jsonc (and add
+// "custom/ai" to one of the modules-left/center/right arrays). It polls
+// `aidctl meter --waybar`, which asks the daemon over D-Bus — so it shows
+// tokens per rolling day across every app and agent on the machine, named,
+// with money beside them once a remote provider has a price table. The
+// tooltip breaks it down per identity.
+//
+// The user running waybar must be in the `ai` group, like any other caller.
+//
+// "custom/ai": {
+//     "exec": "aidctl meter --waybar",
+//     "return-type": "json",
+//     "interval": 30,
+//     "format": "ai {}",
+//     "tooltip": true
+// }

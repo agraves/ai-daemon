@@ -211,6 +211,12 @@ struct PolicyState {
     /// What each identity has spent, and when. Pruned to the window on every
     /// touch, so it holds a day of requests rather than a history.
     spend: HashMap<String, Vec<(Instant, u64)>>,
+    /// Tokens each identity has consumed, and when — the same rolling window
+    /// as `spend`, kept separately because most machines never price anything
+    /// and a meter that only worked beside a bill would be empty exactly where
+    /// this daemon is most at home. Feeds `Usage()` and nothing else: limits
+    /// read the bucket, ceilings read `spend`.
+    usage: HashMap<String, Vec<(Instant, u64)>>,
 }
 
 impl PolicyEngine {
@@ -256,6 +262,7 @@ impl PolicyEngine {
                 buckets: HashMap::new(),
                 sessions: HashMap::new(),
                 spend: HashMap::new(),
+                usage: HashMap::new(),
             }),
             polkit: Mutex::new(None),
         }
@@ -558,6 +565,68 @@ impl PolicyEngine {
             entry.push((now, micros));
         }
         entry.iter().map(|(_, m)| *m).sum()
+    }
+
+    /// Note what a finished request consumed, for the meter.
+    ///
+    /// Accounting, not enforcement: nothing reads this to refuse anything.
+    /// The rate limit charged its bucket before the request ran and the spend
+    /// ceiling has its own ledger — this exists so "what has this machine
+    /// thought about today, and for whom" has an answer without grepping the
+    /// audit log as root.
+    pub fn record_usage(&self, identity: &Identity, tokens: u64) {
+        if tokens == 0 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        let entry = state.usage.entry(identity.key()).or_default();
+        let now = Instant::now();
+        entry.retain(|(at, _)| now.duration_since(*at) < SPEND_WINDOW);
+        entry.push((now, tokens));
+    }
+
+    /// Every identity that consumed tokens in the window, with what it spent.
+    ///
+    /// Rows are (identity, tokens, spent micros, ceiling micros), heaviest
+    /// first. The union of the usage and spend maps rather than either alone:
+    /// an identity can have tokens and no bill (every local model) or a bill
+    /// and no fresh tokens (its requests aged out of one map first), and a
+    /// meter that dropped either row would read as "nothing happened".
+    pub fn usage_report(&self) -> Vec<(String, u64, u64, u64)> {
+        let keys: Vec<String> = {
+            let state = self.state.lock().unwrap();
+            state.usage.keys().chain(state.spend.keys()).cloned().collect()
+        };
+        let mut keys = keys;
+        keys.sort();
+        keys.dedup();
+        let mut rows: Vec<(String, u64, u64, u64)> = keys
+            .into_iter()
+            .map(|key| {
+                let tokens = {
+                    let mut state = self.state.lock().unwrap();
+                    let now = Instant::now();
+                    match state.usage.get_mut(&key) {
+                        Some(entry) => {
+                            entry.retain(|(at, _)| now.duration_since(*at) < SPEND_WINDOW);
+                            entry.iter().map(|(_, n)| *n).sum()
+                        }
+                        None => 0,
+                    }
+                };
+                let spent = self.spent_by(&key);
+                let ceiling = self
+                    .config
+                    .rule_for(&key)
+                    .and_then(|rule| rule.daily_spend)
+                    .map(to_micros)
+                    .unwrap_or_else(|| to_micros(self.config.policy.daily_spend));
+                (key, tokens, spent, ceiling)
+            })
+            .filter(|(_, tokens, spent, _)| *tokens > 0 || *spent > 0)
+            .collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.1));
+        rows
     }
 
     /// Has this identity already spent its day, on something that costs?

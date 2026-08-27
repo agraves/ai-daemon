@@ -430,6 +430,16 @@ impl Manager {
             .collect()
     }
 
+    /// The meter: per identity, tokens and money over the rolling day.
+    ///
+    /// Rows are (identity, tokens, spent micros, ceiling micros), heaviest
+    /// first. Micros rather than rendered strings, unlike `Spend`, because
+    /// this is the method a status-bar widget polls and a widget formats for
+    /// its own space; `aidctl meter` renders the same rows for a terminal.
+    fn usage(&self) -> Vec<(String, u64, u64, u64)> {
+        self.daemon.policy.usage_report()
+    }
+
     fn list_grants(&self) -> Vec<(String, String, String, u64, String)> {
         self.daemon
             .policy

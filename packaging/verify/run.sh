@@ -1589,6 +1589,40 @@ check "and it is still about forty lines, which is the claim being made of it" \
   bash -c "test \"\$(grep -cv '^\s*#\|^\s*\$' /usr/share/doc/ai-daemon/examples/think.py)\" -le 45"
 
 # ---------------------------------------------------------------------------
+section "27. The meter, and a standing identity to meter"
+# ---------------------------------------------------------------------------
+note "Everything above generated tokens; the meter is where they show up"
+note "named. Usage() is the D-Bus method a status bar polls, aidctl meter is"
+note "the same rows for a person, and neither needs root — accounting is not"
+note "a privilege."
+
+runas alice aidctl meter >/tmp/meter.txt 2>&1
+run cat /tmp/meter.txt
+contains "the day's tokens are itemised per identity" /tmp/meter.txt 'IDENTITY *TOKENS'
+contains "and alice's turns are on the bill" /tmp/meter.txt 'uid:4001'
+runas alice aidctl meter --waybar >/tmp/waybar.txt 2>&1
+run cat /tmp/waybar.txt
+contains "the waybar form is one line of JSON with a text field" /tmp/waybar.txt '^\{"text": '
+check "that a status bar can actually parse" \
+  bash -c "python -c 'import json,sys; json.load(open(\"/tmp/waybar.txt\"))'"
+note "Tokens count local models too. A meter that only worked beside a bill"
+note "would be empty exactly where this daemon is most at home."
+
+note "ai-run --as NAME is the other half: a terminal program has no app"
+note "identity — a shell is deliberately not an app — so per-app policy had"
+note "nothing to grip until the program could claim a standing name. The box"
+note "has no user manager, so what it can prove is the failure mode: if the"
+note "scope cannot be created the program is NOT run anonymously."
+refute "with no user manager, --as refuses rather than running unnamed" \
+  ai-run --keep-network --as boxtest -- touch /tmp/airun-as-ran
+check "and the program never ran" test ! -e /tmp/airun-as-ran
+note "The acceptance half — unit:NAME@uid in the audit log, one [[identity]]"
+note "rule holding across launches — needs a real machine, and is recorded in"
+note "notes/2026-08-27-real-machine.md beside the namespace demo. The same is"
+note "true of the audit log's journald fields: no journald here, so the"
+note "stderr fallback is what this box exercises, on every line above."
+
+# ---------------------------------------------------------------------------
 printf '\n\033[1m=== Result ===\033[0m\n'
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

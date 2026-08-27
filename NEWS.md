@@ -251,6 +251,29 @@ with the docs and the verification runs it, so it cannot rot silently. And
 `docs/provisioning.md` writes down the half of the no-credential claim that is
 not code: how to ship a machine so no application ever holds a provider key.
 
+### Standing identities, and a meter you can see
+
+`ai-run --as claude-code -- claude …` runs a program under a standing name: a
+transient scope the daemon normalises back to exactly the name given, so the
+caller is `unit:claude-code@1000` (or `shim:unit:claude-code@1000` over the
+socket) on every launch, and one `[[identity]]` rule in `config.toml` —
+models, rate, spend ceiling — holds for good. That closes the gap where every
+terminal-launched agent collapsed to its bare uid and per-app policy had
+nothing to grip. If the scope cannot be created the program is not run:
+running it anonymously is what the flag exists to prevent.
+
+The accounting grew a face. `Usage()` on the manager reports tokens and spend
+per identity over the rolling day; `aidctl meter` prints it, and
+`aidctl meter --waybar` emits the JSON a status-bar module wants
+(`waybar.jsonc.example` ships in the docs) — a live token count in the corner
+of the screen, which is the visible answer to "what did anything on this
+machine just spend". Tokens are counted for local models too, not only where
+a price table bills them. And on a machine with a journal, every audit record
+now carries structured fields, so
+`journalctl -t ai-daemon AI_IDENTITY=unit:claude-code@1000 -o json` is a
+query rather than a grep; the chained file and the stderr fallback are
+unchanged.
+
 ---
 
 ## Compatibility
@@ -328,7 +351,7 @@ Stated here rather than left to be discovered:
 ## Verifying it yourself
 
 `dev build` runs the whole thing: `makepkg` from a source tarball, `pacman -U`
-into a clean box, then 299 checks against the installed package over the system
+into a clean box, then 305 checks against the installed package over the system
 bus with polkit running, plus the workspace’s 156 unit tests. The verification
 runs *during* the build, so a failure fails the build.
 

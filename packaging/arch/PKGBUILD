@@ -154,6 +154,8 @@ package() {
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 docs/protocol.md "$pkgdir/usr/share/doc/$pkgname/protocol.md"
   install -Dm644 docs/provisioning.md "$pkgdir/usr/share/doc/$pkgname/provisioning.md"
+  install -Dm644 packaging/config/waybar.jsonc.example \
+    "$pkgdir/usr/share/doc/$pkgname/waybar.jsonc.example"
   # The client story, installed where a person can copy it from: the whole
   # native protocol as a program, not a framing spec.
   install -Dm644 examples/think.py "$pkgdir/usr/share/doc/$pkgname/examples/think.py"
