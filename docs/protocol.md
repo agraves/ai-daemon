@@ -87,7 +87,13 @@ properties: Version (s), DataProtocol (u), Backends (as)
 | `portal_app_id` | `s` | accepted only from xdg-desktop-portal (§13) |
 | `shim_peer_pid` | `u` | accepted only from `ai-daemon-shim` (§5) |
 | `shim_peer_uid` | `u` | as above |
+| `shim_peer_attested` | `b` | as above; whether the kernel vouched for that pid/uid (`SO_PEERCRED` on the shim's Unix socket) or the shim is describing itself (TCP) |
 | `shim_client` | `s` | as above; the name a token mapped to. Refused, not ignored, from anything that is not the shim |
+
+Plus the narrowing options — `no_tools`, `max_tokens_per_minute`,
+`max_sessions`, `daily_spend`, `allowed_models`, `prelude`,
+`mark_provenance` — which any caller may pass and which can only take away;
+they have their own section below.
 
 `CreateSession` is cheap on purpose. It does not prompt for consent and does
 not load weights: both can take a long time, and the bus thread is shared with
@@ -95,8 +101,11 @@ every other caller on the machine. The first `generate` on the session is
 where consent is asked and the model is loaded.
 
 `InstallModel` options are `format` (default `gguf`, checked against the file's
-magic), `backend`, `license`, and `capabilities` (`as`, default
-`["generate"]`).
+magic), `backend`, `license`, `capabilities` (`as`, default `["generate"]`),
+and `max_ctx` (`u`) — the largest context the model can serve, stated by the
+administrator because install reads the file's magic and deliberately not its
+header. Absent means unknown, which is treated as no ceiling, not as a
+default.
 
 ### Capabilities
 
@@ -237,11 +246,20 @@ Two APIs, on a loopback port and a Unix socket, off by default:
 
 | | |
 |---|---|
-| OpenAI | `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/embeddings` |
+| OpenAI | `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/embeddings` |
 | Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
 
-Both become ordinary daemon sessions: same policy engine, same rate limit,
-same audit record, same `aidctl sessions`. Only the wire shapes differ, and
+`/v1/responses` exists because modern codex speaks only the Responses API and
+refuses a provider configured for chat completions. It is a deliberate
+subset: text and function-call output, streaming and non-streaming,
+`instructions` / `input` / `max_output_tokens` / flat tools inbound — not
+reasoning items, not `store` / `previous_response_id` continuation, not
+inbound images. The routes match with query strings stripped, because Claude
+Code sends `?beta=true` on every turn and a 404 there reads to its user as a
+missing model.
+
+All of them become ordinary daemon sessions: same policy engine, same rate
+limit, same audit record, same `aidctl sessions`. Only the wire shapes differ, and
 they differ in ways worth naming — `system` is a field rather than a message,
 `max_tokens` is required and is *not* defaulted, tool results arrive inside a
 user turn, tool arguments are an object rather than a JSON string, and the
@@ -298,12 +316,26 @@ The trust class does not move: everything here is still `Class::Shim`. A
 shared secret in a file is weaker than peer credentials and this does not
 pretend otherwise — any local process that can read the token file can present
 the token, so what it buys is that *cooperating* clients are told apart. The
-structural fix is a Unix-socket listener where `SO_PEERCRED` answers, and it
-is not built yet.
+structural answer is the Unix socket above, where the kernel names the peer
+and no secret is involved; the token table remains for TCP callers and for
+naming an agent something more useful than a pid.
 
 The name is the shim's to assert and nobody else's: the daemon takes
 `shim_client` only from the shim, and refuses it — rather than ignoring it —
 from anything else.
+
+### Naming the models
+
+Agents send their vendor's model ids, and some validate the name client-side
+against a list they ship — so without a translation the only way in was
+installing local weights under a vendor SKU. `[[model]]` entries in
+`shim.toml` map a client's id (`from`) to a daemon model (`to`); first exact
+match wins, `from = "*"` catches the rest, and no entries means the name
+passes through unchanged. Replies echo the id the client sent, because an
+agent that checks the model field against what it asked for must see what it
+asked for. This is deliberately not the daemon's alias table: aliases are the
+machine's vocabulary, and a vendor SKU belongs at the boundary where the
+foreign name arrives, not in every caller's view of the registry.
 
 The OpenAI-compatible shim maps only `logit_bias` and `top_logprobs`, which
 are the two OpenAI itself defines. It deliberately invents no spelling for the

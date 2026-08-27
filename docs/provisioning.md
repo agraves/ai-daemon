@@ -60,10 +60,11 @@ grep -rl 'sk-[A-Za-z0-9_-]' /etc /home/*/.config 2>/dev/null   # the blunt versi
 
 For each application found holding a credential: point it at the shim
 (`ANTHROPIC_BASE_URL` / OpenAI `base_url` — every serious client has the
-knob, because organisations put gateways in front of these tools), give it a
-token from `/etc/ai-daemon/shim.toml` so it arrives as itself, and delete its
-key. `aidctl spend` then answers per-agent what used to be invisible, and
-revoking one agent is one line rather than a key rotation.
+knob, because organisations put gateways in front of these tools), name it —
+a token from `/etc/ai-daemon/shim.toml`, or launch it as
+`ai-run --as <name>` so the kernel-attested scope is the name — and delete
+its key. `aidctl meter` and `aidctl spend` then answer per-agent what used to
+be invisible, and revoking one agent is one line rather than a key rotation.
 
 A token in `shim.toml` is a name, not a secret worth stealing: it selects
 which identity a caller is filed under, and what that identity may do is

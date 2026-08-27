@@ -4,9 +4,12 @@ Written for whoever picks this up next, and specifically for the WSL2 side of
 the Omarchy image. It assumes you have not read the commit log and do not
 intend to.
 
-`0.1.0`, master at the commit that added this file. Nothing has been deployed
-anywhere, which is worth knowing before you read the compatibility notes: they
-describe what *would* break, not what did.
+`1.0.0`. The number says the contracts are ready to hold, not that the project
+is finished: nothing has been deployed beyond the development machines, so
+there was no install base to justify iterating pre-1 versions against, and a
+version that only ever changes on a dev box is noise. The compatibility notes
+below describe what *would* break for an install that predates a change, not
+what did break for anyone.
 
 ---
 
@@ -16,7 +19,7 @@ Build and install the package the way a user would:
 
 ```
 ./packaging/arch/make-package.sh
-sudo pacman -U packaging/arch/ai-daemon-0.1.0-1-*.pkg.tar.zst
+sudo pacman -U packaging/arch/ai-daemon-1.0.0-1-*.pkg.tar.zst
 ```
 
 The version in that glob matters. `makepkg` emits an `ai-daemon-debug` package
@@ -81,8 +84,13 @@ machine could not talk to the daemon at all. It now serves both:
 
 | | |
 |---|---|
-| OpenAI | `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/embeddings` |
+| OpenAI | `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/embeddings` |
 | Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
+
+`/v1/responses` is the dialect modern codex requires (it refuses chat
+completions outright) and is served as a documented subset — no reasoning
+items, no `previous_response_id` continuation, no inbound images; codex needs
+none of them.
 
 Same port (`127.0.0.1:11434`), same sessions underneath, same policy engine,
 same audit log. Streaming and non-streaming, tools, images, `system`, and
@@ -354,6 +362,12 @@ Stated here rather than left to be discovered:
   itself — egress gone, loopback gone, the socket and the whole native client
   still working — is demonstrated on a real machine and recorded verbatim in
   `notes/2026-08-27-real-machine.md`.
+- **Rate limits are per-minute**, and a minute is the wrong shape for an
+  agent: one legitimate turn can resend a whole conversation, so a bucket
+  cannot tell a large first request from a runaway fourth one. The bucket is
+  enforced as written — an administrator's small number means it — and the
+  daemon diagnoses at startup any identity whose allowance is below its
+  context window. An allowance shaped like a turn or a task is future work.
 
 ---
 

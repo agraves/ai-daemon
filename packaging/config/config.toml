@@ -140,14 +140,12 @@ name = "mock"
 exec = "/usr/lib/ai-daemon/backends/ai-daemon-backend-mock"
 enabled = true
 
-# Per-identity overrides, keyed by the string `aidctl grants` prints. Listing
-# capabilities here is an administrator's decision and beats a remembered
-# consent click, so this is also how you revoke something permanently.
-#
-# The key is the *normalised* identity — run the app once and copy the row
-# `aidctl grants` (or `aidctl meter`) shows, rather than guessing: a desktop
-# launch scope like `app-gnome-org.gnome.Newelle-4242.scope` is keyed as its
-# application id, so the rule reads:
+# Per-identity overrides, keyed by the string `aidctl grants` prints — run the
+# app once and copy the row rather than guessing, because the key is the
+# *normalised* identity (a launch scope like
+# `app-gnome-org.gnome.Newelle-4242.scope` keys as its application id).
+# Listing capabilities here beats a remembered consent click, so this is also
+# how you revoke something permanently.
 #
 # [[identity]]
 # identity = "unit:org.gnome.Newelle@1000"
@@ -156,23 +154,18 @@ enabled = true
 # tokens_per_minute = 3000
 # allowed_models = ["default", "fast"]
 #
-# A terminal-launched program has no such identity — a shell is deliberately
-# not an app — so it arrives as bare `uid:1000` and a rule here would cover
-# everything that uid runs. `ai-run --as NAME` is the fix: it launches the
-# program under a standing name, and one rule then holds for every launch.
-# This pair is the whole per-app policy story for agents:
-#
-#   $ ai-run --as claude-code -- claude ...
+# A terminal-launched program is deliberately not an app and arrives as bare
+# `uid:1000`. Launch it as `ai-run --as claude-code -- claude ...` and it gets
+# a standing name instead, so one rule holds for every launch:
 #
 # [[identity]]
 # identity = "unit:claude-code@1000"        # native D-Bus callers
 # tokens_per_minute = 60000
-# allowed_models = ["default"]
 # daily_spend = 2.0
 #
 # [[identity]]
 # identity = "shim:unit:claude-code@1000"   # the same program over the shim's
-# tokens_per_minute = 60000                 # unix socket (HTTP API)
+# tokens_per_minute = 60000                 # unix socket
 # daily_spend = 2.0
 
 # There is no [[backend]] here for the remote provider, deliberately.

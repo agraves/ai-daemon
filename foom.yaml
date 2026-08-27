@@ -31,13 +31,14 @@ software:
     type: service
     language: rust
     description: >
-      OpenAI- and Anthropic-compatible HTTP endpoint on 127.0.0.1:11434, off
-      by default. The adoption bridge: software already pointed at a localhost
-      inference port keeps working — including Claude Code, which speaks the
-      Messages API and nothing else — but under the daemon's policy engine and
-      audit log. A token table names its callers, so several agents on one
-      machine are several policies rather than one. Its own unprivileged unit,
-      because it is the least trusted code here.
+      OpenAI- and Anthropic-compatible endpoint on 127.0.0.1:11434 and a Unix
+      socket, off by default. The adoption bridge: software already pointed at
+      a localhost inference port keeps working — including Claude Code, which
+      speaks the Messages API and nothing else — but under the daemon's policy
+      engine and audit log. Socket callers are named by the kernel; a token
+      table names the rest, so several agents on one machine are several
+      policies rather than one. Its own unprivileged unit, because it is the
+      least trusted code here.
 
   - name: ai-daemon-fetch
     path: crates/ai-daemon-fetch
@@ -110,7 +111,9 @@ software:
       Runs a program with inference and nothing else: a network namespace
       containing only a downed loopback, and the shim's Unix socket left
       reachable. The credential and the egress are what it removes; it is one
-      capability taken away rather than a container, and says so.
+      capability taken away rather than a container, and says so. --as NAME
+      also gives the program a standing identity, so one policy rule holds
+      across every launch.
 
   - name: aidctl
     path: crates/aidctl

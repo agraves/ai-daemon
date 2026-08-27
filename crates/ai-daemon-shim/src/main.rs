@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! ai-daemon-shim — an OpenAI-compatible endpoint on loopback, off by default.
+//! ai-daemon-shim — OpenAI- and Anthropic-compatible endpoint on loopback and
+//! a Unix socket, off by default.
 //!
 //! This is the adoption bridge from §15: every editor plugin and desktop
 //! assistant on Linux already points at `http://127.0.0.1:11434` or
@@ -13,14 +14,14 @@
 //! Three properties are load-bearing and are enforced here rather than
 //! documented:
 //!
-//! * **Loopback only.** The listener binds `127.0.0.1`; there is no option to
-//!   bind anything else, because "no network listener ever" is a property
-//!   users should be able to check rather than trust.
+//! * **No network listener.** TCP binds `127.0.0.1` and nothing else, with no
+//!   option otherwise; the second listener is a Unix socket, which is what a
+//!   network-less process can still reach and where `SO_PEERCRED` names the
+//!   caller.
 //! * **Lowest trust.** Everything the shim introduces is `Class::Shim` in the
-//!   daemon's policy engine. A client that was written for a server with no
-//!   authorisation gets the identity that deserves. Named clients (below) do
-//!   not change that class — a shared secret over loopback is not peer
-//!   credentials — they only stop every caller sharing one grant.
+//!   daemon's policy engine, kernel-named socket callers included. A named
+//!   token (below) or an attested peer stops every caller sharing one grant;
+//!   neither moves the class.
 //! * **No remote fetches.** `image_url` accepts `data:` URLs and nothing else.
 //!   Following a URL here would be a server-side request forgery primitive
 //!   sitting inside the machine's AI service.

@@ -30,6 +30,11 @@
 //! anything, and holds nothing open: whatever the child can reach afterwards,
 //! it reached through a descriptor or a path that was there before the exec.
 //!
+//! `--as NAME` additionally runs the program in a transient scope the daemon
+//! keys back to exactly NAME, so a terminal-launched agent gets a standing
+//! identity and one `[[identity]]` rule holds across every launch — see the
+//! comment at the wrapper in `main`.
+//!
 //! ## What it does not do
 //!
 //! It does not stop the child acting badly on what the model says. Nothing at

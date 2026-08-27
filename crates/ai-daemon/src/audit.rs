@@ -6,9 +6,11 @@
 //! never logged. This module exists so that rule has exactly one place to be
 //! broken, and so that reviewing whether it holds means reading one file.
 //!
-//! Records go to the journal via stderr (so `journalctl -u ai-daemon` is the
-//! interface) and, when configured, to a newline-delimited JSON file that
-//! survives log rotation policy the admin did not choose.
+//! Records go to the journal — natively with structured `AI_*` fields where
+//! journald's socket exists, via stderr where it does not — and to a
+//! newline-delimited JSON file that survives log rotation policy the admin
+//! did not choose. `journalctl -t ai-daemon AI_IDENTITY=… -o json` is the
+//! query interface; the file is the evidence.
 //!
 //! ## The chain
 //!

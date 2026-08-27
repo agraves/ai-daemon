@@ -35,19 +35,19 @@ That is this.
 ## What it actually does
 
 **Tells its callers apart.** Peer credentials plus the caller's systemd unit
-for native processes, an application id for sandboxed ones — read out of their
+for native processes; an application id for sandboxed ones, read out of their
 Flatpak or Snap confinement by `ai-daemon-portal`, which runs in the user's
-session because the daemon cannot read another user's `/proc` — and the
-lowest trust class for anything arriving through the HTTP shim — where a
-caller presenting a configured token is named (`shim:cx`) so six agents on
-one machine are six policies rather than one, without the trust class moving,
-because a shared secret over loopback is not peer credentials. The daemon
-takes an asserted app id only from a caller on `policy.portal_units`, never
-because a message said so.
-The first request from a new app asks the user through polkit; the answer is
-remembered per (identity, capability) and is revocable. Linux has no
-code-signature check on a peer, so native identity is a good guess rather than
-proof — the daemon says so rather than pretending otherwise.
+session because the daemon cannot read another user's `/proc`. Callers on the
+shim's Unix socket are named by the kernel too (`SO_PEERCRED`); on its TCP
+port the kernel will not say, so a configured token names the caller
+(`shim:cx`) and an anonymous one is honestly just a uid — six agents on one
+machine are six policies either way, and everything through the shim stays
+the lowest trust class. The daemon takes an asserted app id only from a
+caller on `policy.portal_units`, never because a message said so. The first
+request from a new app asks the user through polkit; the answer is remembered
+per (identity, capability) and is revocable. Linux has no code-signature
+check on a peer, so native identity is a good guess rather than proof — the
+daemon says so rather than pretending otherwise.
 
 **Arbitrates.** One scheduler, two priority classes. An interactive request
 preempts a background batch at a token boundary; within a class, the session
@@ -148,7 +148,7 @@ Building the package on Arch (and so on Omarchy):
 
 ```
 ./packaging/arch/make-package.sh
-sudo pacman -U packaging/arch/ai-daemon-0.1.0-1-*.pkg.tar.zst
+sudo pacman -U packaging/arch/ai-daemon-1.0.0-1-*.pkg.tar.zst
 sudo usermod -aG ai "$USER"      # the outer gate; log back in afterwards
 ```
 
@@ -191,7 +191,7 @@ every capability dropped, and the run needs to act as three different users.)
 The transcript is kept at `/verification.txt` in the resulting image, which is
 what the image prints if you run it.
 
-It checks nearly three hundred things, and is deliberately adversarial about most of
+It checks over three hundred things, and is deliberately adversarial about most of
 them — a wrong digest, an oversized screenshot, a truncated PNG, a user outside
 the gate, a revoked identity, a remote `image_url` — because "it generated some
 text" is the easy half and the refusals are the point.
@@ -208,7 +208,7 @@ text" is the easy half and the refusals are the point.
 | `crates/ai-daemon-portal` | session-bus portal: turns a sandbox into an app identity |
 | `crates/ai-daemon-fetch` | the download helper, and the only thing here with a network |
 | `crates/ai-daemon-decode` | the confined media decoder |
-| `crates/ai-daemon-shim` | OpenAI- and Anthropic-compatible localhost endpoint, off by default |
+| `crates/ai-daemon-shim` | OpenAI- and Anthropic-compatible endpoint on loopback and a Unix socket, off by default |
 | `crates/ai-run` | run a program with inference and nothing else: no network, no credential |
 | `crates/aidctl` | administration and inspection |
 | `packaging/` | PKGBUILD, systemd units, D-Bus and polkit policy, the verification run |
@@ -267,10 +267,12 @@ project's protocol has users.
 
 ## Status
 
-Draft. The data plane and provider protocol are at v2 and both still serve v1;
-"frozen" means the daemon refuses a peer speaking anything outside that range,
-not that anyone has agreed to them yet. The design record this implements is
-in `notes/`.
+1.0.0. The wire contracts are versioned and held — data plane and provider
+protocol at v2, both still serving v1, and the daemon refuses a peer speaking
+anything outside that range. The number means the contracts are ready to be
+relied on, not that the ecosystem has agreed to them: nothing has shipped
+beyond development machines yet. The design record this implements is in
+`notes/`.
 
 Not built: the freedesktop review that would make `org.freedesktop.AI1` and
 `org.freedesktop.portal.AI` real names rather than a proposal and an interim,
