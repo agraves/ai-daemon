@@ -219,6 +219,38 @@ Media generation, parallel tool calls, and fine-grained sampling control
 plane and the provider protocol are at v2 and both still serve v1: a v1 client
 is never sent anything v2 added.
 
+### A door that survives a namespace
+
+The shim listens on `/run/ai-daemon-shim/shim.sock` beside its TCP port.
+Loopback is network — an application in a namespace with no interfaces cannot
+reach `127.0.0.1` either — so the socket is what makes "confined" and "can do
+inference" stop being mutually exclusive. It is also where `SO_PEERCRED`
+answers: a caller there is named by the kernel, pid and uid, no token needed,
+and the audit log records the real caller instead of the shim's own uid.
+Tokens still win where presented — a name beats a pid in a grant table.
+`--port 0` serves only the socket.
+
+`ai-run -- <program>` is the claim in one command: a network namespace with a
+downed loopback, the socket left reachable, exec. The program keeps inference
+and loses the credential and the egress. It refuses to run the program
+unconfined if it cannot unshare, and it is not a container — one capability
+removed, composable with `systemd-run` or `bwrap` for the rest.
+
+`CreateSession` accepts narrowing options that can only take away: `no_tools`,
+a lower rate (enforced by a session-private bucket *in addition to* the
+identity's), fewer sessions, a lower spend, a subset of models, an appended
+prelude, provenance marking that only turns on. A supervisor can open a
+session and hand the descriptor to a child knowing the child holds strictly
+less than it does; there is no method that widens a session.
+
+### The client story, on paper and in the package
+
+`examples/think.py` is the native protocol as a program — one D-Bus call, then
+CBOR frames on the returned socket, forty lines, no key, no SDK. It installs
+with the docs and the verification runs it, so it cannot rot silently. And
+`docs/provisioning.md` writes down the half of the no-credential claim that is
+not code: how to ship a machine so no application ever holds a provider key.
+
 ---
 
 ## Compatibility
@@ -256,8 +288,11 @@ The operator approved it on the grounds that nothing is deployed yet.
 
 Stated here rather than left to be discovered:
 
-- **The shim's identity is a shared secret**, not peer credentials. See above.
-  The Unix-socket listener that would fix it properly is not built.
+- **The shim's TCP identity is a shared secret**, not peer credentials — a
+  loopback TCP socket has no `SO_PEERCRED` to ask. On the Unix socket the
+  kernel names the caller and the wart is gone; on the port, the token table
+  remains what tells cooperating clients apart, and an anonymous TCP caller is
+  honestly recorded as the shim's uid rather than dressed up as a peer.
 - **The freedesktop names are not ours yet.** `org.freedesktop.AI1` and
   `org.freedesktop.portal.AI` are proposals; the daemon owns
   `io.github.agraves.AIDaemon1` and the portal `io.github.agraves.AIPortal1`.
@@ -282,14 +317,19 @@ Stated here rather than left to be discovered:
   designed behaviour for a helper that cannot build its cage. The verification
   asserts that refusal rather than skipping the case, and the codecs are
   covered by unit tests.
+- **The box cannot namespace**, so what it proves about `ai-run` is that it
+  fails closed rather than running a program unconfined. The confinement
+  itself — egress gone, loopback gone, the socket and the whole native client
+  still working — is demonstrated on a real machine and recorded verbatim in
+  `notes/2026-08-27-real-machine.md`.
 
 ---
 
 ## Verifying it yourself
 
 `dev build` runs the whole thing: `makepkg` from a source tarball, `pacman -U`
-into a clean box, then 253 checks against the installed package over the system
-bus with polkit running, plus the workspace’s 154 unit tests. The verification
+into a clean box, then 299 checks against the installed package over the system
+bus with polkit running, plus the workspace’s 156 unit tests. The verification
 runs *during* the build, so a failure fails the build.
 
 It is deliberately adversarial — a wrong digest, an oversized attachment, a
