@@ -72,7 +72,8 @@ usage: ai-daemon-shim [--port N]   (default {DEFAULT_PORT}, always on 127.0.0.1)
 
 usage: ai-daemon-shim [--port N] [--config {DEFAULT_CONFIG}]
 
-OpenAI:    GET /v1/models, POST /v1/chat/completions, POST /v1/embeddings
+OpenAI:    GET /v1/models, POST /v1/chat/completions, POST /v1/responses,
+           POST /v1/embeddings
 Anthropic: POST /v1/messages, POST /v1/messages/count_tokens
 
 Every request becomes an ai-daemon session at the lowest trust class. A
@@ -240,6 +241,9 @@ fn serve(mut stream: TcpStream, config: &ShimConfig) -> Result<(), String> {
         ("POST", "/v1/chat/completions") => {
             return chat(&mut stream, &request, &peer);
         }
+        ("POST", "/v1/responses") => {
+            return responses(&mut stream, &request, &peer);
+        }
         ("POST", "/v1/embeddings") => embeddings(&request, &peer),
         ("POST", "/v1/messages") => {
             return messages(&mut stream, &request, &peer);
@@ -277,6 +281,20 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     reader.read_line(&mut line).map_err(|e| e.to_string())?;
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
+    // The request target, minus any query string. Routing matches the path
+    // exactly, so a query has to come off first or it changes the route.
+    //
+    // Not hypothetical, and not an edge case: Claude Code sends every turn to
+    // `POST /v1/messages?beta=true`. Matching the raw target sent that to the
+    // 404 arm, and a 404 from /v1/messages is what an Anthropic client reads
+    // as "that model does not exist" — so the failure surfaced to the user as
+    // `There's an issue with the selected model`, naming a model that was
+    // installed and working. The session-title call, which carries no query,
+    // went through on the same connection, which made it look like auth and
+    // the model were fine and only one request was refused.
+    //
+    // Nothing here reads a query parameter and nothing should: these are
+    // hints about the body's dialect, and the body is what this parses.
     let path = route_path(parts.next().unwrap_or_default()).to_string();
 
     let mut content_length = 0usize;
@@ -425,6 +443,28 @@ fn open_session(model: &str, peer: &Peer, background: bool) -> Result<Session, S
             Value::Str(name.as_str().into()).try_into().map_err(|_| "client name")?,
         );
     }
+    // Ask for as much context as the machine will give, and let it say no.
+    //
+    // Neither wire format this bridge speaks has a field for context length —
+    // an OpenAI or Anthropic client states `max_tokens` for its *output* and
+    // assumes the window is a property of the model it named. So the shim is
+    // the only thing in the path that can ask, and when it did not ask, every
+    // HTTP session took the backend's fallback of 4096.
+    //
+    // That is below the floor for the callers this bridge exists to serve.
+    // Claude Code's system prompt alone measures ~8.8k tokens, so it was
+    // refused before its first turn — with an accurate message about a 4096
+    // window that no configuration appeared to control, because raising
+    // `max_context` in policy correctly changed a ceiling that nothing was
+    // reaching up to.
+    //
+    // `max_context` is documented as clamped by policy and by the model, so
+    // asking for everything is a request for "whatever I am allowed", not a
+    // way around either limit.
+    options.insert(
+        "max_context".into(),
+        Value::U32(u32::MAX).try_into().map_err(|_| "max context")?,
+    );
     options.insert(
         "priority".into(),
         Value::Str(if background { "background" } else { "interactive" }.into())
@@ -1503,6 +1543,502 @@ fn stream_tool_use(
 
 /// POST /v1/messages/count_tokens — the daemon's tokenizer, in Anthropic's
 /// clothes. Claude Code asks before it sends, to decide what to trim.
+// ---------------------------------------------------------------------------
+// OpenAI Responses API — POST /v1/responses
+//
+// The second of OpenAI's two shapes, and for some clients now the only one.
+// codex-cli 0.150 refuses to start against a provider configured for chat
+// completions at all — `wire_api = "chat" is no longer supported` — so a
+// bridge that speaks only /v1/chat/completions cannot serve it, however
+// correct that endpoint is. Supporting one OpenAI dialect turned out to mean
+// supporting the one its clients have left.
+//
+// The differences that matter here are shallow: `input` replaces `messages`
+// and may be a bare string, `instructions` replaces the system message,
+// `max_output_tokens` replaces `max_tokens`, tools are flat rather than
+// wrapped in a `function` object, and the reply is an `output` array of items
+// rather than a `choices` array. Everything underneath is the same session.
+// ---------------------------------------------------------------------------
+
+struct ResponsesTurn {
+    messages: Vec<Message>,
+    tools: Option<Vec<ai_daemon_proto::frame::ToolSchema>>,
+    params: Params,
+    stream: bool,
+    model: String,
+}
+
+/// Flatten a Responses content value: either a bare string, or the part array
+/// whose text lives under `input_text` / `output_text` / `text`.
+fn responses_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => {
+            let mut text = String::new();
+            for part in parts {
+                match part.get("type").and_then(|t| t.as_str()) {
+                    Some("input_text") | Some("output_text") | Some("text") | None => {
+                        if let Some(s) = part.get("text").and_then(|t| t.as_str()) {
+                            text.push_str(s);
+                        }
+                    }
+                    // Images arrive as data: URLs or not at all, for the same
+                    // reason they do on the other two routes: this process
+                    // does not fetch what a prompt names.
+                    _ => {}
+                }
+            }
+            text
+        }
+        _ => String::new(),
+    }
+}
+
+fn parse_responses_body(body: &serde_json::Value) -> Result<ResponsesTurn, String> {
+    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("default").to_string();
+    let mut messages: Vec<Message> = Vec::new();
+
+    // `instructions` is the system prompt under another name.
+    if let Some(text) = body.get("instructions").and_then(|i| i.as_str()) {
+        if !text.is_empty() {
+            messages.push(Message {
+                role: "system".into(),
+                content: text.to_string(),
+                attachments: Vec::new(),
+                tool_call_id: None,
+            });
+        }
+    }
+
+    match body.get("input") {
+        // The one-shot form: `input` is the whole user turn.
+        Some(serde_json::Value::String(s)) => messages.push(Message {
+            role: "user".into(),
+            content: s.clone(),
+            attachments: Vec::new(),
+            tool_call_id: None,
+        }),
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                match item.get("type").and_then(|t| t.as_str()) {
+                    // A tool result on its way back in. `call_id` is the
+                    // Responses spelling of tool_call_id.
+                    Some("function_call_output") => {
+                        let output = match item.get("output") {
+                            Some(serde_json::Value::String(s)) => s.clone(),
+                            Some(other) => other.to_string(),
+                            None => String::new(),
+                        };
+                        messages.push(Message {
+                            role: "tool".into(),
+                            content: output,
+                            attachments: Vec::new(),
+                            tool_call_id: item
+                                .get("call_id")
+                                .and_then(|c| c.as_str())
+                                .map(str::to_string),
+                        });
+                    }
+                    // The model's own earlier tool call, replayed. Carried as
+                    // assistant text so the turn reads in order; the daemon
+                    // mints tool calls itself and does not need it structured.
+                    Some("function_call") => {
+                        let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                        let args = item.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
+                        messages.push(Message {
+                            role: "assistant".into(),
+                            content: format!("{name}({args})"),
+                            attachments: Vec::new(),
+                            tool_call_id: None,
+                        });
+                    }
+                    // "message", or an item with no type at all, which the API
+                    // permits for the plain {role, content} shape.
+                    _ => {
+                        let role =
+                            item.get("role").and_then(|r| r.as_str()).unwrap_or("user").to_string();
+                        messages.push(Message {
+                            role,
+                            content: responses_text(item.get("content")),
+                            attachments: Vec::new(),
+                            tool_call_id: None,
+                        });
+                    }
+                }
+            }
+        }
+        _ => return Err("input is required".into()),
+    }
+
+    if messages.iter().all(|m| m.role == "system") {
+        return Err("input contained no user or tool message".into());
+    }
+
+    // Tools are flat here: {type, name, description, parameters} rather than
+    // chat's {type, function: {...}}.
+    let tools = body.get("tools").and_then(|t| t.as_array()).map(|list| {
+        list.iter()
+            .filter(|t| {
+                t.get("type").and_then(|k| k.as_str()).map(|k| k == "function").unwrap_or(true)
+            })
+            .map(|t| ai_daemon_proto::frame::ToolSchema {
+                name: t.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string(),
+                description: t
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                json_schema: t.get("parameters").cloned().unwrap_or(serde_json::Value::Null),
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let params = Params {
+        temperature: body.get("temperature").and_then(|v| v.as_f64()).map(|v| v as f32),
+        top_p: body.get("top_p").and_then(|v| v.as_f64()).map(|v| v as f32),
+        max_tokens: body.get("max_output_tokens").and_then(|v| v.as_u64()).map(|v| v as u32),
+        ..Default::default()
+    };
+
+    Ok(ResponsesTurn {
+        messages,
+        tools: tools.filter(|t| !t.is_empty()),
+        params,
+        stream: body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false),
+        model,
+    })
+}
+
+fn responses(stream: &mut TcpStream, request: &HttpRequest, peer: &Peer) -> Result<(), String> {
+    let body: serde_json::Value = match serde_json::from_slice(&request.body) {
+        Ok(body) => body,
+        Err(e) => return respond(stream, 400, &error_body("invalid_request_error", &e.to_string())),
+    };
+    let turn = match parse_responses_body(&body) {
+        Ok(turn) => turn,
+        Err(e) => return respond(stream, 400, &error_body("invalid_request_error", &e)),
+    };
+
+    let session = match open_session(&turn.model, peer, false) {
+        Ok(session) => session,
+        Err(e) => {
+            let status = if e.contains("AccessDenied") { 403 } else { 400 };
+            return respond(stream, status, &error_body("permission_error", &e));
+        }
+    };
+    let mut socket = session.socket.try_clone().map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(session.socket.try_clone().map_err(|e| e.to_string())?);
+    frame::write_cbor(&mut socket, &Request::Hello { proto: DATA_PROTO })
+        .map_err(|e| e.to_string())?;
+    let _ = read_event(&mut reader);
+
+    frame::write_cbor(
+        &mut socket,
+        &Request::Generate {
+            messages: turn.messages,
+            stream: true,
+            params: Some(turn.params),
+            grammar: None,
+            tools: turn.tools,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut cancel_channel = session.socket.try_clone().map_err(|e| e.to_string())?;
+    let outcome = if turn.stream {
+        relay_responses_sse(stream, &mut reader, &turn.model)
+    } else {
+        relay_responses_json(stream, &mut reader, &mut cancel_channel, &turn.model)
+    };
+    session.close();
+    outcome
+}
+
+/// A `function_call` output item, which is how Responses carries a tool call.
+fn responses_call_item(call: &ai_daemon_proto::frame::ToolCall) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function_call",
+        "id": format!("fc_{}", call.id),
+        "call_id": call.id,
+        "name": call.name,
+        // A JSON *string*, unlike the Anthropic route's object.
+        "arguments": call.arguments.to_string(),
+        "status": "completed",
+    })
+}
+
+fn responses_envelope(
+    id: &str,
+    model: &str,
+    status: &str,
+    output: Vec<serde_json::Value>,
+    usage: &ai_daemon_proto::frame::Usage,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "object": "response",
+        "status": status,
+        "model": model,
+        "output": output,
+        "parallel_tool_calls": true,
+        "usage": {
+            "input_tokens": usage.prompt_tokens,
+            "output_tokens": usage.completion_tokens,
+            "total_tokens": usage.prompt_tokens + usage.completion_tokens,
+        },
+    })
+}
+
+fn relay_responses_json(
+    stream: &mut TcpStream,
+    reader: &mut impl Read,
+    daemon: &mut UnixStream,
+    model: &str,
+) -> Result<(), String> {
+    let mut text = String::new();
+    let mut calls: Vec<serde_json::Value> = Vec::new();
+    let mut usage = ai_daemon_proto::frame::Usage::default();
+    let mut abandoned = false;
+
+    loop {
+        if !abandoned && peer_hung_up(stream) {
+            abandoned = true;
+            eprintln!("<6>ai-daemon-shim: client went away; cancelling the generation");
+            let _ = frame::write_cbor(daemon, &Request::Cancel);
+        }
+        match read_event(reader)? {
+            None => break,
+            Some(Event::Token { tok, .. }) => text.push_str(&tok),
+            Some(Event::ToolCall { tool_call }) => calls.push(responses_call_item(&tool_call)),
+            Some(Event::ToolCalls { tool_calls }) => {
+                calls.extend(tool_calls.iter().map(responses_call_item))
+            }
+            Some(Event::Done { usage: u, .. }) => {
+                usage = u;
+                break;
+            }
+            Some(Event::Error { error }) => {
+                if abandoned {
+                    return Ok(());
+                }
+                let status = match error.code.as_str() {
+                    "policy-denied" => 403,
+                    "rate-limited" => 429,
+                    _ => 400,
+                };
+                return respond(stream, status, &error_body(&error.code, &error.message));
+            }
+            Some(_) => {}
+        }
+    }
+    if abandoned {
+        return Ok(());
+    }
+
+    let id = format!("resp_{}", std::process::id());
+    let mut output = Vec::new();
+    if !text.is_empty() {
+        output.push(serde_json::json!({
+            "type": "message",
+            "id": format!("msg_{}", std::process::id()),
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }));
+    }
+    output.extend(calls);
+    respond(stream, 200, &responses_envelope(&id, model, "completed", output, &usage))
+}
+
+fn relay_responses_sse(
+    stream: &mut TcpStream,
+    reader: &mut impl Read,
+    model: &str,
+) -> Result<(), String> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+    )
+    .map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+
+    // Every Responses event carries a sequence number, and clients that track
+    // ordering reject a stream without one.
+    let mut seq = 0u64;
+    let mut send = |stream: &mut TcpStream, kind: &str, mut data: serde_json::Value| -> Result<(), String> {
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("sequence_number".into(), serde_json::json!(seq));
+        }
+        seq += 1;
+        write!(stream, "event: {kind}\ndata: {data}\n\n").map_err(|e| e.to_string())?;
+        stream.flush().map_err(|e| e.to_string())
+    };
+
+    let id = format!("resp_{}", std::process::id());
+    let msg_id = format!("msg_{}", std::process::id());
+    let empty = ai_daemon_proto::frame::Usage::default();
+
+    send(
+        stream,
+        "response.created",
+        serde_json::json!({
+            "type": "response.created",
+            "response": responses_envelope(&id, model, "in_progress", vec![], &empty),
+        }),
+    )?;
+
+    let mut text = String::new();
+    let mut calls: Vec<serde_json::Value> = Vec::new();
+    let mut usage = ai_daemon_proto::frame::Usage::default();
+    let mut text_open = false;
+    let mut index = 0usize;
+
+    loop {
+        match read_event(reader)? {
+            None => break,
+            Some(Event::Token { tok, .. }) => {
+                if !text_open {
+                    text_open = true;
+                    send(
+                        stream,
+                        "response.output_item.added",
+                        serde_json::json!({
+                            "type": "response.output_item.added",
+                            "output_index": index,
+                            "item": {
+                                "type": "message", "id": msg_id, "status": "in_progress",
+                                "role": "assistant", "content": [],
+                            },
+                        }),
+                    )?;
+                    send(
+                        stream,
+                        "response.content_part.added",
+                        serde_json::json!({
+                            "type": "response.content_part.added",
+                            "item_id": msg_id, "output_index": index, "content_index": 0,
+                            "part": {"type": "output_text", "text": "", "annotations": []},
+                        }),
+                    )?;
+                }
+                text.push_str(&tok);
+                send(
+                    stream,
+                    "response.output_text.delta",
+                    serde_json::json!({
+                        "type": "response.output_text.delta",
+                        "item_id": msg_id, "output_index": index, "content_index": 0,
+                        "delta": tok,
+                    }),
+                )?;
+            }
+            Some(Event::ToolCall { tool_call }) => calls.push(responses_call_item(&tool_call)),
+            Some(Event::ToolCalls { tool_calls }) => {
+                calls.extend(tool_calls.iter().map(responses_call_item))
+            }
+            Some(Event::Done { usage: u, .. }) => {
+                usage = u;
+                break;
+            }
+            Some(Event::Error { error }) => {
+                send(
+                    stream,
+                    "response.failed",
+                    serde_json::json!({
+                        "type": "response.failed",
+                        "response": {
+                            "id": id, "object": "response", "status": "failed", "model": model,
+                            "error": {"code": error.code, "message": error.message},
+                        },
+                    }),
+                )?;
+                return Ok(());
+            }
+            Some(_) => {}
+        }
+    }
+
+    if text_open {
+        send(
+            stream,
+            "response.output_text.done",
+            serde_json::json!({
+                "type": "response.output_text.done",
+                "item_id": msg_id, "output_index": index, "content_index": 0, "text": text,
+            }),
+        )?;
+        send(
+            stream,
+            "response.content_part.done",
+            serde_json::json!({
+                "type": "response.content_part.done",
+                "item_id": msg_id, "output_index": index, "content_index": 0,
+                "part": {"type": "output_text", "text": text, "annotations": []},
+            }),
+        )?;
+        send(
+            stream,
+            "response.output_item.done",
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": {
+                    "type": "message", "id": msg_id, "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                },
+            }),
+        )?;
+        index += 1;
+    }
+
+    for call in &calls {
+        send(
+            stream,
+            "response.output_item.added",
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": index, "item": call,
+            }),
+        )?;
+        send(
+            stream,
+            "response.function_call_arguments.done",
+            serde_json::json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": call.get("id"), "output_index": index,
+                "arguments": call.get("arguments"),
+            }),
+        )?;
+        send(
+            stream,
+            "response.output_item.done",
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": index, "item": call,
+            }),
+        )?;
+        index += 1;
+    }
+
+    let mut output = Vec::new();
+    if !text.is_empty() {
+        output.push(serde_json::json!({
+            "type": "message", "id": msg_id, "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }));
+    }
+    output.extend(calls);
+    send(
+        stream,
+        "response.completed",
+        serde_json::json!({
+            "type": "response.completed",
+            "response": responses_envelope(&id, model, "completed", output, &usage),
+        }),
+    )
+}
+
 fn count_tokens(request: &HttpRequest, peer: &Peer) -> Result<serde_json::Value, String> {
     let body: serde_json::Value =
         serde_json::from_slice(&request.body).map_err(|e| e.to_string())?;
