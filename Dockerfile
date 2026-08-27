@@ -109,8 +109,20 @@ RUN cargo check --workspace --locked --all-targets && touch /src/arch-ok
 # Everything the verification touches came out of pacman.
 # ---------------------------------------------------------------------------
 FROM --platform=linux/amd64 archlinux:latest AS box
+# Two departures from the image's stock pacman.conf. The container image ships
+# `NoExtract = usr/share/doc/*`, so a package's docs are listed by the database
+# and absent from the disk; a real install extracts them and the verification
+# reads them (it runs the packaged example), and a box that silently differed
+# from a real machine here cost an afternoon — pacman -Ql swore the file
+# existed while python could not open it.
+#
+# python-gobject and python-cbor2 are not the daemon's dependencies. They are
+# examples/think.py's, and the verification runs it because an example that
+# rots is worse than none.
 RUN printf 'DisableSandbox\n' >> /etc/pacman.conf \
+ && sed -i '/^NoExtract.*usr\/share\/doc/d' /etc/pacman.conf \
  && pacman -Syu --noconfirm dbus polkit systemd curl iproute2 rust \
+      python-gobject python-cbor2 \
  && pacman -Scc --noconfirm
 
 # Pulls the arm64 stage into the graph, so a build that does not compile there

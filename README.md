@@ -119,6 +119,20 @@ aidctl sessions                  # who else is using it right now
 aidctl grants                    # every consent decision, and when
 ```
 
+Building an application on it is the same session opened from your own code:
+one D-Bus call returns a socket, and frames on the socket are length-prefixed
+CBOR. `examples/think.py` is the whole client in forty lines — no API key, no
+SDK, and it keeps working under `ai-run` with the network gone:
+
+```
+python examples/think.py "why is the sky blue?"
+ai-run -- python examples/think.py "and again with no network at all"
+```
+
+`docs/provisioning.md` is the other half of the no-credential claim: how to
+ship a machine so no application ever holds a provider key, which is what
+makes going around the daemon not just forbidden but useless.
+
 Building the package on Arch (and so on Omarchy):
 
 ```
@@ -166,7 +180,7 @@ every capability dropped, and the run needs to act as three different users.)
 The transcript is kept at `/verification.txt` in the resulting image, which is
 what the image prints if you run it.
 
-It checks ninety-one things, and is deliberately adversarial about most of
+It checks nearly three hundred things, and is deliberately adversarial about most of
 them — a wrong digest, an oversized screenshot, a truncated PNG, a user outside
 the gate, a revoked identity, a remote `image_url` — because "it generated some
 text" is the easy half and the refusals are the point.
@@ -187,7 +201,9 @@ text" is the easy half and the refusals are the point.
 | `crates/ai-run` | run a program with inference and nothing else: no network, no credential |
 | `crates/aidctl` | administration and inspection |
 | `packaging/` | PKGBUILD, systemd units, D-Bus and polkit policy, the verification run |
+| `examples/think.py` | the native protocol as a working client, forty lines |
 | `docs/protocol.md` | the wire protocols in full |
+| `docs/provisioning.md` | shipping a machine so no application ever holds a provider key |
 
 ## On the name
 

@@ -153,6 +153,10 @@ package() {
 
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 docs/protocol.md "$pkgdir/usr/share/doc/$pkgname/protocol.md"
+  install -Dm644 docs/provisioning.md "$pkgdir/usr/share/doc/$pkgname/provisioning.md"
+  # The client story, installed where a person can copy it from: the whole
+  # native protocol as a program, not a framing spec.
+  install -Dm644 examples/think.py "$pkgdir/usr/share/doc/$pkgname/examples/think.py"
   install -Dm644 packaging/portal/org.freedesktop.portal.AI.xml \
     "$pkgdir/usr/share/doc/$pkgname/org.freedesktop.portal.AI.xml"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

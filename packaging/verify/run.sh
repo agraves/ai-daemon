@@ -1567,6 +1567,28 @@ check "and that it cannot stop a program acting on what a model says" \
   bash -c "ai-run --help | grep -q 'acting badly'"
 
 # ---------------------------------------------------------------------------
+section "26. The client story"
+# ---------------------------------------------------------------------------
+note "If the pitch is 'build applications this way', the thing a viewer copies"
+note "has to exist, work, and stay small. examples/think.py is the native"
+note "protocol as a program: one D-Bus call, then CBOR frames on the returned"
+note "socket. It runs here so that a protocol change that breaks it breaks the"
+note "build — an example that rots is worse than none."
+
+check "the example ships in the package, beside the docs" \
+  test -f /usr/share/doc/ai-daemon/examples/think.py
+runas alice python /usr/share/doc/ai-daemon/examples/think.py \
+  "one honest sentence" >/tmp/think.txt 2>&1
+run cat /tmp/think.txt
+contains "it opens a session and is told who it is" /tmp/think.txt 'you are uid:4001'
+contains "and streams an answer" /tmp/think.txt 'mock:'
+note "uid:4001 is alice: the identity came from the bus, not from the script,"
+note "which passes no identity anywhere — there is nothing in it to pass."
+
+check "and it is still about forty lines, which is the claim being made of it" \
+  bash -c "test \"\$(grep -cv '^\s*#\|^\s*\$' /usr/share/doc/ai-daemon/examples/think.py)\" -le 45"
+
+# ---------------------------------------------------------------------------
 printf '\n\033[1m=== Result ===\033[0m\n'
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then
