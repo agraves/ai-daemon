@@ -266,13 +266,18 @@ fn anthropic_error(kind: &str, message: &str) -> serde_json::Value {
     serde_json::json!({"type": "error", "error": {"type": kind, "message": message}})
 }
 
+/// The path a request routes on: the target with any query string removed.
+fn route_path(target: &str) -> &str {
+    target.split('?').next().unwrap_or(target)
+}
+
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let mut line = String::new();
     reader.read_line(&mut line).map_err(|e| e.to_string())?;
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
-    let path = parts.next().unwrap_or_default().to_string();
+    let path = route_path(parts.next().unwrap_or_default()).to_string();
 
     let mut content_length = 0usize;
     let mut token: Option<String> = None;
@@ -1607,5 +1612,22 @@ mod tests {
         let body = error_body("rate-limited", "over the allowance");
         assert_eq!(body["error"]["type"], "rate-limited");
         assert_eq!(body["error"]["message"], "over the allowance");
+    }
+
+    /// The regression that kept Claude Code out. It sends every turn to
+    /// `/v1/messages?beta=true`; matching the raw target routed that to 404,
+    /// and an Anthropic client reads a 404 from /v1/messages as a missing
+    /// model, so the user was told their installed model did not exist.
+    #[test]
+    fn a_query_string_does_not_change_the_route() {
+        assert_eq!(route_path("/v1/messages?beta=true"), "/v1/messages");
+        assert_eq!(route_path("/v1/messages"), "/v1/messages");
+        assert_eq!(
+            route_path("/v1/messages/count_tokens?beta=true"),
+            "/v1/messages/count_tokens"
+        );
+        assert_eq!(route_path("/v1/chat/completions?a=1&b=2"), "/v1/chat/completions");
+        assert_eq!(route_path("/v1/models?"), "/v1/models");
+        assert_eq!(route_path(""), "");
     }
 }
