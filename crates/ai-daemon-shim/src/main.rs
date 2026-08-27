@@ -1541,8 +1541,6 @@ fn stream_tool_use(
     Ok(index + 1)
 }
 
-/// POST /v1/messages/count_tokens — the daemon's tokenizer, in Anthropic's
-/// clothes. Claude Code asks before it sends, to decide what to trim.
 // ---------------------------------------------------------------------------
 // OpenAI Responses API — POST /v1/responses
 //
@@ -2039,6 +2037,8 @@ fn relay_responses_sse(
     )
 }
 
+/// POST /v1/messages/count_tokens — the daemon's tokenizer, in Anthropic's
+/// clothes. Claude Code asks before it sends, to decide what to trim.
 fn count_tokens(request: &HttpRequest, peer: &Peer) -> Result<serde_json::Value, String> {
     let body: serde_json::Value =
         serde_json::from_slice(&request.body).map_err(|e| e.to_string())?;
