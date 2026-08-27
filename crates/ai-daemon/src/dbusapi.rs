@@ -583,19 +583,39 @@ impl Manager {
         // is trusted far less for it: everything it speaks for is Class::Shim,
         // the lowest-trust class in §5, because the programs behind it were
         // written for a server that had no policy at all.
+        //
+        // By uid, not by executable name: the daemon runs as its own user and
+        // cannot read /proc/<pid>/exe for a process it does not own, so an exe
+        // check here would refuse the real shim on every machine. The shim's
+        // uid is the package's, and nothing else has it.
+        let shim_user = self.daemon.config.policy.shim_user.trim();
+        let is_shim = (!shim_user.is_empty()
+            && crate::identity::uid_of_user(shim_user)
+                .is_some_and(|shim_uid| identity.uid == shim_uid))
+            || identity
+                .unit
+                .as_deref()
+                .is_some_and(|unit| unit == "ai-daemon-shim.service");
+
+        // Naming a client is gated on its own, not as a side effect of also
+        // sending a peer pid.
+        //
+        // The first version only read shim_client inside the block below, so a
+        // caller sending the name alone had it quietly dropped — safe, but
+        // silent, and silence is the wrong answer to somebody trying to pick
+        // their own identity. It is refused the way portal_app_id is, and for
+        // the same reason: the attempt belongs in the log.
+        if options.contains_key("shim_client") && !is_shim {
+            warn!(
+                "{} tried to name an HTTP client without being the shim; refusing",
+                identity.key()
+            );
+            return Err(zbus::fdo::Error::AccessDenied(
+                "only ai-daemon-shim may name an HTTP caller".into(),
+            ));
+        }
+
         if let Some(pid) = options.get("shim_peer_pid").and_then(|v| u32::try_from(v.clone()).ok()) {
-            // By uid, not by executable name: the daemon runs as its own user
-            // and cannot read /proc/<pid>/exe for a process it does not own,
-            // so an exe check here would refuse the real shim on every machine.
-            // The shim's uid is the package's, and nothing else has it.
-            let shim_user = self.daemon.config.policy.shim_user.trim();
-            let is_shim = (!shim_user.is_empty()
-                && crate::identity::uid_of_user(shim_user)
-                    .is_some_and(|shim_uid| identity.uid == shim_uid))
-                || identity
-                    .unit
-                    .as_deref()
-                    .is_some_and(|unit| unit == "ai-daemon-shim.service");
             if !is_shim {
                 warn!(
                     "{} asserted shim_peer_pid={pid} without being the shim; ignoring the claim",
@@ -610,6 +630,28 @@ impl Manager {
                 .and_then(|v| u32::try_from(v.clone()).ok())
                 .unwrap_or(identity.uid);
             identity = Identity::from_pid_uid(pid as i32, peer_uid, peer_uid, Class::Shim);
+            // A name the shim vouched for, from a token its caller presented.
+            //
+            // Taken only from the shim, checked above, and never from the
+            // caller: the whole point is that the HTTP client does not get to
+            // say who it is to the daemon. It stays Class::Shim — a shared
+            // secret over loopback is not peer credentials and the trust class
+            // should not move — but the grant, the rate limit and the
+            // revocation are now per agent instead of shared by every HTTP
+            // client on the machine.
+            identity.client = options
+                .get("shim_client")
+                .and_then(|v| String::try_from(v.clone()).ok())
+                .map(|name| name.trim().to_string())
+                .filter(|name| {
+                    !name.is_empty()
+                        && name.len() <= 64
+                        // Keyed on this, printed in prompts, written to the
+                        // audit log: a name with a colon or a newline in it
+                        // could forge a different identity's key or a second
+                        // audit line.
+                        && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+                });
         }
         Ok(identity)
     }
@@ -924,6 +966,7 @@ mod tests {
             unit: None,
             app_id: None,
             exe: Some("test".into()),
+            client: None,
         }
     }
 

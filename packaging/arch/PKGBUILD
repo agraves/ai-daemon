@@ -136,6 +136,10 @@ package() {
   # sending prompts off this machine should be.
   install -Dm644 packaging/config/remote.toml.example \
     "$pkgdir/usr/share/doc/$pkgname/remote.toml.example"
+  # Same treatment: documentation, not configuration. Without it every HTTP
+  # caller shares one identity, which is how the shim behaved before it.
+  install -Dm644 packaging/config/shim.toml.example \
+    "$pkgdir/usr/share/doc/$pkgname/shim.toml.example"
   # Also an example, and for the same reason: under WSL2 the accelerator is
   # /dev/dxg rather than /dev/dri and PrivateDevices has to come off to reach
   # it. That is a real loosening of this unit and it buys nothing on hardware

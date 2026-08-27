@@ -256,6 +256,28 @@ env DBUS_SESSION_BUS_ADDRESS="$ALICE_BUS" \
            -- /usr/lib/ai-daemon/ai-daemon-portal' >/tmp/portal.log 2>&1 &
 sleep 1
 
+log "naming the shim's clients, the way a six-agent box would"
+# Loopback TCP has no SO_PEERCRED, so without this every HTTP caller on the
+# machine reaches the daemon as one identity and shares one grant. These two
+# stand in for the agents an Omarchy box runs.
+install -m 0640 -o root -g ai-daemon-shim /dev/null /etc/ai-daemon/shim.toml
+cat > /etc/ai-daemon/shim.toml <<'CONF'
+# require_token stays off here on purpose: section 20 tests both the named
+# path and the anonymous one, and the anonymous one is what every existing
+# client does today.
+require_token = false
+
+[[client]]
+name = "cx"
+token = "verification-token-cx"
+
+[[client]]
+name = "cy"
+token = "verification-token-cy"
+CONF
+chmod 0640 /etc/ai-daemon/shim.toml
+chgrp ai-daemon-shim /etc/ai-daemon/shim.toml
+
 log "starting the shim (off by default on a real install; on here to test it)"
 setpriv --reuid ai-daemon-shim --regid ai-daemon-shim --init-groups --inh-caps=-all \
   -- /usr/bin/ai-daemon-shim >/tmp/shim.log 2>&1 &

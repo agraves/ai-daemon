@@ -1417,6 +1417,7 @@ mod tests {
                 unit: None,
                 app_id: None,
                 exe: Some("test".into()),
+                client: None,
             },
             model: "none".into(),
             digest: "sha256:0".into(),

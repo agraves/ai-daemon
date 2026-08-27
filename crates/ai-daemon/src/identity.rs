@@ -54,6 +54,18 @@ pub struct Identity {
     /// `/proc/<pid>/exe` basename. Advisory; used in prompts, never as the key
     /// on its own.
     pub exe: Option<String>,
+    /// A name the shim's caller presented a token for, only ever set on the
+    /// shim path.
+    ///
+    /// The shim listens on loopback TCP, which has no `SO_PEERCRED`, so it
+    /// cannot tell one HTTP client from another by asking the kernel — before
+    /// this every caller shared one identity, and on a machine running six
+    /// agents that means one grant, one rate limit and one revocation for all
+    /// of them. A shared secret is a weaker thing than peer credentials and
+    /// this does not pretend otherwise: it distinguishes cooperating clients,
+    /// it does not defend against a local process that can read the token
+    /// file. It is still the difference between per-agent policy and none.
+    pub client: Option<String>,
 }
 
 impl Identity {
@@ -72,9 +84,15 @@ impl Identity {
                 (None, Some(exe)) => format!("exe:{exe}@{}", self.uid),
                 (None, None) => format!("uid:{}", self.uid),
             },
-            Class::Shim => match &self.exe {
-                Some(exe) => format!("shim:{exe}@{}", self.uid),
-                None => format!("shim:uid:{}", self.uid),
+            // A named client first: it is the only thing here that is stable
+            // across a restart *and* distinguishes one HTTP caller from
+            // another. Without one, a loopback caller is genuinely
+            // indistinguishable and the key says so rather than implying the
+            // uid means something.
+            Class::Shim => match (&self.client, &self.exe) {
+                (Some(client), _) => format!("shim:{client}"),
+                (None, Some(exe)) => format!("shim:{exe}@{}", self.uid),
+                (None, None) => format!("shim:uid:{}", self.uid),
             },
         }
     }
@@ -83,6 +101,9 @@ impl Identity {
     pub fn display(&self) -> String {
         match self.class {
             Class::Portal => self.app_id.clone().unwrap_or_else(|| "an app".into()),
+            Class::Shim if self.client.is_some() => {
+                format!("{} (over the HTTP shim)", self.client.clone().unwrap_or_default())
+            }
             _ => self
                 .exe
                 .clone()
@@ -102,6 +123,7 @@ impl Identity {
             unit: unit_of_pid(pid),
             app_id: None,
             exe: exe_of_pid(pid),
+            client: None,
         }
     }
 }
@@ -395,6 +417,7 @@ mod tests {
             )),
             app_id: None,
             exe: Some("gnome-text-editor".into()),
+            client: None,
         };
         let monday = launch(4242, "app-gnome-org.gnome.TextEditor-4242.scope");
         let tuesday = launch(9137, "app-gnome-org.gnome.TextEditor-9137.scope");
@@ -442,6 +465,7 @@ mod tests {
             ),
             app_id: None,
             exe: Some("aidctl".into()),
+            client: None,
         };
         assert_eq!(identity.unit, None, "a terminal tab is not an app identity");
         assert_eq!(identity.key(), "exe:aidctl@1000");
@@ -528,6 +552,7 @@ mod tests {
             unit: Some("ai-daemon-shim.service".into()),
             app_id: None,
             exe: Some("foo".into()),
+            client: None,
         };
         let second = Identity { pid: 9999, ..first.clone() };
         assert_eq!(first.key(), second.key());
@@ -544,6 +569,7 @@ mod tests {
             unit: None,
             app_id: Some("org.gnome.Newelle".into()),
             exe: Some("aidctl".into()),
+            client: None,
         };
         assert_eq!(base.key(), "exe:aidctl@1000");
         assert_eq!(Identity { class: Class::Shim, ..base.clone() }.key(), "shim:aidctl@1000");

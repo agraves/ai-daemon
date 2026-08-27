@@ -913,6 +913,156 @@ note "to speak, which is the whole reason it exists — covered by unit tests"
 note "over wait_for_event, where a fake clock beats a twenty-second wait."
 
 # ---------------------------------------------------------------------------
+section "20. The Anthropic half of the bridge, and telling clients apart"
+# ---------------------------------------------------------------------------
+note "§15 asks for an OpenAI/Anthropic-compatible shim and only the OpenAI half"
+note "was built. Claude Code speaks the Messages API and nothing else, so on a"
+note "box running it the most-used agent could not be pointed at the daemon at"
+note "all. Same session, same policy engine, same audit record underneath —"
+note "only the wire shapes differ."
+
+ANTH=http://127.0.0.1:11434/v1/messages
+curl -sS --max-time 60 "$ANTH" -H 'Content-Type: application/json' \
+  -d '{"model":"default","max_tokens":16,"messages":[{"role":"user","content":"hello anthropic"}]}' \
+  >/tmp/anth.json 2>&1
+run cat /tmp/anth.json
+contains "a Messages response comes back in Anthropic shape" /tmp/anth.json '"type":"message"'
+contains "with the assistant role" /tmp/anth.json '"role":"assistant"'
+contains "content is a block array, not a string" /tmp/anth.json '"type":"text"'
+contains "a stop reason in Anthropic's vocabulary, not OpenAI's" /tmp/anth.json '"stop_reason":"(end_turn|max_tokens)"'
+contains "usage uses input_tokens/output_tokens" /tmp/anth.json '"input_tokens":'
+lacks "and it is not an OpenAI body wearing a different name" /tmp/anth.json 'chat.completion'
+
+note "max_tokens is required by that API. Defaulting it would produce a"
+note "truncation the caller cannot explain, so it is a hard error."
+curl -sS --max-time 20 "$ANTH" -H 'Content-Type: application/json' \
+  -d '{"model":"default","messages":[{"role":"user","content":"no ceiling"}]}' \
+  >/tmp/anth-nomax.json 2>&1
+run cat /tmp/anth-nomax.json
+contains "a request without max_tokens is refused" /tmp/anth-nomax.json 'max_tokens is required'
+contains "in Anthropic's error envelope, not OpenAI's" /tmp/anth-nomax.json '"type":"error"'
+note "The envelope matters: a client that cannot parse the other API's error"
+note "shape gets a wall of nothing when it is refused."
+
+note "system is a top-level field there, not a message. It has to reach the"
+note "model as one — the mock counts what it was given."
+curl -sS --max-time 60 "$ANTH" -H 'Content-Type: application/json' \
+  -d '{"model":"default","max_tokens":16,"system":"you are a fixture","messages":[{"role":"user","content":"hi"}]}' \
+  >/tmp/anth-system.json 2>&1
+run cat /tmp/anth-system.json
+contains "the system field arrived as a second message" /tmp/anth-system.json '2 message'
+
+note "Streaming is a state machine of named events, not one repeated chunk"
+note "shape. A client tracks block indices, so every event has to be there."
+curl -sS --max-time 60 -N "$ANTH" -H 'Content-Type: application/json' \
+  -d '{"model":"default","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"stream anthropic"}]}' \
+  >/tmp/anth-stream.txt 2>&1
+run head -6 /tmp/anth-stream.txt
+contains "the stream opens with message_start" /tmp/anth-stream.txt 'event: message_start'
+contains "a text block is opened" /tmp/anth-stream.txt 'event: content_block_start'
+contains "tokens arrive as text_delta" /tmp/anth-stream.txt '"type":"text_delta"'
+contains "the block is closed" /tmp/anth-stream.txt 'event: content_block_stop'
+contains "the stop reason arrives in message_delta" /tmp/anth-stream.txt 'event: message_delta'
+contains "and the stream terminates properly" /tmp/anth-stream.txt 'event: message_stop'
+lacks "no OpenAI sentinel leaked into an Anthropic stream" /tmp/anth-stream.txt '\[DONE\]'
+
+note "Tools: Anthropic puts name and input_schema at the top level where"
+note "OpenAI nests them under function, and answers with a tool_use block."
+curl -sS --max-time 60 "$ANTH" -H 'Content-Type: application/json' \
+  -d '{"model":"default","max_tokens":32,"tools":[{"name":"get_weather","description":"w","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}],"messages":[{"role":"user","content":"weather in Oslo"}]}' \
+  >/tmp/anth-tool.json 2>&1
+run cat /tmp/anth-tool.json
+contains "a tool call comes back as a tool_use block" /tmp/anth-tool.json '"type":"tool_use"'
+contains "naming the tool that was offered" /tmp/anth-tool.json '"name":"get_weather"'
+contains "and the stop reason says why the turn ended" /tmp/anth-tool.json '"stop_reason":"tool_use"'
+lacks "arguments are an object, not the JSON string OpenAI uses" /tmp/anth-tool.json '"input":"'
+
+note "count_tokens, which Claude Code asks before it sends so it knows what to"
+note "trim. It is the daemon's tokenizer in Anthropic's clothes."
+curl -sS --max-time 30 http://127.0.0.1:11434/v1/messages/count_tokens \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"default","messages":[{"role":"user","content":"count these words please"}]}' \
+  >/tmp/anth-count.json 2>&1
+run cat /tmp/anth-count.json
+contains "a token count comes back" /tmp/anth-count.json '"input_tokens":[1-9]'
+
+note "Images by base64 only. A url source is refused for the same reason the"
+note "OpenAI route refuses image_url: following it would put a server-side"
+note "request forgery primitive inside the machine's AI service."
+curl -sS --max-time 20 "$ANTH" -H 'Content-Type: application/json' \
+  -d '{"model":"default","max_tokens":8,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.com/x.png"}}]}]}' \
+  >/tmp/anth-url.json 2>&1
+run cat /tmp/anth-url.json
+contains "a url image source is refused" /tmp/anth-url.json 'never fetches a URL'
+
+# ---------------------------------------------------------------------------
+note "Telling clients apart. Loopback TCP carries no SO_PEERCRED, so the shim"
+note "cannot ask the kernel who is calling — before this every HTTP client on"
+note "the machine arrived as one identity, which on a six-agent box means one"
+note "grant, one rate limit and one revocation for all of them."
+# ---------------------------------------------------------------------------
+run cat /etc/ai-daemon/shim.toml
+check "the client table is not world-readable" \
+  test "$(stat -c %a /etc/ai-daemon/shim.toml)" = 640
+note "It is a shared secret, which is weaker than peer credentials and is not"
+note "pretended otherwise: it distinguishes cooperating clients. Any local"
+note "process that can read that file can present that token."
+
+for AGENT in cx cy; do
+  curl -sS --max-time 60 "$ANTH" -H 'Content-Type: application/json' \
+    -H "x-api-key: verification-token-$AGENT" \
+    -d "{\"model\":\"default\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"I am $AGENT\"}]}" \
+    >/dev/null 2>&1
+done
+curl -sS --max-time 60 "$ANTH" -H 'Content-Type: application/json' \
+  -d '{"model":"default","max_tokens":8,"messages":[{"role":"user","content":"anonymous"}]}' \
+  >/dev/null 2>&1
+tail -12 /var/lib/ai-daemon/audit.jsonl | sed 's/^/    /'
+contains "a named client is its own identity in the audit log" \
+  /var/lib/ai-daemon/audit.jsonl '"identity":"shim:cx"'
+contains "and so is the other one" /var/lib/ai-daemon/audit.jsonl '"identity":"shim:cy"'
+contains "an anonymous caller still says so rather than borrowing a name" \
+  /var/lib/ai-daemon/audit.jsonl '"identity":"shim:uid:'
+contains "named or not, the trust class does not move" \
+  /var/lib/ai-daemon/audit.jsonl '"identity":"shim:cx"[^}]*"class":"shim"'
+note "The class stays shim deliberately: a token over loopback is not peer"
+note "credentials, and only the granularity of policy should change."
+
+note "Which is the point — policy is now per agent."
+check "one agent can be denied on its own" aidctl deny shim:cx generate
+curl -sS --max-time 20 "$ANTH" -H 'Content-Type: application/json' \
+  -H 'x-api-key: verification-token-cx' \
+  -d '{"model":"default","max_tokens":8,"messages":[{"role":"user","content":"still me"}]}' \
+  >/tmp/anth-denied.json 2>&1
+run cat /tmp/anth-denied.json
+contains "and is refused" /tmp/anth-denied.json 'denied|AccessDenied|policy'
+curl -sS --max-time 60 "$ANTH" -H 'Content-Type: application/json' \
+  -H 'x-api-key: verification-token-cy' \
+  -d '{"model":"default","max_tokens":8,"messages":[{"role":"user","content":"but not me"}]}' \
+  >/tmp/anth-other.json 2>&1
+contains "while the other agent is unaffected" /tmp/anth-other.json '"type":"message"'
+note "Before this, denying one HTTP client denied every HTTP client."
+check "and it can be granted back" aidctl grant shim:cx generate
+
+note "A caller cannot name itself: the token maps to a name inside the shim,"
+note "and the daemon takes the name only from the shim."
+curl -sS --max-time 20 "$ANTH" -H 'Content-Type: application/json' \
+  -H 'x-api-key: not-a-configured-token' \
+  -d '{"model":"default","max_tokens":8,"messages":[{"role":"user","content":"let me in"}]}' \
+  >/tmp/anth-badtoken.json 2>&1
+contains "an unknown token is simply anonymous, not an error by default" \
+  /tmp/anth-badtoken.json '"type":"message"'
+refute "and asserting a client name straight to the daemon is refused" \
+  runas alice busctl --system call io.github.agraves.AIDaemon1 \
+  /io/github/agraves/AIDaemon1/Manager io.github.agraves.AIDaemon1.Manager \
+  CreateSession 'sa{sv}' default 1 shim_client s cx
+contains "refused rather than quietly ignored — the attempt belongs in the log" \
+  /tmp/daemon.log 'tried to name an HTTP client without being the shim'
+note "The first version read the name only alongside a peer pid, so a caller"
+note "sending it alone had it dropped: safe, but silent, and silence is the"
+note "wrong answer to somebody trying to pick their own identity."
+
+# ---------------------------------------------------------------------------
 printf '\n\033[1m=== Result ===\033[0m\n'
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

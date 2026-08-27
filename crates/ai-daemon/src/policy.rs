@@ -454,6 +454,7 @@ mod tests {
             unit: None,
             app_id: None,
             exe: Some("aidctl".into()),
+            client: None,
         }
     }
 

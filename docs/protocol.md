@@ -79,6 +79,7 @@ properties: Version (s), DataProtocol (u), Backends (as)
 | `portal_app_id` | `s` | accepted only from xdg-desktop-portal (§13) |
 | `shim_peer_pid` | `u` | accepted only from `ai-daemon-shim` (§5) |
 | `shim_peer_uid` | `u` | as above |
+| `shim_client` | `s` | as above; the name a token mapped to. Refused, not ignored, from anything that is not the shim |
 
 `CreateSession` is cheap on purpose. It does not prompt for consent and does
 not load weights: both can take a long time, and the bus thread is shared with
@@ -190,6 +191,53 @@ v2 adds `top_k`, `min_p`, `repeat_penalty`, `logit_bias` (a map of token id
 to bias) and `logprobs` (how many alternatives to return per token) to
 `params`. A backend applies what it can and ignores the rest; `logprobs` is a
 declared capability, so a client can find out before asking.
+
+## The HTTP shim
+
+Two APIs on one loopback port, off by default:
+
+| | |
+|---|---|
+| OpenAI | `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/embeddings` |
+| Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
+
+Both become ordinary daemon sessions: same policy engine, same rate limit,
+same audit record, same `aidctl sessions`. Only the wire shapes differ, and
+they differ in ways worth naming — `system` is a field rather than a message,
+`max_tokens` is required and is *not* defaulted, tool results arrive inside a
+user turn, tool arguments are an object rather than a JSON string, and the
+streaming protocol is a state machine of named events rather than one repeated
+chunk shape. Errors go out in the envelope of whichever API was called, because
+a client that cannot parse the other one's error body gets nothing useful.
+
+Neither route ever fetches a URL a prompt named. OpenAI `image_url` takes
+`data:` only; Anthropic image blocks take `source.type = "base64"` only. A
+`url` source is refused rather than followed: this process is the last place
+that should hold a server-side request forgery primitive.
+
+### Naming the callers
+
+A loopback TCP socket has no `SO_PEERCRED` — the kernel will not say which
+process is at the other end — so every HTTP client reached the daemon as one
+identity, sharing one grant, one rate limit and one revocation. On a machine
+running several agents that is the difference between per-agent policy and
+none.
+
+`/etc/ai-daemon/shim.toml` maps tokens to names. A caller presenting one in
+`Authorization: Bearer` or `x-api-key` is `shim:<name>`; one without a token
+stays anonymous and says so. `require_token = true` refuses anonymous callers
+outright, which is the right setting once a machine has named its agents.
+
+The trust class does not move: everything here is still `Class::Shim`. A
+shared secret in a file is weaker than peer credentials and this does not
+pretend otherwise — any local process that can read the token file can present
+the token, so what it buys is that *cooperating* clients are told apart. The
+structural fix is a Unix-socket listener where `SO_PEERCRED` answers, and it
+is not built yet.
+
+The name is the shim's to assert and nobody else's: the daemon takes
+`shim_client` only from the shim, and refuses it — rather than ignoring it —
+from anything else.
 
 The OpenAI-compatible shim maps only `logit_bias` and `top_logprobs`, which
 are the two OpenAI itself defines. It deliberately invents no spelling for the

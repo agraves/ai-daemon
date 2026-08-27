@@ -38,7 +38,10 @@ That is this.
 for native processes, an application id for sandboxed ones — read out of their
 Flatpak or Snap confinement by `ai-daemon-portal`, which runs in the user's
 session because the daemon cannot read another user's `/proc` — and the
-lowest trust class for anything arriving through the HTTP shim. The daemon
+lowest trust class for anything arriving through the HTTP shim — where a
+caller presenting a configured token is named (`shim:cx`) so six agents on
+one machine are six policies rather than one, without the trust class moving,
+because a shared secret over loopback is not peer credentials. The daemon
 takes an asserted app id only from a caller on `policy.portal_units`, never
 because a message said so.
 The first request from a new app asks the user through polkit; the answer is
@@ -170,7 +173,7 @@ text" is the easy half and the refusals are the point.
 | `crates/ai-daemon-portal` | session-bus portal: turns a sandbox into an app identity |
 | `crates/ai-daemon-fetch` | the download helper, and the only thing here with a network |
 | `crates/ai-daemon-decode` | the confined media decoder |
-| `crates/ai-daemon-shim` | OpenAI-compatible localhost endpoint, off by default |
+| `crates/ai-daemon-shim` | OpenAI- and Anthropic-compatible localhost endpoint, off by default |
 | `crates/aidctl` | administration and inspection |
 | `packaging/` | PKGBUILD, systemd units, D-Bus and polkit policy, the verification run |
 | `docs/protocol.md` | the wire protocols in full |

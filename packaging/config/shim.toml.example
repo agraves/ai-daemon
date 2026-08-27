@@ -1,0 +1,41 @@
+# ai-daemon's HTTP shim — naming the clients. An example, not a config.
+#
+# Copy to /etc/ai-daemon/shim.toml, mode 0640, group ai-daemon-shim. Without
+# it the shim still works and every HTTP caller shares one identity, which is
+# how it behaved before this file existed.
+#
+# Why it exists: the shim listens on loopback TCP, and a TCP socket carries no
+# SO_PEERCRED — the kernel will not say which process is at the other end. So
+# the shim cannot tell one client from another by asking, and before this every
+# editor, agent and script on the machine reached the daemon as the same
+# identity: one grant, one rate limit, one revocation for all of them. On a box
+# running several agents that is the difference between per-agent policy and
+# none at all.
+#
+# What it is not: peer credentials. A token is a shared secret in a file, and
+# any local process that can read this file can present the token in it. What
+# it buys is that *cooperating* clients are told apart, which is what "the CI
+# runner gets this much and the editor gets that much" needs. Everything here
+# is still the daemon's lowest trust class either way.
+
+# Refuse callers with no recognised token. Off by default, because the whole
+# point of this bridge is that existing software works unchanged and existing
+# software does not know to send a token. Turn it on once this machine has
+# named its agents and does not want anonymous ones.
+require_token = false
+
+# The daemon will know this caller as `shim:cx`. Grants, rate limits and
+# revocations are written against that name:
+#
+#     aidctl grants
+#     aidctl deny shim:cx generate
+#
+# Clients send it as `Authorization: Bearer <token>` or `x-api-key: <token>`;
+# both are read, because the two APIs this shim speaks disagree about which.
+[[client]]
+name = "cx"
+token = "change-me-openssl-rand-hex-32"
+
+[[client]]
+name = "ci-runner"
+token = "change-me-too"
