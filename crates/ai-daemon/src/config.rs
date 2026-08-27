@@ -313,9 +313,13 @@ impl Default for Policy {
             gate_group: "ai".to_string(),
             shim_user: "ai-daemon-shim".to_string(),
             portal_units: default_portal_units(),
-            max_context: 8192,
-            max_sessions: 4,
-            tokens_per_minute: 12_000,
+            // See packaging/config/config.toml for why these two numbers are
+            // what they are. Both were sized before anything with a system
+            // prompt connected: 8192 is under Claude Code's ~8.8k prompt, so a
+            // session was refused before its first turn.
+            max_context: 131_072,
+            max_sessions: 8,
+            tokens_per_minute: 600_000,
             daily_spend: 0.0,
             prelude: String::new(),
             mark_provenance: false,

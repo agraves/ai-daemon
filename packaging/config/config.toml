@@ -80,9 +80,26 @@ portal_units = [
   "ai-daemon-portal",
 ]
 
-max_context = 8192
-max_sessions = 4
-tokens_per_minute = 12000
+# Sized for coding agents, which is what actually connects to this.
+#
+# 8192 was under the floor rather than a limit: Claude Code's system prompt
+# alone measures ~8.8k, so a session was refused before its first turn with an
+# accurate message about a window no configuration appeared to control. This is
+# a *ceiling*, not an allocation — the backend reports its own n_ctx and the
+# smaller of the two wins — so a generous number here costs nothing and simply
+# stops this being the thing in the way.
+max_context = 131072
+max_sessions = 8
+# Generous for real work, still a backstop for a loop.
+#
+# 12000 was spent by the second turn, because an agent resends its whole system
+# prompt every request. But the number should not go to infinity: an agent
+# retrying against a model that cannot satisfy it opened 715 sessions and
+# billed 2.66M prompt tokens from one trivial instruction, and this is the only
+# mechanism that would have stopped it. A heavy minute of real work is tens of
+# thousands of tokens; this is an order of magnitude above that and two below
+# the runaway.
+tokens_per_minute = 600000
 allowed_models = ["*"]
 
 [scheduler]
