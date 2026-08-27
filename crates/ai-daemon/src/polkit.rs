@@ -94,13 +94,14 @@ fn ask(
 /// out (`aidctl revoke`) needs the capability that is now denied.
 ///
 /// So the three cases are three cases:
-///   - `(true, _)`      the subject may proceed.
-///   - `(false, false)` a real refusal: no rule permits this subject, and no
-///                      authentication would change that. Worth remembering.
-///   - `(false, true)`  authentication was required and none arrived. Nobody
-///                      answered, so there is nothing to remember — `Err` puts
-///                      this on the caller's "no authority could be reached"
-///                      path, which refuses without writing a decision down.
+///
+/// - `(true, _)` — the subject may proceed.
+/// - `(false, false)` — a real refusal: no rule permits this subject, and no
+///   authentication would change that. Worth remembering.
+/// - `(false, true)` — authentication was required and none arrived. Nobody
+///   answered, so there is nothing to remember — `Err` puts this on the
+///   caller's "no authority could be reached" path, which refuses without
+///   writing a decision down.
 ///
 /// A user who dismisses the dialog lands in the third case too, and that is
 /// the right home for it: closing a prompt is not a decision to be held to
