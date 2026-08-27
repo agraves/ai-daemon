@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "ai-daemon"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ai-daemon-proto",
  "ciborium",
@@ -18,7 +18,7 @@ dependencies = [
 
 [[package]]
 name = "ai-daemon-backend-llamacpp"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ai-daemon-proto",
  "serde",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "ai-daemon-backend-mock"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ai-daemon-proto",
  "serde",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "ai-daemon-backend-remote"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ai-daemon-proto",
  "serde",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "ai-daemon-decode"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ai-daemon-proto",
  "libc",
@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "ai-daemon-fetch"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -64,21 +64,14 @@ dependencies = [
 
 [[package]]
 name = "ai-daemon-portal"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "zbus",
 ]
 
 [[package]]
-name = "ai-run"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "ai-daemon-proto"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ciborium",
  "serde",
@@ -87,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "ai-daemon-shim"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ai-daemon-proto",
  "ciborium",
@@ -99,8 +92,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-run"
+version = "1.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "aidctl"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ai-daemon-proto",
  "ciborium",

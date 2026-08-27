@@ -5,7 +5,7 @@
 # source tarball this expects; `makepkg` on its own has nothing to fetch.
 
 pkgname=ai-daemon
-pkgver=0.1.0
+pkgver=1.0.0
 pkgrel=1
 pkgdesc='System inference service for desktop Linux: D-Bus control plane, per-session data plane, per-app policy'
 arch=('x86_64' 'aarch64')
