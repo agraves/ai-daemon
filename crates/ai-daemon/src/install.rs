@@ -149,8 +149,28 @@ pub fn install(
 /// asked for `--capability vision` and got a text model would have no way to
 /// tell, and the manifest would then quietly disagree with what they believe
 /// they installed.
+/// The policy vocabulary, which is not this one.
+///
+/// `aidctl grant` takes `generate-tools`; `aidctl install --capability` takes
+/// `tools`. The two lists sit four lines apart in the same `--help`, they
+/// overlap on `generate` and `embed`, and nothing marks which is which — so
+/// `--capability generate-tools` is the natural thing to type and produced a
+/// refusal that listed `"tools"` inside a backend's capability array without
+/// saying that was the word wanted. Naming the confusion is cheaper than
+/// letting each person rediscover it.
+const POLICY_ONLY: [(&str, &str); 2] =
+    [("generate-tools", "tools"), ("generate-media", "image-out` or `audio-out")];
+
 fn servable(daemon: &Daemon, manifest: &Manifest) -> Result<(), String> {
     for capability in &manifest.capabilities {
+        if let Some((_, model_word)) = POLICY_ONLY.iter().find(|(p, _)| p == capability) {
+            return Err(format!(
+                "{capability:?} is a policy capability, not a model capability. Policy \
+                 capabilities are what `aidctl grant` takes and describe what an *identity* \
+                 may ask for; `--capability` describes what a *model* is, and for this one \
+                 the word is `{model_word}`."
+            ));
+        }
         // for_manifest resolves the same way a session will, so what is
         // checked here is what will actually serve it — including a named
         // backend that does not exist, which is worth catching at install too.
