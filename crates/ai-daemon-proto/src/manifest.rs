@@ -7,7 +7,14 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Everything zero, and every zero means the same thing: nobody measured it.
+///
+/// `max_ctx` used to default to 4096, which was a guess wearing the clothes of
+/// a measurement — and it is the third of three clamps in `CreateSession`, so
+/// it silently beat both the session request and the policy ceiling. A 32k
+/// model became a 4k model permanently and the only way out was editing JSON
+/// in the model store by hand.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Requirements {
     /// Bytes of weights. Also the file size the digest is taken over.
     pub weights_bytes: u64,
@@ -15,15 +22,24 @@ pub struct Requirements {
     #[serde(default)]
     pub min_memory_bytes: u64,
     #[serde(default)]
+    /// What to load this model at when nobody asks for anything else. Zero
+    /// means "no opinion", and the backend's own default is used.
     pub default_ctx: u32,
     #[serde(default)]
+    /// The largest context this model can serve. Zero means **unknown**, and
+    /// is treated as no ceiling — policy and the backend still bound it.
+    ///
+    /// Zero rather than a number, because a number here is a *measurement* and
+    /// nothing measures it: `install` reads the file's magic and deliberately
+    /// not its header (§7 keeps weight parsing in the backend), so unless an
+    /// administrator says otherwise the honest answer is that we do not know.
+    ///
+    /// This defaulted to 4096, which was an unmeasured guess wearing the
+    /// clothes of a measurement — and it is the *third* clamp in
+    /// `CreateSession`, so it silently won over both the session's request and
+    /// the policy ceiling. A 32k model became a 4k model permanently, and the
+    /// only way out was editing JSON in the model store by hand.
     pub max_ctx: u32,
-}
-
-impl Default for Requirements {
-    fn default() -> Self {
-        Requirements { weights_bytes: 0, min_memory_bytes: 0, default_ctx: 4096, max_ctx: 4096 }
-    }
 }
 
 /// Prompt-template metadata. The daemon does not render templates — backends

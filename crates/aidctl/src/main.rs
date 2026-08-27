@@ -374,6 +374,13 @@ fn install(args: &[String]) -> Result<(), String> {
             "--source" => source = iter.next().cloned().unwrap_or_default(),
             "--digest" => digest = iter.next().cloned().unwrap_or_default(),
             "--name" => name = iter.next().cloned().unwrap_or_default(),
+            "--context" | "--max-context" => {
+                let value = iter.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                options.insert(
+                    "max_ctx".into(),
+                    Value::U32(value).try_into().map_err(|_| "context")?,
+                );
+            }
             "--format" | "--backend" | "--license" => {
                 let key = arg.trim_start_matches("--").to_string();
                 let value = iter.next().cloned().unwrap_or_default();
@@ -405,6 +412,13 @@ install, a capability no configured backend serves for this format is
 refused rather than recorded; at request, a model is refused a capability
 it did not claim even when its backend offers it. Default is
 --capability generate, so a model that should also embed needs it named.
+
+  --context N     the largest context this model can serve. Absent means
+                  unknown, which is treated as no ceiling — policy and the
+                  backend still bound it. It is not detected from the weights:
+                  reading a GGUF header would mean a weight parser in the
+                  daemon, and that is the backend's job. If you install a 32k
+                  model without this, sessions get whatever policy allows.
 
 Sources: https://…, file:///…, oci://registry/repo@sha256:…, remote:MODEL-ID
 The digest is mandatory except for a remote: source. The download runs in
@@ -1140,7 +1154,7 @@ using it
   tokenize [-m MODEL] TEXT    token ids
 
 administration (polkit action io.github.agraves.aidaemon.model-admin)
-  install --name N --source URL --digest sha256:HEX
+  install --name N --source URL --digest sha256:HEX [--context N]
   install --name N --source remote:MODEL-ID   a model on somebody else's machine
   portal                      what app identity the session portal would assert
   remove NAME

@@ -411,6 +411,7 @@ impl Manager {
             format: options.get("format").and_then(|v| String::try_from(v.clone()).ok()),
             backend: options.get("backend").and_then(|v| String::try_from(v.clone()).ok()),
             license: options.get("license").and_then(|v| String::try_from(v.clone()).ok()),
+            max_ctx: options.get("max_ctx").and_then(|v| u32::try_from(v.clone()).ok()),
             capabilities: options
                 .get("capabilities")
                 .and_then(|v| Vec::<String>::try_from(v.clone()).ok()),
@@ -466,9 +467,19 @@ impl Manager {
         if pinned {
             // Loading weights is minutes of disk, not microseconds of bus.
             let daemon = self.daemon.clone();
+            // Read before the closure: `self` is borrowed for the method body and
+            // the closure outlives it.
+            let fallback_ctx = self.daemon.config.policy.max_context;
             unblock(move || {
                 let backend = daemon.backends.for_manifest(&resolved.manifest, "generate")?;
-                let ctx = resolved.manifest.requirements.default_ctx.max(512);
+                // A pinned load with no stated context takes the policy
+                // default rather than a floor: pinning exists to have the
+                // model warm for real sessions, and warming it at 512 tokens
+                // means the first real session reloads it.
+                let ctx = match resolved.manifest.requirements.default_ctx {
+                    0 => fallback_ctx,
+                    stated => stated,
+                };
                 backend.load(
                     &resolved.manifest.name,
                     &resolved.blob,

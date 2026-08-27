@@ -154,6 +154,32 @@ struct ShimConfig {
     require_token: bool,
     #[serde(rename = "client")]
     clients: Vec<ShimClient>,
+    /// What a client's model id means on this machine.
+    ///
+    /// Agents send their vendor's identifiers, and some validate the name
+    /// client-side against a list they ship — so a Claude Code pointed here
+    /// asks for `claude-sonnet-4-5-…` and will not be talked out of it. With
+    /// nothing mapping that to a local model, the only way in was to install
+    /// a GGUF *under a vendor SKU*, which works and should not: the model
+    /// store is content-addressed and its names are how a person knows what
+    /// they are running.
+    ///
+    /// The alias mechanism in the daemon cannot do this job. Aliases are the
+    /// machine's own vocabulary — `default`, `fast`, `embed` — and putting a
+    /// vendor's product names in there would spread one client's naming into
+    /// every other caller's view of the registry. This is a translation at the
+    /// boundary where the foreign name arrives, which is where it belongs.
+    #[serde(rename = "model")]
+    models: Vec<ShimModel>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShimModel {
+    /// What the client asks for. `*` matches anything not named above it.
+    from: String,
+    /// What this machine calls it: a model name or an alias.
+    to: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -185,9 +211,28 @@ impl ShimConfig {
                 // exists, so somebody meant to name their agents, and running
                 // as if they had not would silently merge them all again.
                 eprintln!("<3>ai-daemon-shim: {} is unreadable ({e}); refusing all callers", path.display());
-                ShimConfig { require_token: true, clients: Vec::new() }
+                ShimConfig { require_token: true, clients: Vec::new(), models: Vec::new() }
             }
         }
+    }
+
+    /// Translate a client's model id into one this machine knows.
+    ///
+    /// First exact match wins, then a `*` catch-all if there is one. No
+    /// mapping means the name passes through unchanged, which is what every
+    /// install without this table already did.
+    fn model_for(&self, asked: &str) -> String {
+        for entry in &self.models {
+            if entry.from == asked {
+                return entry.to.clone();
+            }
+        }
+        for entry in &self.models {
+            if entry.from == "*" {
+                return entry.to.clone();
+            }
+        }
+        asked.to_string()
     }
 
     /// The name for a presented token, if it is one we know.
@@ -239,16 +284,16 @@ fn serve(mut stream: TcpStream, config: &ShimConfig) -> Result<(), String> {
     let result = match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/v1/models") | ("GET", "/api/tags") => list_models(),
         ("POST", "/v1/chat/completions") => {
-            return chat(&mut stream, &request, &peer);
+            return chat(&mut stream, &request, &peer, config);
         }
         ("POST", "/v1/responses") => {
-            return responses(&mut stream, &request, &peer);
+            return responses(&mut stream, &request, &peer, config);
         }
-        ("POST", "/v1/embeddings") => embeddings(&request, &peer),
+        ("POST", "/v1/embeddings") => embeddings(&request, &peer, config),
         ("POST", "/v1/messages") => {
-            return messages(&mut stream, &request, &peer);
+            return messages(&mut stream, &request, &peer, config);
         }
-        ("POST", "/v1/messages/count_tokens") => count_tokens(&request, &peer),
+        ("POST", "/v1/messages/count_tokens") => count_tokens(&request, &peer, config),
         ("GET", "/health") => Ok(serde_json::json!({"status": "ok"})),
         _ => {
             respond(&mut stream, 404, &error_body("not_found", "no such route"))?;
@@ -516,14 +561,19 @@ fn list_models() -> Result<serde_json::Value, String> {
 // /v1/chat/completions
 // ---------------------------------------------------------------------------
 
-fn chat(stream: &mut TcpStream, request: &HttpRequest, peer: &Peer) -> Result<(), String> {
+fn chat(
+    stream: &mut TcpStream,
+    request: &HttpRequest,
+    peer: &Peer,
+    config: &ShimConfig,
+) -> Result<(), String> {
     let body: serde_json::Value = match serde_json::from_slice(&request.body) {
         Ok(body) => body,
         Err(e) => {
             return respond(stream, 400, &error_body("invalid_request_error", &e.to_string()));
         }
     };
-    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("default").to_string();
+    let model = config.model_for(body.get("model").and_then(|m| m.as_str()).unwrap_or("default"));
     let streaming = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     let session = match open_session(&model, peer, false) {
@@ -851,10 +901,14 @@ fn relay_json(
     respond(stream, 400, &error_body("api_error", "the session ended without a reply"))
 }
 
-fn embeddings(request: &HttpRequest, peer: &Peer) -> Result<serde_json::Value, String> {
+fn embeddings(
+    request: &HttpRequest,
+    peer: &Peer,
+    config: &ShimConfig,
+) -> Result<serde_json::Value, String> {
     let body: serde_json::Value =
         serde_json::from_slice(&request.body).map_err(|e| e.to_string())?;
-    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("embed").to_string();
+    let model = config.model_for(body.get("model").and_then(|m| m.as_str()).unwrap_or("embed"));
     let inputs: Vec<String> = match body.get("input") {
         Some(serde_json::Value::String(s)) => vec![s.clone()],
         Some(serde_json::Value::Array(items)) => {
@@ -989,6 +1043,10 @@ fn parse_messages_body(
     body: &serde_json::Value,
     socket: &mut UnixStream,
 ) -> Result<AnthropicTurn, String> {
+    // The name the *client* asked for, kept as-is: it is echoed back in the
+    // reply, and a client that gets a different model id than it sent has
+    // been quietly answered by something else. The translation to a local
+    // model happens where the session is opened.
     let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("default").to_string();
     // Required by the API, and not defaulted here: a client that omits it is
     // a client whose author expects a hard error, and inventing a ceiling
@@ -1189,7 +1247,12 @@ fn parse_messages_body(
     })
 }
 
-fn messages(stream: &mut TcpStream, request: &HttpRequest, peer: &Peer) -> Result<(), String> {
+fn messages(
+    stream: &mut TcpStream,
+    request: &HttpRequest,
+    peer: &Peer,
+    config: &ShimConfig,
+) -> Result<(), String> {
     let body: serde_json::Value = match serde_json::from_slice(&request.body) {
         Ok(body) => body,
         Err(e) => {
@@ -1200,7 +1263,7 @@ fn messages(stream: &mut TcpStream, request: &HttpRequest, peer: &Peer) -> Resul
             )
         }
     };
-    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("default").to_string();
+    let model = config.model_for(body.get("model").and_then(|m| m.as_str()).unwrap_or("default"));
 
     let session = match open_session(&model, peer, false) {
         Ok(session) => session,
@@ -1593,6 +1656,10 @@ fn responses_text(content: Option<&serde_json::Value>) -> String {
 }
 
 fn parse_responses_body(body: &serde_json::Value) -> Result<ResponsesTurn, String> {
+    // The name the *client* asked for, kept as-is: it is echoed back in the
+    // reply, and a client that gets a different model id than it sent has
+    // been quietly answered by something else. The translation to a local
+    // model happens where the session is opened.
     let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("default").to_string();
     let mut messages: Vec<Message> = Vec::new();
 
@@ -1707,7 +1774,12 @@ fn parse_responses_body(body: &serde_json::Value) -> Result<ResponsesTurn, Strin
     })
 }
 
-fn responses(stream: &mut TcpStream, request: &HttpRequest, peer: &Peer) -> Result<(), String> {
+fn responses(
+    stream: &mut TcpStream,
+    request: &HttpRequest,
+    peer: &Peer,
+    config: &ShimConfig,
+) -> Result<(), String> {
     let body: serde_json::Value = match serde_json::from_slice(&request.body) {
         Ok(body) => body,
         Err(e) => return respond(stream, 400, &error_body("invalid_request_error", &e.to_string())),
@@ -1717,7 +1789,10 @@ fn responses(stream: &mut TcpStream, request: &HttpRequest, peer: &Peer) -> Resu
         Err(e) => return respond(stream, 400, &error_body("invalid_request_error", &e)),
     };
 
-    let session = match open_session(&turn.model, peer, false) {
+    // The client's name opens nothing: it is translated here, where the
+    // config is in scope, and `turn.model` stays what the caller asked for so
+    // the reply echoes it back unchanged.
+    let session = match open_session(&config.model_for(&turn.model), peer, false) {
         Ok(session) => session,
         Err(e) => {
             let status = if e.contains("AccessDenied") { 403 } else { 400 };
@@ -2039,10 +2114,14 @@ fn relay_responses_sse(
 
 /// POST /v1/messages/count_tokens — the daemon's tokenizer, in Anthropic's
 /// clothes. Claude Code asks before it sends, to decide what to trim.
-fn count_tokens(request: &HttpRequest, peer: &Peer) -> Result<serde_json::Value, String> {
+fn count_tokens(
+    request: &HttpRequest,
+    peer: &Peer,
+    config: &ShimConfig,
+) -> Result<serde_json::Value, String> {
     let body: serde_json::Value =
         serde_json::from_slice(&request.body).map_err(|e| e.to_string())?;
-    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("default").to_string();
+    let model = config.model_for(body.get("model").and_then(|m| m.as_str()).unwrap_or("default"));
 
     // Everything the request would have sent, flattened. Counting only the
     // last turn would under-report by the whole conversation.

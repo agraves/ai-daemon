@@ -113,6 +113,22 @@ pub fn render_micros(micros: u64) -> String {
 
 /// Token bucket per identity. Refills continuously rather than per window, so
 /// a client cannot burst the whole minute's allowance at the boundary.
+///
+/// Capacity is the per-minute rate, and deliberately not "one full turn".
+///
+/// That was tried. An agent resends its whole conversation every request, so
+/// one turn can reserve most of a context window, and a rate below that
+/// refuses the first legitimate turn — which is a real problem and this is not
+/// the fix for it. Sizing the bucket to hold a turn makes every limit smaller
+/// than a context window unenforceable: an administrator who writes
+/// `tokens_per_minute = 50` means it, and would get a bucket of eight thousand.
+/// The two cannot both be true, and enforcement is the one worth keeping.
+///
+/// What the daemon owes the other case is a *diagnosis* rather than a silent
+/// accommodation, and `PolicyEngine::new` gives one: an identity whose
+/// allowance is below one turn is named at startup, because otherwise the only
+/// symptom is a 429 the client cannot act on — waiting does not help, the next
+/// request is the same size.
 struct Bucket {
     tokens: f64,
     capacity: f64,
@@ -164,6 +180,36 @@ impl PolicyEngine {
         let path = state_dir.join("grants.json");
         let grants = load_grants(&path);
         info!("policy: {} remembered grant(s), consent mode {:?}", grants.len(), config.policy.consent);
+        // An allowance that cannot cover one turn is a configuration that
+        // refuses every turn, and the client cannot tell.
+        //
+        // The daemon reserves prompt plus max_tokens before generating, and
+        // both are bounded by the context window — so an identity whose
+        // per-minute allowance is below its context can be refused before its
+        // first request, with a 429 that waiting does not fix because the next
+        // request is the same size. It reads as "the service is busy" and is
+        // actually "this will never work".
+        //
+        // Named here rather than worked around: an administrator who writes a
+        // small number may mean it, and the bucket honours it. What they
+        // should not have to do is discover the consequence from a client's
+        // error message.
+        let warn_if_starved = |who: &str, per_minute: u64, context: u32| {
+            if per_minute < context as u64 {
+                warn!(
+                    "policy: {who} allows {per_minute} tokens/minute against a {context}-token \
+                     context — one full turn reserves more than that, so requests near the \
+                     window will be refused before they start. Raise tokens_per_minute above \
+                     max_context, or lower max_context, if that is not intended."
+                );
+            }
+        };
+        warn_if_starved("the default", config.policy.tokens_per_minute, config.policy.max_context);
+        for rule in &config.identities {
+            let per_minute = rule.tokens_per_minute.unwrap_or(config.policy.tokens_per_minute);
+            let context = rule.max_context.unwrap_or(config.policy.max_context);
+            warn_if_starved(&rule.identity, per_minute, context);
+        }
         PolicyEngine {
             config,
             path,
@@ -649,6 +695,24 @@ mod tests {
             "a continuous refill means a client does not wait for a window boundary"
         );
         assert!(!bucket.take(6000), "but the refill is a trickle, not a reset");
+    }
+
+    /// A small allowance means a small allowance.
+    ///
+    /// This was briefly not true: the bucket was sized to hold one full
+    /// context window so an agent's first turn could never be refused, which
+    /// made every limit below a window unenforceable — 50 a minute became
+    /// eight thousand. An administrator who writes a small number means it,
+    /// and the diagnosis for the other case belongs in the log at startup, not
+    /// in the arithmetic here.
+    #[test]
+    fn a_tight_allowance_refuses_a_request_larger_than_itself() {
+        let mut bucket = Bucket::new(50);
+        assert!(
+            !bucket.take(500),
+            "a request ten times the whole minute must not be admitted"
+        );
+        assert!(bucket.take(50), "while what the limit does permit still goes through");
     }
 
     /// Refusing and *remembering* the refusal are different things. A daemon

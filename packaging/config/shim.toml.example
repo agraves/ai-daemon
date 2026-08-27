@@ -39,3 +39,35 @@ token = "change-me-openssl-rand-hex-32"
 [[client]]
 name = "ci-runner"
 token = "change-me-too"
+
+# ---------------------------------------------------------------------------
+# What a client's model id means on this machine.
+#
+# Agents send their vendor's identifiers, and some validate the name
+# client-side against a list they ship — Claude Code will ask for
+# `claude-sonnet-4-5-…` and cannot be talked out of it. Without a mapping the
+# only way in was to install a local GGUF *under a vendor SKU*, which works and
+# should not: the model store is content-addressed and its names are how a
+# person knows what they are actually running.
+#
+# This is not the daemon's alias mechanism and should not be. Aliases are the
+# machine's own vocabulary — `default`, `fast`, `embed` — and putting a
+# vendor's product names in there would spread one client's naming into every
+# other caller's view of the registry. This is a translation at the boundary
+# where the foreign name arrives.
+#
+# First exact match wins; a `from = "*"` entry catches everything else. With no
+# entries the name passes through unchanged, which is what every install
+# without this table already did.
+#
+# [[model]]
+# from = "claude-sonnet-4-5-20250929"
+# to = "qwen2.5-7b-instruct"
+#
+# [[model]]
+# from = "gpt-5-codex"
+# to = "qwen2.5-7b-instruct"
+#
+# [[model]]
+# from = "*"
+# to = "default"

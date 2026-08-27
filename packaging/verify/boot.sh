@@ -63,6 +63,7 @@ useradd --uid 4002 --create-home --groups ai bob
 useradd --uid 4003 --create-home mallory      # deliberately outside the gate
 useradd --uid 4004 --create-home --groups ai carol   # provenance marking on
 useradd --uid 4005 --create-home --groups ai dave    # bounded in money
+useradd --uid 4006 --create-home --groups ai eve     # rate below one turn
 usermod --append --groups ai root
 # systemd would do this from SupplementaryGroups= in the units. Without an init
 # system, setpriv --init-groups reads /etc/group, so the membership has to be
@@ -200,6 +201,16 @@ identity = "uid:4005"
 daily_spend = 0.01
 CONF
 
+cat > /etc/ai-daemon/config.toml.d/92-turn.conf <<'CONF'
+# eve's allowance is far below one turn, which used to mean she could not
+# take a single legal turn at all: the bucket's capacity was the rate. It
+# holds one turn now and the rate governs the refill, so her first request
+# succeeds and her second meets the limit.
+[[identity]]
+identity = "uid:4006"
+tokens_per_minute = 100
+CONF
+
 cat > /etc/ai-daemon/config.toml.d/91-prelude.conf <<'CONF'
 # carol gets the treatment an agent that reads other people's text should get:
 # a prelude she cannot remove, and every part of the prompt labelled with
@@ -315,6 +326,16 @@ token = "verification-token-cx"
 [[client]]
 name = "cy"
 token = "verification-token-cy"
+
+# Vendor ids agents will not be talked out of, pointed at what this box
+# actually has installed.
+[[model]]
+from = "claude-sonnet-4-5-20250929"
+to = "mock-small"
+
+[[model]]
+from = "gpt-5-codex"
+to = "mock-small"
 CONF
 chmod 0640 /etc/ai-daemon/shim.toml
 chgrp ai-daemon-shim /etc/ai-daemon/shim.toml

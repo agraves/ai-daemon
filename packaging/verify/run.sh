@@ -885,8 +885,8 @@ SILENCE=$(sed -n 's/^backend_silence_seconds = //p' /etc/ai-daemon/config.toml.d
 note "configured silence window: ${SILENCE}s"
 check "the window is short enough for this test to reach it" test "$SILENCE" -lt 10
 
-# Both counts sit inside the session's 4096-token context; an earlier draft
-# asked for 8000 and was refused before any of this was exercised.
+# Both counts sit inside the session context; an earlier draft asked for
+# 8000 and was refused before any of this was exercised.
 runas alice aidctl generate --priority background --max-tokens 1500 --usage \
   "a batch job that will be held still" >/tmp/preempted.txt 2>&1 &
 BG=$!
@@ -1273,6 +1273,104 @@ note "somebody who owns the file can rewrite the chain from the point of an"
 note "edit. What this costs them is the whole remainder rather than one line."
 check "verification needs no running daemon, only the file" \
   bash -c "cp /var/lib/ai-daemon/audit.jsonl /tmp/copy.jsonl && aidctl audit --verify --file /tmp/copy.jsonl >/dev/null"
+
+# ---------------------------------------------------------------------------
+section "22. What the first real agent run found"
+# ---------------------------------------------------------------------------
+note "Three things from notes/2026-08-27-omarchy-integration.md, all of them"
+note "found by pointing a real agent at the daemon rather than reasoning about"
+note "it. Each reported accurately and pointed somewhere else."
+
+note "One: a model's context. Requirements::default() said max_ctx = 4096 — an"
+note "unmeasured number wearing the clothes of a measurement, and the third of"
+note "three clamps in CreateSession, so it silently beat both the session's"
+note "request and the policy ceiling. A 32k model became a 4k model for good."
+aidctl install --name wide --source file:///tmp/weights.bin \
+  --digest "$DIGEST" --format mock --backend mock --capability generate \
+  --context 32768 >/dev/null 2>&1
+aidctl models > /tmp/wide.txt 2>&1
+check "a model can state the context it serves" \
+  bash -c "grep -q '^wide ' /tmp/wide.txt"
+runas alice aidctl generate --model wide --max-tokens 4 "how wide" >/tmp/wide-run.txt 2>&1
+run head -2 /tmp/wide-run.txt
+contains "and a session on it gets more than the old 4096" /tmp/wide-run.txt 'context (8192|32768)'
+
+note "A model that says nothing about its context must not assert 4096 either."
+aidctl install --name quiet --source file:///tmp/weights.bin \
+  --digest "$DIGEST" --format mock --backend mock --capability generate \
+  >/dev/null 2>&1
+runas alice aidctl generate --model quiet --max-tokens 4 "how wide" >/tmp/quiet-run.txt 2>&1
+run head -2 /tmp/quiet-run.txt
+lacks "an unstated context does not silently become 4096" /tmp/quiet-run.txt 'context 4096'
+note "Unknown is zero, and zero already meant no ceiling — policy governs, as"
+note "the field was always documented to. It is stated rather than read out of"
+note "the GGUF: a weight parser in the process that holds every prompt is what"
+note "§7 keeps in the backend, and install checks the magic and nothing else."
+
+# ---------------------------------------------------------------------------
+note "Two: an allowance that cannot cover one turn. An agent resends its whole"
+note "conversation every request, so one turn reserves most of a window —"
+note "Claude Code's system prompt alone measures ~8.8k against a shipped 12000"
+note "a minute. Below that, the first turn is refused with a 429 that waiting"
+note "cannot fix, because the next request is the same size."
+# ---------------------------------------------------------------------------
+run cat /etc/ai-daemon/config.toml.d/92-turn.conf
+note "The first attempt at this sized the bucket to hold a full window so the"
+note "turn always fit. That was wrong, and this suite caught it: it makes every"
+note "limit below a context window unenforceable — section 10's deliberately"
+note "tight 50-a-minute became eight thousand. Both cannot be true, and"
+note "enforcement is the half worth keeping."
+runas eve aidctl generate --max-tokens 600 "a turn larger than the whole minute" \
+  >/tmp/turn1.txt 2>&1
+run cat /tmp/turn1.txt
+contains "so a starved allowance still refuses, as it is asked to" /tmp/turn1.txt 'rate-limited'
+
+note "What the daemon owes instead is the diagnosis, at startup, naming the"
+note "identity — because the only other symptom is an error the client cannot"
+note "act on and an administrator cannot connect to a setting."
+grep 'tokens/minute against' /tmp/daemon.log | sed 's/^/    /'
+contains "the starved identity is named when the config is read" /tmp/daemon.log \
+  'uid:4006 allows 100 tokens/minute against a 8192-token context'
+contains "and the message says what to change" /tmp/daemon.log \
+  'Raise tokens_per_minute above max_context'
+lacks "an identity whose allowance covers a turn is not warned about" /tmp/daemon.log \
+  'uid:4001 allows'
+note "uid:4001 is alice, whose allowance was widened for this run; she covers a"
+note "turn and gets no warning, which is what stops this becoming noise."
+
+# ---------------------------------------------------------------------------
+note "Three: a client's model id. Agents send vendor identifiers and some"
+note "validate the name client-side against a list they ship, so the only way"
+note "in was installing a local GGUF under a vendor SKU — which works and"
+note "should not: the store is content-addressed and its names are how a"
+note "person knows what they are running."
+# ---------------------------------------------------------------------------
+run grep -A 3 '\[\[model\]\]' /etc/ai-daemon/shim.toml
+curl -sS --max-time 60 http://127.0.0.1:11434/v1/messages \
+  -H 'Content-Type: application/json' -H 'x-api-key: verification-token-cx' \
+  -d '{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"who served this"}]}' \
+  >/tmp/mapped.json 2>&1
+run cat /tmp/mapped.json
+contains "a vendor model id is served by the local model it maps to" /tmp/mapped.json 'mock:'
+contains "and the reply still echoes the name the client asked for" /tmp/mapped.json '"model":"claude-sonnet-4-5-20250929"'
+note "Both halves matter: an agent that checks the reply's model field against"
+note "what it sent must see what it sent, and the machine must run what its"
+note "administrator installed."
+tail -4 /var/lib/ai-daemon/audit.jsonl | sed 's/^/    /'
+contains "and the audit log records the model that actually ran" \
+  /var/lib/ai-daemon/audit.jsonl '"model":"mock-small"[^}]*"identity":"shim:cx"|"identity":"shim:cx"[^}]*"model":"mock-small"'
+
+curl -sS --max-time 60 http://127.0.0.1:11434/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5-codex","messages":[{"role":"user","content":"and the other one"}]}' \
+  >/tmp/mapped2.json 2>&1
+contains "the map applies to the OpenAI route too, not just Anthropic's" /tmp/mapped2.json 'mock:'
+curl -sS --max-time 60 http://127.0.0.1:11434/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mock-small","messages":[{"role":"user","content":"unmapped"}]}' \
+  >/tmp/unmapped.json 2>&1
+contains "and a name with no entry passes through unchanged" /tmp/unmapped.json 'mock:'
+note "No entries at all is the behaviour every install had before this table."
 
 # ---------------------------------------------------------------------------
 printf '\n\033[1m=== Result ===\033[0m\n'

@@ -45,6 +45,13 @@ struct FetchReport {
 /// intersected with what the backend offers. None of it is taken on trust.
 #[derive(Debug, Default)]
 pub struct Options {
+    /// The largest context this model can serve, if the administrator knows.
+    ///
+    /// Stated rather than detected, and that is a §7 decision rather than
+    /// laziness: reading a GGUF header means a weight parser in the process
+    /// that holds every prompt, and the backend already does that job. Absent
+    /// means unknown, which is treated as no ceiling — not as 4096.
+    pub max_ctx: Option<u32>,
     pub format: Option<String>,
     pub backend: Option<String>,
     pub license: Option<String>,
@@ -122,7 +129,15 @@ pub fn install(
         format,
         quantization: guess_quantization(source),
         license: options.license.unwrap_or_default(),
-        requirements: Requirements { weights_bytes: report.bytes, ..Requirements::default() },
+        requirements: Requirements {
+            weights_bytes: report.bytes,
+            // Both from one number: an administrator saying "this is a 32k
+            // model" means both that it can go that high and that there is no
+            // reason to open it lower.
+            default_ctx: options.max_ctx.unwrap_or(0),
+            max_ctx: options.max_ctx.unwrap_or(0),
+            ..Requirements::default()
+        },
         template: Default::default(),
         backend: options.backend.unwrap_or_default(),
         capabilities: options.capabilities.unwrap_or_else(|| vec!["generate".into()]),
@@ -234,7 +249,11 @@ fn install_remote(
         // No weights, so no weight bytes and no VRAM on this machine. Leaving
         // these zero is what keeps the scheduler from reserving budget for a
         // model that occupies none of it.
-        requirements: Requirements::default(),
+        requirements: Requirements {
+            default_ctx: options.max_ctx.unwrap_or(0),
+            max_ctx: options.max_ctx.unwrap_or(0),
+            ..Requirements::default()
+        },
         template: Default::default(),
         backend: serving.clone(),
         capabilities: options.capabilities.unwrap_or_else(|| vec!["generate".into()]),
