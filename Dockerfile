@@ -36,6 +36,7 @@ COPY --chown=builder crates/ai-daemon-backend-mock/Cargo.toml crates/ai-daemon-b
 COPY --chown=builder crates/ai-daemon-backend-llamacpp/Cargo.toml crates/ai-daemon-backend-llamacpp/
 COPY --chown=builder crates/ai-daemon-backend-remote/Cargo.toml crates/ai-daemon-backend-remote/
 COPY --chown=builder crates/ai-daemon-portal/Cargo.toml crates/ai-daemon-portal/
+COPY --chown=builder crates/ai-run/Cargo.toml crates/ai-run/
 COPY --chown=builder crates/ai-daemon-fetch/Cargo.toml crates/ai-daemon-fetch/
 COPY --chown=builder crates/ai-daemon-decode/Cargo.toml crates/ai-daemon-decode/
 COPY --chown=builder crates/ai-daemon-shim/Cargo.toml crates/ai-daemon-shim/
@@ -44,7 +45,7 @@ RUN set -eu; \
     for d in crates/*/; do mkdir -p "$d/src"; done; \
     echo 'pub fn placeholder() {}' > crates/ai-daemon-proto/src/lib.rs; \
     for c in ai-daemon ai-daemon-backend-mock ai-daemon-backend-llamacpp ai-daemon-backend-remote \
-             ai-daemon-portal \
+             ai-daemon-portal ai-run \
              ai-daemon-fetch ai-daemon-decode ai-daemon-shim aidctl; do \
         echo 'fn main() {}' > "crates/$c/src/main.rs"; \
     done; \

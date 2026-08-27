@@ -609,6 +609,13 @@ fn generate(args: &[String]) -> Result<(), String> {
     // serve the old protocol" is a claim with nothing behind it.
     let mut proto = DATA_PROTO;
     let mut via_portal = false;
+    // Narrowing, not configuring: these can only ever ask for less than the
+    // caller is already allowed. That is what makes a session fd something you
+    // can hand to a child — you can give away strictly less than you hold, and
+    // there is no request on the far end that widens it back.
+    let mut no_tools = false;
+    let mut narrow_rate: Option<u64> = None;
+    let mut narrow_models: Option<Vec<String>> = None;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -627,6 +634,13 @@ fn generate(args: &[String]) -> Result<(), String> {
             "--proto" => proto = iter.next().and_then(|v| v.parse().ok()).unwrap_or(DATA_PROTO),
             "--cancel-after" => cancel_after = iter.next().and_then(|v| v.parse().ok()),
             "--via-portal" => via_portal = true,
+            "--no-tools" => no_tools = true,
+            "--narrow-rate" => narrow_rate = iter.next().and_then(|v| v.parse().ok()),
+            "--narrow-models" => {
+                narrow_models = iter.next().map(|v| {
+                    v.split(',').map(|m| m.trim().to_string()).collect::<Vec<_>>()
+                })
+            }
             "--help" => {
                 println!(
                     "usage: aidctl generate [options] [PROMPT]
@@ -636,6 +650,19 @@ fn generate(args: &[String]) -> Result<(), String> {
       --priority CLASS interactive (default) or background
       --max-tokens N    cap the completion
       --tool FILE       JSON array of tool schemas; enables tool calling
+      --no-tools        open a session that cannot make tool calls, whatever
+                        this identity is otherwise permitted
+      --narrow-rate N   tokens/minute for this session only, if lower than
+                        what policy already allows
+      --narrow-models A,B
+                        restrict this session to a subset of what policy allows
+
+                        These three can only take away. They exist so a
+                        supervisor can open a session, hand the descriptor to a
+                        child, and know the child holds strictly less than it
+                        does — asking for more than you are allowed silently
+                        gets you what you were already allowed.
+
       --via-portal      open the session through the session-bus portal, so
                         the daemon identifies this process by application id
                         rather than by unit. Only works inside a sandbox.
@@ -670,6 +697,21 @@ With no PROMPT, reads one from stdin."
         "priority".into(),
         Value::Str(priority.as_str().into()).try_into().map_err(|_| "priority")?,
     );
+    if no_tools {
+        options.insert("no_tools".into(), Value::Bool(true).try_into().map_err(|_| "no_tools")?);
+    }
+    if let Some(rate) = narrow_rate {
+        options.insert(
+            "max_tokens_per_minute".into(),
+            Value::U64(rate).try_into().map_err(|_| "narrow rate")?,
+        );
+    }
+    if let Some(models) = &narrow_models {
+        options.insert(
+            "allowed_models".into(),
+            Value::Array(models.clone().into()).try_into().map_err(|_| "narrow models")?,
+        );
+    }
     let session = open_session_by(&model, options, via_portal)?;
     let mut socket = session.socket.try_clone().map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(session.socket.try_clone().map_err(|e| e.to_string())?);

@@ -66,6 +66,13 @@ pub struct Identity {
     /// it does not defend against a local process that can read the token
     /// file. It is still the difference between per-agent policy and none.
     pub client: Option<String>,
+    /// Did the kernel vouch for `pid` and `uid`?
+    ///
+    /// Only ever false on the shim's TCP path, where a loopback socket carries
+    /// no peer credentials and the shim reports itself. It changes what the
+    /// key may be built from: an unattested pid is the shim's own and must not
+    /// be dressed up as a caller.
+    pub attested: bool,
 }
 
 impl Identity {
@@ -89,10 +96,22 @@ impl Identity {
             // another. Without one, a loopback caller is genuinely
             // indistinguishable and the key says so rather than implying the
             // uid means something.
-            Class::Shim => match (&self.client, &self.exe) {
-                (Some(client), _) => format!("shim:{client}"),
-                (None, Some(exe)) => format!("shim:{exe}@{}", self.uid),
-                (None, None) => format!("shim:uid:{}", self.uid),
+            // A named client first: an administrator's token is the most
+            // stable and most useful thing to key on.
+            //
+            // Then the unit, but only when the kernel vouched for the pid it
+            // came from — the cgroup of an unattested pid is the *shim's*
+            // cgroup, and keying on it would file every anonymous HTTP caller
+            // under a name that looks like an application.
+            //
+            // The unit matters because a desktop runs everything as one user:
+            // without it every app on the machine collapses to `shim:uid:1000`
+            // and per-app policy is per-user policy wearing a different name.
+            Class::Shim => match (&self.client, self.attested, &self.unit, &self.exe) {
+                (Some(client), _, _, _) => format!("shim:{client}"),
+                (None, true, Some(unit), _) => format!("shim:unit:{unit}@{}", self.uid),
+                (None, true, None, Some(exe)) => format!("shim:{exe}@{}", self.uid),
+                (None, _, _, _) => format!("shim:uid:{}", self.uid),
             },
         }
     }
@@ -124,6 +143,7 @@ impl Identity {
             app_id: None,
             exe: exe_of_pid(pid),
             client: None,
+            attested: false,
         }
     }
 }
@@ -418,6 +438,7 @@ mod tests {
             app_id: None,
             exe: Some("gnome-text-editor".into()),
             client: None,
+            attested: false,
         };
         let monday = launch(4242, "app-gnome-org.gnome.TextEditor-4242.scope");
         let tuesday = launch(9137, "app-gnome-org.gnome.TextEditor-9137.scope");
@@ -466,6 +487,7 @@ mod tests {
             app_id: None,
             exe: Some("aidctl".into()),
             client: None,
+            attested: false,
         };
         assert_eq!(identity.unit, None, "a terminal tab is not an app identity");
         assert_eq!(identity.key(), "exe:aidctl@1000");
@@ -553,6 +575,7 @@ mod tests {
             app_id: None,
             exe: Some("foo".into()),
             client: None,
+            attested: false,
         };
         let second = Identity { pid: 9999, ..first.clone() };
         assert_eq!(first.key(), second.key());
@@ -570,12 +593,42 @@ mod tests {
             app_id: Some("org.gnome.Newelle".into()),
             exe: Some("aidctl".into()),
             client: None,
+            attested: false,
         };
         assert_eq!(base.key(), "exe:aidctl@1000");
-        assert_eq!(Identity { class: Class::Shim, ..base.clone() }.key(), "shim:aidctl@1000");
         assert_eq!(
-            Identity { class: Class::Portal, ..base }.key(),
+            Identity { class: Class::Portal, ..base.clone() }.key(),
             "portal:org.gnome.Newelle"
+        );
+
+        // The shim's four cases, in the order key() tries them.
+        //
+        // Unattested is the one worth stating: on loopback TCP the kernel will
+        // not name the peer, so the pid and exe are the *shim's own*. Keying on
+        // them would file every anonymous HTTP caller under something that
+        // reads like an application, so the key says only what is true — this
+        // arrived through the shim, as some user.
+        let shim = Identity { class: Class::Shim, ..base.clone() };
+        assert_eq!(shim.key(), "shim:uid:1000", "an unattested exe is the shim's own");
+        assert_eq!(
+            Identity { attested: true, ..shim.clone() }.key(),
+            "shim:aidctl@1000",
+            "attested and with no unit, the executable is the caller's"
+        );
+        assert_eq!(
+            Identity {
+                attested: true,
+                unit: Some("app-widget.scope".into()),
+                ..shim.clone()
+            }
+            .key(),
+            "shim:unit:app-widget.scope@1000",
+            "a unit beats an exe: a desktop runs everything as one user"
+        );
+        assert_eq!(
+            Identity { client: Some("ci-runner".into()), ..shim }.key(),
+            "shim:ci-runner",
+            "and a token an administrator wrote beats both"
         );
     }
 

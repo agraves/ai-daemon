@@ -78,6 +78,25 @@ pub struct Limits {
     pub prelude: String,
     /// Tag each part of a prompt with where it came from.
     pub mark_provenance: bool,
+    /// A rate this session was narrowed to, below what the identity holds.
+    ///
+    /// Separate from `tokens_per_minute` because the identity's bucket is
+    /// shared by every session it opens — that is the point of a rate limit —
+    /// so lowering the number in `Limits` alone changes nothing: the bucket
+    /// already exists and `or_insert_with` will not rebuild it. A narrowed
+    /// session gets its own bucket in addition, and both must pass.
+    ///
+    /// In addition, not instead: a child handed a narrowed descriptor is
+    /// bounded by its own allowance *and* still counts against the parent's,
+    /// or a supervisor could mint unlimited children each under the limit.
+    pub session_rate: Option<u64>,
+    /// Refuse tool calling outright for this session.
+    ///
+    /// Distinct from the `generate-tools` capability, which is what an
+    /// identity is *permitted*. This is what a session was *opened as*, so a
+    /// supervisor can hand a child an fd that cannot make tool calls even
+    /// though the supervisor's own identity may.
+    pub no_tools: bool,
     pub allowed_models: Vec<String>,
 }
 
@@ -98,7 +117,7 @@ struct GrantFile {
 const SPEND_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// A decimal in the config becomes an integer here, once.
-fn to_micros(units: f64) -> u64 {
+pub fn to_micros(units: f64) -> u64 {
     if !units.is_finite() || units <= 0.0 {
         return 0;
     }
@@ -153,6 +172,25 @@ impl Bucket {
         } else {
             false
         }
+    }
+}
+
+/// A rate limit belonging to one session rather than to an identity.
+///
+/// Handed to the worker that owns the session, so it dies with it. There is no
+/// map keyed on anything, deliberately: a session-local limit that outlived
+/// its session would be a limit nobody could account for.
+pub struct SessionBudget {
+    bucket: Mutex<Bucket>,
+}
+
+impl SessionBudget {
+    pub fn new(per_minute: u64) -> SessionBudget {
+        SessionBudget { bucket: Mutex::new(Bucket::new(per_minute)) }
+    }
+
+    pub fn take(&self, n: u64) -> bool {
+        self.bucket.lock().unwrap().take(n)
     }
 }
 
@@ -266,6 +304,8 @@ impl PolicyEngine {
             daily_spend_micros: to_micros(defaults.daily_spend),
             prelude: defaults.prelude.clone(),
             mark_provenance: defaults.mark_provenance,
+            no_tools: false,
+            session_rate: None,
             allowed_models: defaults.allowed_models.clone(),
         };
         if let Some(rule) = self.config.rule_for(&identity.key()) {
@@ -666,6 +706,7 @@ mod tests {
             app_id: None,
             exe: Some("aidctl".into()),
             client: None,
+            attested: false,
         }
     }
 
@@ -820,6 +861,8 @@ mod tests {
             daily_spend_micros: 0,
             prelude: String::new(),
             mark_provenance: false,
+            no_tools: false,
+            session_rate: None,
             allowed_models: vec!["*".into()],
         };
         policy.open_session(&identity(1000), &limits).unwrap();
@@ -841,6 +884,8 @@ mod tests {
             daily_spend_micros: 0,
             prelude: String::new(),
             mark_provenance: false,
+            no_tools: false,
+            session_rate: None,
             allowed_models: vec!["small".into()],
         };
         assert!(limits.permits_model("small"));

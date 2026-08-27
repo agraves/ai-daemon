@@ -1373,6 +1373,200 @@ contains "and a name with no entry passes through unchanged" /tmp/unmapped.json 
 note "No entries at all is the behaviour every install had before this table."
 
 # ---------------------------------------------------------------------------
+section "23. A door a process with no network can still reach"
+# ---------------------------------------------------------------------------
+note "Loopback is network. Put an application in a namespace with no"
+note "interfaces and 127.0.0.1 goes with everything else — so until now"
+note "'confined' and 'can do inference' were mutually exclusive, and the whole"
+note "point is an app with no route off the machine, no credential, and"
+note "inference anyway. The shim now also listens on a unix socket."
+
+check "the socket exists beside the port" test -S /run/ai-daemon-shim/shim.sock
+run ls -ld /run/ai-daemon-shim /run/ai-daemon-shim/shim.sock
+check "it is group-readable and not world-readable" \
+  test "$(stat -c %a /run/ai-daemon-shim/shim.sock)" = 660
+check "and its group is the machine's outer gate" \
+  test "$(stat -c %G /run/ai-daemon-shim/shim.sock)" = ai
+note "Tighter than the TCP port on purpose: 'ai' is the documented gate on"
+note "which humans may use inference at all, and the daemon enforces it either"
+note "way. A filesystem object should carry the same answer."
+check "it is not in the daemon's own runtime directory" \
+  test ! -e /run/ai-daemon/shim.sock
+note "Because that one holds every live session's socket, and a uid that can"
+note "create files there can unlink them."
+refute "a user outside the gate cannot reach it" \
+  runas mallory test -r /run/ai-daemon-shim/shim.sock
+
+note "It serves the same routes as the port."
+runas alice curl -sS --max-time 60 --unix-socket /run/ai-daemon-shim/shim.sock \
+  http://localhost/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"default","messages":[{"role":"user","content":"over a socket"}]}' \
+  >/tmp/sock-chat.json 2>&1
+run cat /tmp/sock-chat.json
+contains "a completion comes back over the socket" /tmp/sock-chat.json '"object":"chat.completion"'
+runas alice curl -sS --max-time 60 --unix-socket /run/ai-daemon-shim/shim.sock \
+  http://localhost/v1/messages -H 'Content-Type: application/json' \
+  -d '{"model":"default","max_tokens":8,"messages":[{"role":"user","content":"and anthropic"}]}' \
+  >/tmp/sock-msg.json 2>&1
+contains "and so does a Messages turn" /tmp/sock-msg.json '"type":"message"'
+
+# ---------------------------------------------------------------------------
+note "The second reason for the socket, and the one that fixes a wart carried"
+note "since the shim was written: SO_PEERCRED answers here. On TCP the kernel"
+note "will not say who is calling, which is why the token table exists — a"
+note "shared secret in a file. On a socket the kernel names the peer."
+# ---------------------------------------------------------------------------
+tail -6 /var/lib/ai-daemon/audit.jsonl | sed 's/^/    /'
+contains "a socket caller is identified by the kernel, as the user who called" \
+  /var/lib/ai-daemon/audit.jsonl '"class":"shim"[^}]*"uid":4001|"uid":4001[^}]*"class":"shim"'
+note "uid 4001 is alice. Before this every HTTP caller arrived as the shim's"
+note "own uid — one grant, one rate limit, one revocation for all of them."
+
+note "A token still wins where one is presented: naming your agents is a"
+note "deliberate act and a name beats a pid in a grant table."
+runas alice curl -sS --max-time 60 --unix-socket /run/ai-daemon-shim/shim.sock \
+  http://localhost/v1/chat/completions -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer verification-token-cx' \
+  -d '{"model":"default","messages":[{"role":"user","content":"named over a socket"}]}' \
+  >/dev/null 2>&1
+contains "a named caller on the socket is still its name" /var/lib/ai-daemon/audit.jsonl \
+  '"identity":"shim:cx"'
+
+note "And the daemon is told nothing it cannot trust. On TCP the shim has no"
+note "peer to report, so it reports none — a pid it invented would be read as"
+note "an attested peer and keyed into the grant table wearing a caller's"
+note "clothes."
+curl -sS --max-time 60 http://127.0.0.1:11434/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"default","messages":[{"role":"user","content":"over tcp"}]}' \
+  >/dev/null 2>&1
+contains "an anonymous TCP caller is still the shim, and says so" \
+  /var/lib/ai-daemon/audit.jsonl '"identity":"shim:uid:'
+note "That is not a regression: it is the same answer as before, now arrived at"
+note "honestly rather than through a fallback that looked like a measurement."
+
+note "Both doors are optional. --port 0 serves only the socket, which is what"
+note "a machine that has finished migrating would run."
+setpriv --reuid ai-daemon-shim --regid ai-daemon-shim --init-groups --inh-caps=-all \
+  -- /usr/bin/ai-daemon-shim --port 0 --socket /tmp/socket-only.sock >/tmp/sockonly.log 2>&1 &
+SOCKONLY=$!
+sleep 1
+run cat /tmp/sockonly.log
+contains "it starts with no TCP port at all" /tmp/sockonly.log 'listening on /tmp/socket-only.sock'
+lacks "and nothing is bound on loopback by it" /tmp/sockonly.log '127.0.0.1:'
+kill "$SOCKONLY" 2>/dev/null
+rm -f /tmp/socket-only.sock
+
+# ---------------------------------------------------------------------------
+section "24. Handing over less than you hold"
+# ---------------------------------------------------------------------------
+note "§5's model is a supervisor opening a session under narrow policy and"
+note "passing the descriptor to a sandboxed child — 'the child can think and"
+note "can do nothing else'. That is only safe if a session can be opened"
+note "narrower than the caller is: without it the fd carries the caller's whole"
+note "allowance, and handing it over hands over everything."
+
+note "alice is permitted tool calling. A session opened without it refuses,"
+note "and nothing sent on that session can undo the decision."
+check "alice may use tools when she asks for a normal session" \
+  runas alice aidctl generate --max-tokens 24 --tool /tmp/tools.json "what is the weather in Oslo"
+runas alice aidctl generate --no-tools --max-tokens 24 --tool /tmp/tools.json \
+  "and now without" >/tmp/notools.txt 2>&1
+run cat /tmp/notools.txt
+contains "a session opened --no-tools refuses them" /tmp/notools.txt 'opened without tool calling'
+contains "and says it cannot be widened" /tmp/notools.txt 'cannot be widened'
+check "while the same session still generates plain text" \
+  runas alice aidctl generate --no-tools --max-tokens 8 "just text please"
+note "The capability and the session are different questions: one is what this"
+note "identity is permitted, the other is what this descriptor was opened as."
+
+note "Narrowing can only take away. Asking for more than policy allows gets"
+note "what policy allows, silently — which is why this needs no permission"
+note "check: asking for less than you hold requires no authority."
+runas eve aidctl generate --narrow-rate 100000000 --max-tokens 600 \
+  "may I have more than my rule permits" >/tmp/widen.txt 2>&1
+run cat /tmp/widen.txt
+contains "a request to widen the rate changes nothing" /tmp/widen.txt 'rate-limited'
+note "eve's rule is 100 a minute. She asked for a hundred million and is still"
+note "refused at a hundred."
+
+note "And narrowing downward is enforced, on an identity with room to spare."
+runas alice aidctl generate --narrow-rate 1 --max-tokens 600 \
+  "one token a minute, please" >/tmp/narrow.txt 2>&1
+run cat /tmp/narrow.txt
+contains "a session narrowed below its own request is refused" /tmp/narrow.txt 'rate-limited'
+check "while alice's ordinary sessions are unaffected" \
+  runas alice aidctl generate --max-tokens 8 "still fine"
+note "That last check matters: narrowing is per session, not a change to the"
+note "identity. A supervisor cannot pin its own policy down by accident."
+
+# ---------------------------------------------------------------------------
+section "25. A program with inference and nothing else"
+# ---------------------------------------------------------------------------
+note "The claim the whole project rests on, in one command: an application"
+note "needs no provider credential and no route to the internet in order to"
+note "think. ai-run takes the network away and leaves the socket."
+
+check "ai-run is on PATH, unlike the private helpers" test -x /usr/bin/ai-run
+run ai-run --help
+
+note "STOPS HERE, and the reason is the container rather than the code."
+note ""
+note "ai-run unshares CLONE_NEWUSER|CLONE_NEWNET to get a network namespace"
+note "without privilege — the standard unprivileged path, and what bwrap and"
+note "friends use. A docker build step has neither CAP_SYS_ADMIN nor a seccomp"
+note "profile that permits unshare with CLONE_NEWUSER, so it cannot be done"
+note "here at all. Same family as the seccomp filter in section 8 and the"
+note "cgroup in section 17: environmental, named, and not routed around."
+ai-run -- true >/tmp/airun-refuse.txt 2>&1 || true
+run cat /tmp/airun-refuse.txt
+
+note "What the box can prove is the half that matters most for trusting it:"
+note "that it fails closed. A program that believes it is sandboxed and is not"
+note "is worse than one that did not start."
+refute "it refuses rather than running the program unconfined" ai-run -- true
+contains "and says what it could not do" /tmp/airun-refuse.txt 'could not take away the network'
+contains "and where to look" /tmp/airun-refuse.txt 'unprivileged_userns_clone|max_user_namespaces'
+contains "and that --keep-network is how you say you meant it" /tmp/airun-refuse.txt 'keep-network'
+note "The program never ran. That is the property worth having under a"
+note "kernel that will not do what was asked."
+
+note "With --keep-network the program runs and the socket is reachable, which"
+note "is the same wiring the confined path uses minus the namespace — so the"
+note "plumbing is exercised even where the confinement cannot be."
+note "As alice, not root: SO_PEERCRED means the caller on the socket is now"
+note "really the caller, and root is deliberately outside the ai gate. This"
+note "check ran as root once and the daemon refused it — which is the gate"
+note "doing its job on an identity that used to be invisible."
+runas alice ai-run --keep-network -- sh -c 'curl -sS --max-time 60 --unix-socket "$AI_DAEMON_SHIM_SOCKET" \
+  http://localhost/v1/chat/completions -H "Content-Type: application/json" \
+  -d "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":\"through ai-run\"}]}"' \
+  >/tmp/airun-inference.txt 2>&1
+run cat /tmp/airun-inference.txt
+contains "a program run under ai-run reaches the daemon over the socket" \
+  /tmp/airun-inference.txt '"object":"chat.completion"'
+check "and is told where that socket is rather than having to know" \
+  bash -c "ai-run --keep-network -- sh -c 'test -n \"\$AI_DAEMON_SHIM_SOCKET\"'"
+check "and the base URL to use with it" \
+  bash -c "ai-run --keep-network -- sh -c 'test -n \"\$AI_DAEMON_SHIM_URL\"'"
+
+note "It checks the socket exists before unsharing, because inside there is no"
+note "way to fix it and the failure would look like the program's."
+refute "a missing socket is refused before anything is taken away" \
+  ai-run --socket /tmp/no-such-socket -- true
+run cat /tmp/check.out
+
+note "What is NOT shown here, stated rather than implied: that the namespace"
+note "actually has no route off the machine. On a kernel that permits"
+note "unprivileged user namespaces the child gets one interface, down, and"
+note "'curl https://api.anthropic.com' fails while the socket works — that is"
+note "the demo, and it needs a machine, not this box."
+check "the help says what it does not do, so nobody reads it as a container" \
+  bash -c "ai-run --help | grep -q 'not a container'"
+check "and that it cannot stop a program acting on what a model says" \
+  bash -c "ai-run --help | grep -q 'acting badly'"
+
+# ---------------------------------------------------------------------------
 printf '\n\033[1m=== Result ===\033[0m\n'
 printf '  %d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

@@ -70,6 +70,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-run"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "ai-daemon-proto"
 version = "0.1.0"
 dependencies = [

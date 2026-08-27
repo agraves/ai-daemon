@@ -82,6 +82,16 @@ encoded bytes handed to `ai-daemon-decode`: one child per attachment, seccomp
 confined to read, write, memory and exit. A decoder crash costs one
 attachment.
 
+**Can be handed over, narrowed.** A session is a file descriptor, and it can
+be opened with less than the caller holds — no tools, a lower rate, a subset of
+models, a prelude the far end cannot remove. So a supervisor can open one, pass
+it to a sandboxed child, and know the child has strictly less than it does.
+`ai-run` is that in one command: the program runs in a network namespace with
+no route off the machine and reaches the daemon through a Unix socket, which is
+why the shim has one — a port does not survive a namespace, a filesystem object
+does. What that removes is the credential and the egress; it does not stop a
+program acting badly on what a model says, and it is not a container.
+
 **Never executes anything.** Tool schemas are compiled into a decoding grammar
 so tool calls are well-formed by construction, and the daemon emits a
 `tool_call` frame — inert data. The client executes it. Prompt-injection
@@ -174,6 +184,7 @@ text" is the easy half and the refusals are the point.
 | `crates/ai-daemon-fetch` | the download helper, and the only thing here with a network |
 | `crates/ai-daemon-decode` | the confined media decoder |
 | `crates/ai-daemon-shim` | OpenAI- and Anthropic-compatible localhost endpoint, off by default |
+| `crates/ai-run` | run a program with inference and nothing else: no network, no credential |
 | `crates/aidctl` | administration and inspection |
 | `packaging/` | PKGBUILD, systemd units, D-Bus and polkit policy, the verification run |
 | `docs/protocol.md` | the wire protocols in full |

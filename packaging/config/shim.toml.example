@@ -4,13 +4,16 @@
 # it the shim still works and every HTTP caller shares one identity, which is
 # how it behaved before this file existed.
 #
-# Why it exists: the shim listens on loopback TCP, and a TCP socket carries no
-# SO_PEERCRED — the kernel will not say which process is at the other end. So
-# the shim cannot tell one client from another by asking, and before this every
-# editor, agent and script on the machine reached the daemon as the same
-# identity: one grant, one rate limit, one revocation for all of them. On a box
-# running several agents that is the difference between per-agent policy and
-# none at all.
+# Why it exists: on loopback TCP the kernel will not say which process is at
+# the other end, so the shim cannot tell one client from another by asking, and
+# every editor, agent and script reaches the daemon as the same identity — one
+# grant, one rate limit, one revocation for all of them.
+#
+# On the unix socket (/run/ai-daemon-shim/shim.sock) SO_PEERCRED *does* answer,
+# so a caller there is identified by the kernel with no secret to share. A
+# token is still useful there — a name beats a pid in a grant table, and it is
+# how you say "this one is the CI runner" — but it is no longer the only thing
+# standing between your agents and one shared identity.
 #
 # What it is not: peer credentials. A token is a shared secret in a file, and
 # any local process that can read this file can present the token in it. What

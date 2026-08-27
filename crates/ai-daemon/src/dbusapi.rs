@@ -29,7 +29,7 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use crate::identity::{Class, Identity};
 use crate::install;
-use crate::policy::{Decision, CAP_MODEL_ADMIN};
+use crate::policy::{Decision, CAP_MODEL_ADMIN, Limits};
 use crate::registry::Store;
 use crate::sched;
 use crate::session;
@@ -73,6 +73,99 @@ pub(crate) fn is_trusted_introducer(allowed: &[String], unit: Option<&str>, exe:
             && (unit.is_some_and(|unit| matches(unit, name))
                 || exe.is_some_and(|exe| matches(exe, name)))
     })
+}
+
+/// Narrow a caller's own limits to what it asked for, never past them.
+///
+/// This is what makes a session fd a *delegable* capability rather than just
+/// a handle. §5's model is a supervisor opening a session under narrow policy
+/// and passing the fd into a sandboxed child over `SCM_RIGHTS` — "the child
+/// can think and can do nothing else" — and that is only safe if the
+/// supervisor can hand over strictly less than it holds. Without attenuation
+/// a session carries the *caller's* full allowance, so handing the fd to a
+/// child hands the child everything the parent had, and `ai-run --no-tools`
+/// would be a suggestion rather than a fact.
+///
+/// Every field here can only take away. The `min`s and the `&&` are the whole
+/// mechanism, and they are why this can be exposed to any caller without a
+/// permission check: asking for less than you are allowed needs no authority,
+/// and asking for more silently gets you what you were already allowed.
+///
+/// Enforced for the life of the fd, not the request: the limits land on the
+/// `Session`, which every turn reads. A child cannot widen them later because
+/// there is no method that widens them at all.
+fn attenuate(mut limits: Limits, options: &HashMap<String, OwnedValue>) -> Limits {
+    if let Some(v) = options.get("max_tokens_per_minute").and_then(|v| u64::try_from(v.clone()).ok())
+    {
+        if v < limits.tokens_per_minute {
+            // Recorded rather than just lowered. The identity's bucket is
+            // shared by all of its sessions and already exists, so writing a
+            // smaller number here would narrow nothing — the session needs a
+            // bucket of its own, and this is what tells the worker to build
+            // one.
+            limits.session_rate = Some(v);
+            limits.tokens_per_minute = v;
+        }
+    }
+    if let Some(v) = options.get("max_sessions").and_then(|v| u32::try_from(v.clone()).ok()) {
+        limits.max_sessions = limits.max_sessions.min(v);
+    }
+    if let Some(v) = options.get("daily_spend").and_then(|v| f64::try_from(v.clone()).ok()) {
+        let asked = crate::policy::to_micros(v);
+        // Zero means "no ceiling" everywhere else, so a caller asking for zero
+        // is asking for no ceiling — which is a widening and is ignored. A
+        // caller that genuinely wants to spend nothing asks for a very small
+        // number, and gets refused on its first priced request.
+        if asked > 0 {
+            limits.daily_spend_micros = if limits.daily_spend_micros == 0 {
+                asked
+            } else {
+                limits.daily_spend_micros.min(asked)
+            };
+        }
+    }
+    if options
+        .get("no_tools")
+        .and_then(|v| bool::try_from(v.clone()).ok())
+        .unwrap_or(false)
+    {
+        limits.no_tools = true;
+    }
+    if let Some(models) = options
+        .get("allowed_models")
+        .and_then(|v| Vec::<String>::try_from(v.clone()).ok())
+    {
+        // The intersection, and `*` on either side means "whatever the other
+        // one says". A caller cannot add a model it was not already permitted.
+        limits.allowed_models = if limits.allowed_models.iter().any(|m| m == "*") {
+            models
+        } else {
+            models
+                .into_iter()
+                .filter(|m| m == "*" || limits.allowed_models.iter().any(|a| a == m))
+                .collect()
+        };
+    }
+    if let Some(text) = options.get("prelude").and_then(|v| String::try_from(v.clone()).ok()) {
+        // Appended, not replaced. A caller may add an instruction the child
+        // cannot remove; it may not delete one the administrator wrote.
+        if !text.trim().is_empty() {
+            if limits.prelude.trim().is_empty() {
+                limits.prelude = text;
+            } else {
+                limits.prelude = format!("{}\n{}", limits.prelude, text);
+            }
+        }
+    }
+    if options
+        .get("mark_provenance")
+        .and_then(|v| bool::try_from(v.clone()).ok())
+        .unwrap_or(false)
+    {
+        // Only ever on: turning marking off is a widening.
+        limits.mark_provenance = true;
+    }
+    limits
 }
 
 #[interface(name = "io.github.agraves.AIDaemon1.Manager")]
@@ -166,6 +259,11 @@ impl Manager {
             session: None,
             armed: true,
         };
+
+        // Narrowed to what the caller asked for, before anything is opened.
+        // Everything downstream reads the session's limits, so this is the one
+        // place that decides what the fd is worth for the rest of its life.
+        let limits = attenuate(limits, &options);
 
         let class = options
             .get("priority")
@@ -674,6 +772,14 @@ impl Manager {
                 .and_then(|v| u32::try_from(v.clone()).ok())
                 .unwrap_or(identity.uid);
             identity = Identity::from_pid_uid(pid as i32, peer_uid, peer_uid, Class::Shim);
+            // Whether the kernel named that peer, or the shim is describing
+            // itself because loopback TCP would not say. Recorded rather than
+            // inferred: the two produce identical-looking pids and only the
+            // shim knows which it sent.
+            identity.attested = options
+                .get("shim_peer_attested")
+                .and_then(|v| bool::try_from(v.clone()).ok())
+                .unwrap_or(false);
             // A name the shim vouched for, from a token its caller presented.
             //
             // Taken only from the shim, checked above, and never from the
@@ -1011,6 +1117,7 @@ mod tests {
             app_id: None,
             exe: Some("test".into()),
             client: None,
+            attested: false,
         }
     }
 
@@ -1022,6 +1129,8 @@ mod tests {
             daily_spend_micros: 0,
             prelude: String::new(),
             mark_provenance: false,
+            no_tools: false,
+            session_rate: None,
             allowed_models: vec!["*".into()],
         }
     }

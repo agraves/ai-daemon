@@ -6,7 +6,7 @@
 # HTTP parser reading from anything on the machine.
 
 [Unit]
-Description=OpenAI-compatible endpoint for ai-daemon (loopback only)
+Description=OpenAI- and Anthropic-compatible endpoint for ai-daemon (loopback and a socket)
 Documentation=https://github.com/agraves/ai-daemon
 After=ai-daemon.service
 Wants=ai-daemon.service
@@ -19,11 +19,25 @@ RestartSec=2
 User=ai-daemon-shim
 Group=ai-daemon-shim
 DynamicUser=no
-# It must talk to the daemon, so it needs the outer gate too.
+# It must talk to the daemon, so it needs the outer gate too. It also puts the
+# socket in that group, so the same answer applies at the filesystem as the
+# daemon would give at the door.
 SupplementaryGroups=ai
+
+# Its own runtime directory, and not the daemon's. /run/ai-daemon holds every
+# live session's socket, and a uid that can create files there can unlink
+# them — which is not a capability to hand the process that accepts arbitrary
+# HTTP from anything on the machine. 0755 so a confined application can reach
+# the socket inside; the socket itself is 0660, group ai.
+RuntimeDirectory=ai-daemon-shim
+RuntimeDirectoryMode=0755
 
 # It needs a network — a loopback one. The binary refuses to bind anything
 # other than 127.0.0.1; this is the second lock on the same door.
+#
+# The unix socket needs none of this and is the point: an application in a
+# namespace with no interfaces cannot reach 127.0.0.1 either, so the socket is
+# the only door left for something genuinely confined.
 IPAddressAllow=localhost
 IPAddressDeny=any
 RestrictAddressFamilies=AF_UNIX AF_INET

@@ -70,6 +70,9 @@ package() {
   install -Dm755 target/release/ai-daemon      "$pkgdir/usr/bin/ai-daemon"
   install -Dm755 target/release/aidctl         "$pkgdir/usr/bin/aidctl"
   install -Dm755 target/release/ai-daemon-shim "$pkgdir/usr/bin/ai-daemon-shim"
+  # On PATH, unlike the other helpers: this one is meant to be typed, and the
+  # whole argument is that confining an application should be one command.
+  install -Dm755 target/release/ai-run         "$pkgdir/usr/bin/ai-run"
 
   # Private helpers. Not on $PATH, because they are not commands: one has a
   # network and no prompts, the other parses hostile bytes in a cage, and

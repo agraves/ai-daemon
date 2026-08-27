@@ -13,6 +13,7 @@ members = [
     "crates/ai-daemon-backend-llamacpp",
     "crates/ai-daemon-backend-remote",
     "crates/ai-daemon-portal",
+    "crates/ai-run",
     "crates/ai-daemon-fetch",
     "crates/ai-daemon-decode",
     "crates/ai-daemon-shim",

@@ -341,6 +341,9 @@ chmod 0640 /etc/ai-daemon/shim.toml
 chgrp ai-daemon-shim /etc/ai-daemon/shim.toml
 
 log "starting the shim (off by default on a real install; on here to test it)"
+# RuntimeDirectory= in the unit; by hand here, with the mode systemd gives it.
+# 0755 so a confined caller can traverse to the socket, which is 0660 itself.
+install -d -m 0755 -o ai-daemon-shim -g ai-daemon-shim /run/ai-daemon-shim
 setpriv --reuid ai-daemon-shim --regid ai-daemon-shim --init-groups --inh-caps=-all \
   -- /usr/bin/ai-daemon-shim >/tmp/shim.log 2>&1 &
 sleep 1

@@ -102,6 +102,16 @@ software:
       itself cannot choose. Refuses callers it cannot identify rather than
       lending them its own.
 
+  - name: ai-run
+    path: crates/ai-run
+    type: cli
+    language: rust
+    description: >
+      Runs a program with inference and nothing else: a network namespace
+      containing only a downed loopback, and the shim's Unix socket left
+      reachable. The credential and the egress are what it removes; it is one
+      capability taken away rather than a container, and says so.
+
   - name: aidctl
     path: crates/aidctl
     type: cli

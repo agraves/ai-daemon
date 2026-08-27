@@ -29,8 +29,10 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -48,17 +50,25 @@ const SESSION_IFACE: &str = "io.github.agraves.AIDaemon1.Session";
 /// already configured to talk to.
 const DEFAULT_PORT: u16 = 11_434;
 const DEFAULT_CONFIG: &str = "/etc/ai-daemon/shim.toml";
+/// Its own runtime directory, not the daemon's. /run/ai-daemon holds the live
+/// session sockets, and a uid that can create files there can unlink them —
+/// which is not something to hand the process that accepts arbitrary HTTP.
+const DEFAULT_SOCKET: &str = "/run/ai-daemon-shim/shim.sock";
 const MAX_BODY: usize = 32 * 1024 * 1024;
 
 fn main() {
     let mut port = DEFAULT_PORT;
     let mut config_path = std::path::PathBuf::from(DEFAULT_CONFIG);
+    let mut socket_path = std::path::PathBuf::from(DEFAULT_SOCKET);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--port" => port = args.next().and_then(|v| v.parse().ok()).unwrap_or(port),
             "--config" => {
                 config_path = args.next().map(std::path::PathBuf::from).unwrap_or(config_path)
+            }
+            "--socket" => {
+                socket_path = args.next().map(std::path::PathBuf::from).unwrap_or(socket_path)
             }
             "--version" | "-V" => {
                 println!("ai-daemon-shim {}", env!("CARGO_PKG_VERSION"));
@@ -70,7 +80,14 @@ fn main() {
 
 usage: ai-daemon-shim [--port N]   (default {DEFAULT_PORT}, always on 127.0.0.1)
 
-usage: ai-daemon-shim [--port N] [--config {DEFAULT_CONFIG}]
+usage: ai-daemon-shim [--port N] [--config PATH] [--socket PATH]
+
+Listens on 127.0.0.1:{DEFAULT_PORT} and on {DEFAULT_SOCKET}. The socket is
+what a process with no network can still reach: put an application in a
+namespace with no interfaces and loopback goes with everything else, so
+without it a confined process and inference are mutually exclusive. It is
+also where SO_PEERCRED answers, so a caller there is identified by the
+kernel rather than by a shared token. --port 0 serves only the socket.
 
 OpenAI:    GET /v1/models, POST /v1/chat/completions, POST /v1/responses,
            POST /v1/embeddings
@@ -94,29 +111,239 @@ credentials. Off by default; enable with
     }
 
     let config = Arc::new(ShimConfig::load(&config_path));
+    let served = Arc::new(AtomicU64::new(0));
 
-    // Not configurable, and that is the feature.
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let listener = match TcpListener::bind(address) {
-        Ok(listener) => listener,
+    // Two listeners, and the second is the one that matters for confinement.
+    //
+    // The TCP port is what every existing client is configured for and it does
+    // not move. The Unix socket is what a process with no network can still
+    // reach — put an application in a namespace with no interfaces and
+    // 127.0.0.1 goes away with everything else, so without this "confined" and
+    // "can do inference" were mutually exclusive.
+    //
+    // Either may be absent without the other failing: a machine that wants
+    // only the socket passes `--port 0`, and a machine whose runtime directory
+    // does not exist still serves TCP. Refusing to start because one of two
+    // doors is stuck would be worse than serving through the other.
+    let mut listening = Vec::new();
+
+    if port != 0 {
+        // Not configurable beyond the port, and that is the feature.
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        match TcpListener::bind(address) {
+            Ok(listener) => {
+                listening.push(format!("{address}"));
+                let served = served.clone();
+                let config = config.clone();
+                std::thread::spawn(move || accept_tcp(listener, served, config));
+            }
+            Err(e) => {
+                eprintln!("<3>ai-daemon-shim: cannot bind {address}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    match bind_unix(&socket_path) {
+        Ok(Some(listener)) => {
+            listening.push(socket_path.display().to_string());
+            let served = served.clone();
+            let config = config.clone();
+            std::thread::spawn(move || accept_unix(listener, served, config));
+        }
+        Ok(None) => {}
         Err(e) => {
-            eprintln!("<3>ai-daemon-shim: cannot bind {address}: {e}");
+            eprintln!("<3>ai-daemon-shim: cannot bind {}: {e}", socket_path.display());
             std::process::exit(1);
         }
-    };
-    eprintln!("<6>ai-daemon-shim {} listening on {address}", env!("CARGO_PKG_VERSION"));
+    }
 
-    let served = Arc::new(AtomicU64::new(0));
+    if listening.is_empty() {
+        eprintln!("<3>ai-daemon-shim: nothing to listen on; --port 0 and no usable socket path");
+        std::process::exit(1);
+    }
+    eprintln!(
+        "<6>ai-daemon-shim {} listening on {}",
+        env!("CARGO_PKG_VERSION"),
+        listening.join(", ")
+    );
+
+    // The accept loops own the work; this thread only has to not exit.
+    loop {
+        std::thread::park();
+    }
+}
+
+fn accept_tcp(listener: TcpListener, served: Arc<AtomicU64>, config: Arc<ShimConfig>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let served = served.clone();
-        let config = config.clone();
-        std::thread::spawn(move || {
-            let n = served.fetch_add(1, Ordering::Relaxed);
-            if let Err(e) = serve(stream, &config) {
-                eprintln!("<4>ai-daemon-shim: request {n} failed: {e}");
-            }
-        });
+        spawn_served(Conn::Tcp(stream), served.clone(), config.clone());
+    }
+}
+
+fn accept_unix(listener: UnixListener, served: Arc<AtomicU64>, config: Arc<ShimConfig>) {
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        spawn_served(Conn::Unix(stream), served.clone(), config.clone());
+    }
+}
+
+fn spawn_served(conn: Conn, served: Arc<AtomicU64>, config: Arc<ShimConfig>) {
+    std::thread::spawn(move || {
+        let n = served.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = serve(conn, &config) {
+            eprintln!("<4>ai-daemon-shim: request {n} failed: {e}");
+        }
+    });
+}
+
+/// Bind the Unix socket, or say why there isn't one.
+///
+/// `Ok(None)` rather than an error when the parent directory is missing: on a
+/// machine without the runtime directory — a container, a development run —
+/// the socket is simply not offered, and refusing to start over it would take
+/// the TCP port down with it.
+///
+/// A stale socket from a killed process is removed first. That is safe because
+/// the path is in a runtime directory this unit owns; it is not a general
+/// "delete whatever is in the way".
+fn bind_unix(path: &std::path::Path) -> std::io::Result<Option<UnixListener>> {
+    let Some(parent) = path.parent() else { return Ok(None) };
+    if !parent.is_dir() {
+        eprintln!(
+            "<5>ai-daemon-shim: {} does not exist, so no unix socket — confined callers will \
+             have nothing to reach",
+            parent.display()
+        );
+        return Ok(None);
+    }
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+    let listener = UnixListener::bind(path)?;
+
+    // 0660, group `ai`.
+    //
+    // Tighter than the TCP port on purpose. `ai` is the documented outer gate
+    // — which *humans* may use the machine's inference at all — and the daemon
+    // enforces it either way, so this is defence in depth rather than the
+    // check itself. But a socket is a filesystem object and a filesystem
+    // object should carry the same answer the daemon would give, rather than
+    // being open to everyone and relying on a refusal further in.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    if let Some(gid) = group_id("ai") {
+        // SAFETY: a path we just created, and a gid from the passwd database.
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) } != 0 {
+            // Not fatal: the socket still exists and the daemon still gates.
+            // Worth a line, because the mode is now 0660 against the shim's
+            // own group and other members of `ai` cannot reach it.
+            eprintln!(
+                "<4>ai-daemon-shim: could not set the socket's group to ai ({}); only {}'s \
+                 group can connect",
+                std::io::Error::last_os_error(),
+                path.display()
+            );
+        }
+    }
+    Ok(Some(listener))
+}
+
+/// The gid for a group name, or nothing if this machine has no such group.
+fn group_id(name: &str) -> Option<u32> {
+    let text = std::fs::read_to_string("/etc/group").ok()?;
+    for line in text.lines() {
+        let mut fields = line.split(':');
+        if fields.next()? == name {
+            let _password = fields.next()?;
+            return fields.next()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// A client connection, however it arrived.
+///
+/// The shim has always listened on loopback TCP, which is what every existing
+/// client is configured for. It now also listens on a Unix socket, and the
+/// second one is not a convenience — it is what makes confinement possible at
+/// all.
+///
+/// Two reasons, and the first is the one that motivated this:
+///
+/// * **A network-less process can still reach it.** Loopback *is* network: put
+///   an application in a namespace with no interfaces and it can no longer
+///   talk to `127.0.0.1:11434` either, so "confined" and "can do inference"
+///   were mutually exclusive. A Unix socket can be handed into a namespace
+///   that has nothing else, which is the whole point of the exercise — an app
+///   with no route off the machine, no credential, and inference anyway.
+///
+/// * **`SO_PEERCRED` answers here.** On TCP the kernel will not say who is
+///   calling, which is why the token table exists: a shared secret in a file,
+///   telling cooperating clients apart and defending against nobody. On a Unix
+///   socket the kernel names the peer's pid and uid, unforgeably and with no
+///   secret to leak. That is a real identity rather than a stand-in for one.
+enum Conn {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+impl Conn {
+    fn try_clone(&self) -> std::io::Result<Conn> {
+        match self {
+            Conn::Tcp(s) => s.try_clone().map(Conn::Tcp),
+            Conn::Unix(s) => s.try_clone().map(Conn::Unix),
+        }
+    }
+
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Conn::Tcp(s) => s.as_raw_fd(),
+            Conn::Unix(s) => s.as_raw_fd(),
+        }
+    }
+
+    /// Who is on the other end, as far as the kernel will say.
+    ///
+    /// On a Unix socket that is the truth. On TCP it is nothing, and rather
+    /// than pretend, this reports the shim itself and lets the token table be
+    /// the only thing that distinguishes those callers — which is what has
+    /// always happened, now said out loud instead of hidden in a fallback.
+    fn peer(&self) -> Peer {
+        match self {
+            Conn::Unix(_) => peer_cred(self.as_raw_fd()),
+            Conn::Tcp(_) => Peer {
+                pid: std::process::id(),
+                uid: unsafe { libc::getuid() },
+                client: None,
+                attested: false,
+            },
+        }
+    }
+}
+
+impl std::io::Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Tcp(s) => s.read(buf),
+            Conn::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl std::io::Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Tcp(s) => s.write(buf),
+            Conn::Unix(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Conn::Tcp(s) => s.flush(),
+            Conn::Unix(s) => s.flush(),
+        }
     }
 }
 
@@ -262,9 +489,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn serve(mut stream: TcpStream, config: &ShimConfig) -> Result<(), String> {
-    let mut peer = peer_cred(stream.as_raw_fd())?;
+fn serve(mut stream: Conn, config: &ShimConfig) -> Result<(), String> {
+    let mut peer = stream.peer();
     let request = read_request(&mut stream)?;
+    // A token still names a caller and still wins where one is presented: an
+    // administrator naming their agents is a deliberate act, and a name is
+    // more useful in a grant table than a pid. Peer credentials are what a
+    // caller who presented nothing gets now, instead of the shim's own uid.
     peer.client = config.name_for(request.token.as_deref());
 
     // Anthropic's shape for its own routes, OpenAI's for the rest: a client
@@ -320,7 +551,7 @@ fn route_path(target: &str) -> &str {
     target.split('?').next().unwrap_or(target)
 }
 
-fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
+fn read_request(stream: &mut Conn) -> Result<HttpRequest, String> {
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let mut line = String::new();
     reader.read_line(&mut line).map_err(|e| e.to_string())?;
@@ -380,7 +611,7 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     Ok(HttpRequest { method, path, body, token })
 }
 
-fn respond(stream: &mut TcpStream, status: u16, body: &serde_json::Value) -> Result<(), String> {
+fn respond(stream: &mut Conn, status: u16, body: &serde_json::Value) -> Result<(), String> {
     let text = body.to_string();
     write!(
         stream,
@@ -416,15 +647,24 @@ struct Peer {
     uid: u32,
     /// The configured name for the token this caller presented, if any.
     client: Option<String>,
+    /// Did the kernel vouch for `pid` and `uid`, or is this process
+    /// describing itself?
+    ///
+    /// True only on a Unix socket, where SO_PEERCRED answers. It decides
+    /// whether the shim tells the daemon anything about the caller at all: a
+    /// pid the shim invented is worse than no pid, because the daemon would
+    /// read it as an attested peer and key a grant on it.
+    attested: bool,
 }
 
-fn peer_cred(fd: RawFd) -> Result<Peer, String> {
-    // A loopback TCP socket has no SO_PEERCRED, so on the listener this shim
-    // actually has, this *always* falls through to naming ourselves — every
-    // caller arrived as the same identity and shared one grant, one rate
-    // limit and one revocation. That is what the token table above is for.
-    // The call is kept because it costs nothing and is correct the day this
-    // learns to listen on a Unix socket, where the kernel does answer.
+/// Ask the kernel who is on the other end of a Unix socket.
+///
+/// This is the day the comment above used to look forward to. On a Unix socket
+/// `SO_PEERCRED` answers with the peer's pid and uid, which the caller cannot
+/// forge and no secret has to be shared to establish — a real identity rather
+/// than a stand-in for one. TCP callers never reach here; `Conn::peer` handles
+/// them, because on TCP there is nothing to ask.
+fn peer_cred(fd: RawFd) -> Peer {
     let mut ucred = libc::ucred { pid: 0, uid: 0, gid: 0 };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: correctly sized output for SO_PEERCRED on a socket we own.
@@ -438,15 +678,19 @@ fn peer_cred(fd: RawFd) -> Result<Peer, String> {
         )
     };
     if rc != 0 || ucred.pid == 0 {
-        // Fall back to naming ourselves. The daemon then sees "the shim" as
-        // the identity, which is honest: we could not tell it anything better.
-        return Ok(Peer {
+        // A Unix socket that will not name its peer is a kernel that has
+        // changed under us. Fail to the weaker answer rather than guess, and
+        // say so: `attested` false means the daemon should not treat this as
+        // more than the shim speaking for itself.
+        eprintln!("<4>ai-daemon-shim: SO_PEERCRED failed on a unix socket; treating the caller as unattested");
+        return Peer {
             pid: std::process::id(),
             uid: unsafe { libc::getuid() },
             client: None,
-        });
+            attested: false,
+        };
     }
-    Ok(Peer { pid: ucred.pid as u32, uid: ucred.uid, client: None })
+    Peer { pid: ucred.pid as u32, uid: ucred.uid, client: None, attested: true }
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +718,17 @@ impl Session {
 fn open_session(model: &str, peer: &Peer, background: bool) -> Result<Session, String> {
     let connection = Connection::system().map_err(|e| format!("system bus: {e}"))?;
     let mut options: HashMap<String, OwnedValue> = HashMap::new();
+    // Always sent, because this pair is also the marker that says *the shim is
+    // speaking* — without it the daemon has no way to know, and classes the
+    // session `native` on the shim's own unit, losing the lowest-trust marking
+    // that the whole class exists for. Dropping it on the unattested path was
+    // tried and did exactly that.
+    //
+    // What travels separately is whether the kernel vouched for the pair.
+    // Unattested, they are the shim describing itself, which is the truthful
+    // answer to "who is calling" when the answer is "we cannot tell" — and it
+    // is what the audit log has always recorded. Attested, they are the peer,
+    // and the daemon may key a grant on them.
     options.insert(
         "shim_peer_pid".into(),
         Value::U32(peer.pid).try_into().map_err(|_| "peer pid")?,
@@ -481,6 +736,10 @@ fn open_session(model: &str, peer: &Peer, background: bool) -> Result<Session, S
     options.insert(
         "shim_peer_uid".into(),
         Value::U32(peer.uid).try_into().map_err(|_| "peer uid")?,
+    );
+    options.insert(
+        "shim_peer_attested".into(),
+        Value::Bool(peer.attested).try_into().map_err(|_| "attested")?,
     );
     if let Some(name) = &peer.client {
         options.insert(
@@ -562,7 +821,7 @@ fn list_models() -> Result<serde_json::Value, String> {
 // ---------------------------------------------------------------------------
 
 fn chat(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     request: &HttpRequest,
     peer: &Peer,
     config: &ShimConfig,
@@ -734,7 +993,7 @@ fn chat(
 }
 
 fn relay_sse(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     reader: &mut impl Read,
     model: &str,
 ) -> Result<(), String> {
@@ -823,7 +1082,7 @@ fn relay_sse(
 /// first attempt to notice a vanished client would otherwise be the response
 /// nobody is there to read, by which point the daemon has generated the whole
 /// thing and held a decode slot to do it.
-fn peer_hung_up(stream: &TcpStream) -> bool {
+fn peer_hung_up(stream: &Conn) -> bool {
     let mut pollfd = libc::pollfd {
         fd: stream.as_raw_fd(),
         events: libc::POLLRDHUP,
@@ -835,7 +1094,7 @@ fn peer_hung_up(stream: &TcpStream) -> bool {
 }
 
 fn relay_json(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     reader: &mut impl Read,
     daemon: &mut UnixStream,
     model: &str,
@@ -1248,7 +1507,7 @@ fn parse_messages_body(
 }
 
 fn messages(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     request: &HttpRequest,
     peer: &Peer,
     config: &ShimConfig,
@@ -1323,7 +1582,7 @@ fn anthropic_stop_reason(finish: Option<&str>, tool_used: bool) -> &'static str 
 }
 
 fn relay_anthropic_json(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     reader: &mut impl Read,
     daemon: &mut UnixStream,
     model: &str,
@@ -1425,7 +1684,7 @@ fn tool_use_block(call: &ai_daemon_proto::frame::ToolCall) -> serde_json::Value 
 /// path out of here — including an error mid-stream — closes the blocks it
 /// opened and sends `message_stop`.
 fn relay_anthropic_sse(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     reader: &mut impl Read,
     model: &str,
 ) -> Result<(), String> {
@@ -1437,7 +1696,7 @@ fn relay_anthropic_sse(
     stream.flush().map_err(|e| e.to_string())?;
 
     let id = format!("msg_{}", std::process::id());
-    let send = |stream: &mut TcpStream, event: &str, data: serde_json::Value| -> Result<(), String> {
+    let send = |stream: &mut Conn, event: &str, data: serde_json::Value| -> Result<(), String> {
         write!(stream, "event: {event}\ndata: {data}\n\n").map_err(|e| e.to_string())?;
         stream.flush().map_err(|e| e.to_string())
     };
@@ -1549,10 +1808,10 @@ fn relay_anthropic_sse(
     send(stream, "message_stop", serde_json::json!({"type": "message_stop"}))
 }
 
-type Send = dyn Fn(&mut TcpStream, &str, serde_json::Value) -> Result<(), String>;
+type Send = dyn Fn(&mut Conn, &str, serde_json::Value) -> Result<(), String>;
 
 fn close_text_block(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     send: &Send,
     index: usize,
     open: &mut bool,
@@ -1570,7 +1829,7 @@ fn close_text_block(
 }
 
 fn stream_tool_use(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     send: &Send,
     index: usize,
     call: &ai_daemon_proto::frame::ToolCall,
@@ -1775,7 +2034,7 @@ fn parse_responses_body(body: &serde_json::Value) -> Result<ResponsesTurn, Strin
 }
 
 fn responses(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     request: &HttpRequest,
     peer: &Peer,
     config: &ShimConfig,
@@ -1863,7 +2122,7 @@ fn responses_envelope(
 }
 
 fn relay_responses_json(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     reader: &mut impl Read,
     daemon: &mut UnixStream,
     model: &str,
@@ -1924,7 +2183,7 @@ fn relay_responses_json(
 }
 
 fn relay_responses_sse(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     reader: &mut impl Read,
     model: &str,
 ) -> Result<(), String> {
@@ -1938,7 +2197,7 @@ fn relay_responses_sse(
     // Every Responses event carries a sequence number, and clients that track
     // ordering reject a stream without one.
     let mut seq = 0u64;
-    let mut send = |stream: &mut TcpStream, kind: &str, mut data: serde_json::Value| -> Result<(), String> {
+    let mut send = |stream: &mut Conn, kind: &str, mut data: serde_json::Value| -> Result<(), String> {
         if let Some(obj) = data.as_object_mut() {
             obj.insert("sequence_number".into(), serde_json::json!(seq));
         }

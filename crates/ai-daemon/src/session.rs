@@ -181,6 +181,8 @@ pub fn spawn(
                 return;
             }
 
+            // Read before the limits are moved into the worker.
+            let limits_for_budget = limits.clone();
             let mut worker = Worker {
                 daemon: daemon.clone(),
                 session: session.clone(),
@@ -193,6 +195,7 @@ pub fn spawn(
                 pending_tool_calls: Vec::new(),
                 proto: ai_daemon_proto::MIN_DATA_PROTO,
                 nonce: mint_nonce(),
+                budget: limits_for_budget.session_rate.map(crate::policy::SessionBudget::new),
             };
             worker.run(frames);
             worker.teardown();
@@ -340,6 +343,11 @@ struct Worker {
     /// supplied — the thing that makes a provenance marker a marker rather
     /// than a string a prompt can write for itself.
     nonce: String,
+    /// A rate this session was opened narrower than its identity, if it was.
+    ///
+    /// Dies with the worker, which is the point: it belongs to one descriptor,
+    /// not to whoever holds it.
+    budget: Option<crate::policy::SessionBudget>,
 }
 
 impl Worker {
@@ -859,6 +867,16 @@ impl Worker {
         // permits free text would silently defeat that.
         let mut effective_grammar = self.grammar.clone();
         if let Some(tools) = &self.tools {
+            // The session was opened without tools, whatever this identity is
+            // otherwise permitted. A supervisor handed this fd to a child on
+            // that basis, and no request on it can undo that.
+            if self.limits.no_tools {
+                self.send(&Event::error(
+                    "policy-denied",
+                    "this session was opened without tool calling and cannot be widened".to_string(),
+                ));
+                return;
+            }
             if !backend.can("tools") {
                 self.send(&Event::error(
                     "attachment-unsupported",
@@ -949,6 +967,23 @@ impl Worker {
         }
 
         let reserve = prompt_estimate + max_tokens;
+        // The session's own allowance first, where it has one. Both must pass:
+        // a narrowed child is bounded by what it was handed *and* still counts
+        // against its parent, or a supervisor could mint any number of
+        // children each individually under the limit.
+        if let Some(budget) = &self.budget {
+            if !budget.take(reserve) {
+                self.send(&Event::error(
+                    "rate-limited",
+                    format!(
+                        "this session was opened at {} tokens/minute and has spent them; \
+                         the identity's own allowance is untouched",
+                        self.limits.tokens_per_minute
+                    ),
+                ));
+                return;
+            }
+        }
         if !self
             .daemon
             .policy
@@ -1703,6 +1738,7 @@ mod tests {
                 app_id: None,
                 exe: Some("test".into()),
                 client: None,
+                attested: false,
             },
             model: "none".into(),
             digest: "sha256:0".into(),
@@ -1734,6 +1770,8 @@ mod tests {
                 daily_spend_micros: 0,
                 prelude: String::new(),
                 mark_provenance: false,
+                no_tools: false,
+                session_rate: None,
                 allowed_models: vec!["*".into()],
             },
         )

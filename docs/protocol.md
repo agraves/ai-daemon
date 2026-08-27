@@ -225,7 +225,7 @@ declared capability, so a client can find out before asking.
 
 ## The HTTP shim
 
-Two APIs on one loopback port, off by default:
+Two APIs, on a loopback port and a Unix socket, off by default:
 
 | | |
 |---|---|
@@ -246,13 +246,40 @@ Neither route ever fetches a URL a prompt named. OpenAI `image_url` takes
 `url` source is refused rather than followed: this process is the last place
 that should hold a server-side request forgery primitive.
 
+### The socket
+
+`/run/ai-daemon-shim/shim.sock`, alongside `127.0.0.1:11434`. It exists for
+two reasons and the first is the load-bearing one.
+
+**A process with no network can still reach it.** Loopback *is* network: an
+application in a namespace with no interfaces cannot reach `127.0.0.1` any
+more than it can reach the internet, so until there was a socket, "confined"
+and "can do inference" were mutually exclusive. A Unix socket can be handed
+into a namespace that holds nothing else — which is the point of the exercise:
+an application with no route off the machine, no credential, and inference
+anyway.
+
+**`SO_PEERCRED` answers there.** On TCP the kernel will not say who is calling,
+which is why the token table below exists. On the socket the kernel names the
+peer's pid and uid, unforgeably and with no secret to share.
+
+The socket is 0660, group `ai` — tighter than the TCP port on purpose. `ai` is
+the documented outer gate and the daemon enforces it either way; this is the
+filesystem carrying the same answer rather than being open to everyone and
+relying on a refusal further in. `--port 0` serves only the socket, which is
+what a machine that has finished migrating would run.
+
+The shim tells the daemon about a peer **only when the kernel vouched for it**.
+A pid invented on the TCP path would be read as an attested peer and keyed into
+the grant table wearing a caller's clothes, so on TCP it sends nothing and the
+caller is the shim — the same answer as before, now arrived at honestly rather
+than through a fallback that looked like a measurement.
+
 ### Naming the callers
 
-A loopback TCP socket has no `SO_PEERCRED` — the kernel will not say which
-process is at the other end — so every HTTP client reached the daemon as one
-identity, sharing one grant, one rate limit and one revocation. On a machine
-running several agents that is the difference between per-agent policy and
-none.
+A token still names a caller and still wins where one is presented: naming your
+agents is a deliberate act and a name is more useful in a grant table than a
+pid. It is what a TCP caller has instead of peer credentials.
 
 `/etc/ai-daemon/shim.toml` maps tokens to names. A caller presenting one in
 `Authorization: Bearer` or `x-api-key` is `shim:<name>`; one without a token
@@ -365,6 +392,63 @@ none is manufactured. Its manifest identifier reads `remote:<id>` rather than
 `sha256:…`, because the integrity of a remote model is the endpoint's promise
 rather than this machine's measurement, and a hash-shaped string would be a
 claim this daemon cannot honour.
+
+## Narrowing a session
+
+`CreateSession` options that can only take away. They exist for §5's model: a
+supervisor opens a session, passes the descriptor to a sandboxed child over
+`SCM_RIGHTS`, and the child can think and do nothing else. That is only safe if
+you can hand over strictly *less* than you hold — otherwise the fd carries the
+caller's whole allowance and delegating it delegates everything.
+
+| option | type | effect |
+|---|---|---|
+| `no_tools` | `b` | this session cannot make tool calls, whatever the identity is permitted |
+| `max_tokens_per_minute` | `t` | lower of this and policy |
+| `max_sessions` | `u` | lower of this and policy |
+| `daily_spend` | `d` | lower of this and policy; zero means "no ceiling" so it is ignored |
+| `allowed_models` | `as` | intersection with policy's list |
+| `prelude` | `s` | **appended** to policy's, never replacing it |
+| `mark_provenance` | `b` | only ever turns marking on |
+
+Every one is a `min`, an intersection or an "only on". That is why no
+permission check guards them: asking for less than you are allowed needs no
+authority, and asking for more silently gets you what you were already allowed.
+The limits land on the session, so there is no later request that widens them —
+there is no method that widens them at all.
+
+`no_tools` is deliberately separate from the `generate-tools` capability. One
+is what an identity is *permitted*; the other is what a descriptor was *opened
+as*. A supervisor whose own identity may use tools can still hand a child one
+that cannot.
+
+## ai-run
+
+```
+ai-run [--socket PATH] [--keep-network] -- PROGRAM [ARGS...]
+```
+
+Runs a program in a network namespace containing one interface that is down:
+no route off the machine, no DNS, nothing listening. The shim's Unix socket is
+left reachable, and the program is told where it is via
+`AI_DAEMON_SHIM_SOCKET`. Then it execs — nothing stays resident, nothing is
+proxied, nothing is held open.
+
+This is why the shim has a socket at all. A port does not survive a network
+namespace; a filesystem object does.
+
+It checks the socket exists *before* unsharing, because inside there is no way
+to fix it and the failure would look like the program's. If unprivileged user
+namespaces are unavailable it refuses rather than running unconfined — a
+program that believes it is sandboxed and is not is worse than one that did not
+start — and `--keep-network` is how you say you meant it.
+
+**What it removes is the credential and the egress.** It does not stop a
+program acting badly on what a model says: if it asks for text and then runs
+it, that is the program's bug and nothing at this layer can catch it. It is
+also not a container — filesystem, pids and everything else are untouched,
+deliberately. One capability taken away, not a sandbox pretending to be
+complete. Compose it with `systemd-run` or `bwrap` for the rest.
 
 ## Portal
 
