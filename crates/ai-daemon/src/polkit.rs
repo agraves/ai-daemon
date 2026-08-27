@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Asking the user, through the mechanism the desktop already has.
 //!
 //! polkit rather than a bespoke dialog because the answer to "may this app use

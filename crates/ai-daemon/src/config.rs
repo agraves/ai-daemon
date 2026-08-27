@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! `/etc/ai-daemon/config.toml` and its drop-ins.
 //!
 //! Everything here has a default that produces a working, closed-by-default

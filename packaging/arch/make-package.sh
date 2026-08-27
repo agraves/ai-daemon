@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Build ai-daemon's pacman package from this checkout.
 #
 # makepkg wants a source tarball, and a checkout is not one, so this assembles

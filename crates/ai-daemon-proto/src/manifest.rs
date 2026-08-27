@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! What the registry knows about a model (§6).
 //!
 //! Weights are stored by digest and referenced by name, so two apps asking for

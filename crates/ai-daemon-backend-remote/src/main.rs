@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! ai-daemon-backend-remote — the provider that is not on this machine.
 //!
 //! §7 permits a backend that sends bytes to somebody else's computer, and the

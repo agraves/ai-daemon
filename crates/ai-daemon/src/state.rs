@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Everything the daemon is, in one place the D-Bus layer and the session
 //! threads can both hold.
 

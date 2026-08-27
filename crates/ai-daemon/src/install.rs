@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Installing a model, across the network boundary (§6, §9).
 //!
 //! The split this implements is the load-bearing privacy claim of the whole

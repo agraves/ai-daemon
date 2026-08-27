@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Bring up the pieces a real machine would have systemd bring up, then verify.
 #
 # There is no systemd in a container, so this stands in for it — and only for

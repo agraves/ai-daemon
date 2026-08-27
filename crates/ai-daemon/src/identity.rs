@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Who is asking (§5).
 //!
 //! The honest summary, which the daemon repeats rather than hides: Linux has

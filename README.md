@@ -227,6 +227,33 @@ compatibility alias afterwards. The portal interface in
 `packaging/portal/org.freedesktop.portal.AI.xml` is a proposal on the same
 terms.
 
+## Licensing
+
+Apache-2.0, everywhere, on purpose. The point of this project is to be
+substrate — applications route through it, SDKs land on it, distributions
+ship it — and the licence choice follows from that the way the D-Bus names
+do. Permissive, because copyleft would tax exactly the adoption the project
+exists for while buying nothing: the daemon talks to applications across an
+IPC boundary, so the GPL would not reach them anyway. Apache over MIT for
+one reason, the explicit patent grant — this is infrastructure in the most
+patent-litigious corner of the industry, and both adopters and contributors
+get the protection MIT is silent about. Every source file carries an SPDX
+header, and the build fails if one is missing, because a per-file promise
+that depends on memory is not one. Every dependency in the tree is
+permissively licensed (verified, not assumed — `cargo metadata` says so and
+nothing in it is copyleft-only).
+
+Two forward commitments, written down now so they are not decided by
+accident later. If an eBPF enforcement layer is ever built — the
+default-deny egress gate the design conversations keep circling — its
+`.bpf.c` programs go in their own directory as
+`GPL-2.0-only OR BSD-2-Clause`: the kernel's verifier refuses GPL-only
+helpers to programs without a GPL-compatible licence string, so that half is
+forced, and the dual with BSD-2-Clause is the shape Cilium's `bpf/` tree
+settled on under Linux Foundation review for the same problem. And the wire
+protocols in `docs/protocol.md` are meant to be implemented by anyone,
+including competing daemons, without asking; the document says so itself.
+
 ## Prior art
 
 [inferd](https://github.com/3rg0n/inferd) independently implements much of the

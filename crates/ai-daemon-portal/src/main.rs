@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! ai-daemon-portal — the strong app identity from §5 and §13.
 //!
 //! ## What problem this solves

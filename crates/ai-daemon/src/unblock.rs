@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Running blocking work from a D-Bus method without wedging the bus.
 //!
 //! zbus dispatches every incoming method call on one internal executor thread.

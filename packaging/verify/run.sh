@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
 # Prove the installed package works, on Arch, from the outside.
 #
 # Nothing here reaches into the build tree: everything is /usr/bin/aidctl,

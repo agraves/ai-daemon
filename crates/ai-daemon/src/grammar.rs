@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Compiling tool schemas into a decoding grammar (§10).
 //!
 //! The daemon does not parse a tool call out of free text and hope. It builds

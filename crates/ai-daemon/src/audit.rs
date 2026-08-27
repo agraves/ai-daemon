@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! The record of what happened, and nothing about what was said.
 //!
 //! §5 is unambiguous: identity, model and byte counts are logged; content is

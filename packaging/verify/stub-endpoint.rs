@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! A stand-in for somebody else's inference service.
 //!
 //! The remote backend's whole job is to talk OpenAI-compatible HTTP to a

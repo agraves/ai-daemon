@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! ai-daemon-decode — one attachment, then exit.
 //!
 //! This is where attacker-shaped bytes are allowed to be parsed, and it is the

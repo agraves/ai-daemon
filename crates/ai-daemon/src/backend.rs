@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Talking to provider plugins (§7).
 //!
 //! Every backend is a child process on the other end of a socketpair it

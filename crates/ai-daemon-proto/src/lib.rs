@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! The frozen surfaces of ai-daemon.
 //!
 //! Three contracts live here because three different parties depend on them

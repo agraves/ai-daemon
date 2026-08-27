@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scheduling and the KV budget (§8).
 //!
 //! Two scarce things are arbitrated here and they behave completely

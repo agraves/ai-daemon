@@ -65,6 +65,16 @@ COPY --chown=builder . /home/builder/src
 # deps layer were written later than the real ones. Without this, cargo sees a
 # newer artifact than input and happily links the placeholders.
 RUN find crates -name *.rs -newermt @0 -exec touch {} +
+# Licence gate: every source file carries an SPDX header, checked rather than
+# hoped. The workspace is Apache-2.0 and Cargo.toml says so once for every
+# crate; the per-file line is for the person reading one file out of context —
+# a promise that rots the first time a header is forgotten, unless forgetting
+# it fails the build.
+RUN missing=$(grep -rL "SPDX-License-Identifier:" --include="*.rs" crates; \
+      grep -L "SPDX-License-Identifier:" examples/think.py \
+        packaging/verify/*.sh packaging/verify/*.rs packaging/arch/make-package.sh); \
+    if [ -n "$missing" ]; then \
+      echo "missing an SPDX header:"; echo "$missing"; exit 1; fi
 # Lint gate. The tests run in the package build, where makepkg's check()
 # runs them — the same place a distro would run them, rather than only here.
 RUN cargo build --release --workspace \

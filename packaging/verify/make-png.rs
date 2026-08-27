@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! A PNG generator for the verification run.
 //!
 //! Not part of the package: it exists so the attachment test has a real PNG to

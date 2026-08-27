@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! ai-daemon-backend-mock — the conformance backend.
 //!
 //! It loads no weights, opens no devices and produces deterministic text. That

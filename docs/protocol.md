@@ -14,6 +14,12 @@ The floor moves only when a version is genuinely withdrawn, which has not
 happened. `MIN_DATA_PROTO` and `MIN_BACKEND_PROTO` are where that is written
 down.
 
+This document is Apache-2.0 with the rest of the repository, and the
+protocols it describes are meant to be implemented by anyone — another
+daemon, a competing one, a client in any language — without permission,
+coordination, or a copy of this code. Interoperability is the goal the
+document exists for; nothing about implementing it is claimed back.
+
 - **Control plane** — D-Bus on the system bus. Enumeration, sessions, policy,
   model administration.
 - **Data plane** — a Unix socket per session, handed to the client as a file

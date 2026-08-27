@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 # think.py — inference through ai-daemon: no API key, no network, no SDK.
 #
 # This is the whole client. One D-Bus call opens a session and hands back a

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Framing and client-facing frame types for the session data plane.
 //!
 //! Wire shape, deliberately dull:

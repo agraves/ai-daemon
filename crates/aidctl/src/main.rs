@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! aidctl — look at what the daemon is doing, and tell it to do things.
 //!
 //! Two jobs, and the split matters:

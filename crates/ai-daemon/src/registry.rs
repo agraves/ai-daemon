@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! The model registry (§6): one copy of the weights, many callers.
 //!
 //! ```text

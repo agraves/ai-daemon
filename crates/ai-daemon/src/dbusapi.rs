@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! The D-Bus control plane (§3, §12).
 //!
 //! Control traffic goes here and nothing else does. D-Bus gives us activation,

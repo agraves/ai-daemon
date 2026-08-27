@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! The session data plane (§8, §10, §11): one thread, one socket, one client.
 //!
 //! Everything expensive or blocking happens here rather than on the bus:

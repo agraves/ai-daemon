@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! ai-daemon-backend-llamacpp — the reference provider backend.
 //!
 //! llama.cpp is the right first backend for the same reason the spec names it:

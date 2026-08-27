@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! ai-daemon-fetch — the only part of this project allowed near a network.
 //!
 //! §9 is the load-bearing privacy claim of the design: the process that

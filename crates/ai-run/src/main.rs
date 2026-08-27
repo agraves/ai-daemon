@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! ai-run — give a program inference and take away everything else.
 //!
 //! The argument this whole project rests on is that an application should not

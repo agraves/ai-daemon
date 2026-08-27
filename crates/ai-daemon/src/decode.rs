@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Running the confined media decoder (§11).
 //!
 //! The daemon links no image or audio codecs. Accepting attacker-supplied

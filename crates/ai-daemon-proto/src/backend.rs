@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! The provider plugin protocol (§7).
 //!
 //! A backend is a separate process the daemon spawns, speaking this protocol

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Logging, such as it is.
 //!
 //! systemd captures stderr, and `sd-daemon`'s `<N>` prefix is how a plain

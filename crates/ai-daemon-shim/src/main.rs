@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! ai-daemon-shim — an OpenAI-compatible endpoint on loopback, off by default.
 //!
 //! This is the adoption bridge from §15: every editor plugin and desktop

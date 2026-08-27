@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Run a command as another user.
 #
 # A separate program rather than a shell function because the verification

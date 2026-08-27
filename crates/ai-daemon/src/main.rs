@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! ai-daemon — a system inference service for desktop Linux.
 //!
 //! The problem this exists for is not "run a model". Ollama runs a model. The

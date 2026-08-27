@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Grants, capabilities, limits, and the consent path (§5).
 //!
 //! Two things are deliberately separate here and are easy to confuse:

@@ -274,6 +274,15 @@ now carries structured fields, so
 query rather than a grep; the chained file and the stderr fallback are
 unchanged.
 
+### Licensing, settled
+
+Apache-2.0, everywhere — it always was in `Cargo.toml` and `LICENSE`, and now
+every source file says so in an SPDX header the build refuses to lose. The
+reasoning, the dependency audit, and two forward commitments (a future eBPF
+layer would be dual `GPL-2.0-only OR BSD-2-Clause` in its own directory, and
+the wire protocols are implementable by anyone without asking) are written
+down in the README's Licensing section.
+
 ---
 
 ## Compatibility

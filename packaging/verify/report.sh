@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # Show what the verification found when this image was built.
 #
 # The run itself happened during the build (see the Dockerfile for why it has
