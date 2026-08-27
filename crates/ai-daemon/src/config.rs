@@ -22,6 +22,9 @@ pub struct Config {
     pub aliases: BTreeMap<String, String>,
     #[serde(rename = "backend")]
     pub backends: Vec<Backend>,
+    /// Per-model prices, for the spend ceiling. Empty on a local-only machine.
+    #[serde(rename = "price", default)]
+    pub prices: Vec<ModelPrice>,
     /// Per-identity overrides, keyed by the identity string `aidctl grants`
     /// prints. A missing entry means the `[policy]` defaults apply.
     #[serde(rename = "identity")]
@@ -111,9 +114,73 @@ pub struct Policy {
     pub max_context: u32,
     pub max_sessions: u32,
     pub tokens_per_minute: u64,
+    /// What an identity may spend in a rolling day, in whole currency units.
+    ///
+    /// Tokens per minute bounds a burst; this bounds a bill. They are not
+    /// substitutes: a runaway agent against a local model costs nothing and
+    /// wants the token limit, and the same agent against a hosted endpoint
+    /// costs real money at a rate no token count reveals — §5's example is
+    /// "$2/day for a CI runner", which is a sentence about money.
+    ///
+    /// Zero means no ceiling, which is the shipped default because a machine
+    /// with only local models has nothing to meter and a number invented here
+    /// would be a number in somebody else's currency.
+    pub daily_spend: f64,
+    /// Text the client cannot remove, prepended to every turn as a system
+    /// message.
+    ///
+    /// §5's "mandatory preludes". The point is not that the model is told
+    /// something useful — a client can do that itself — it is that the client
+    /// cannot *stop* being told it. An app whose prompt is chosen by whatever
+    /// it just read from disk cannot delete this, and neither can the text it
+    /// read.
+    ///
+    /// Empty by default. A prelude that ships with the daemon would be a
+    /// sentence somebody else wrote appearing in every prompt on the machine,
+    /// which is exactly the thing this exists to make impossible for a client
+    /// to do to another client.
+    pub prelude: String,
+    /// Mark where each part of a prompt came from, so the model can weigh it.
+    ///
+    /// The other half of §5's line: "the broker knows which bytes came from
+    /// the process versus from policy and tags them for the model". Each
+    /// message is wrapped in a marker naming its origin, carrying a nonce
+    /// minted per session — and the nonce is stripped from anything a client
+    /// or a tool supplied, so content cannot close a marker it is inside or
+    /// open one it is not.
+    ///
+    /// That is the whole mechanism, and it is worth being plain about what it
+    /// is: a prompt-injection *defence in depth*, not a proof. It gives the
+    /// model the information it needs to distinguish an instruction from data
+    /// it was handed; whether the model then acts on that is the model's
+    /// business, and no OS-level broker can make that decision for it. What
+    /// the broker can guarantee is that the distinction is not forgeable from
+    /// inside the content, and that is what this guarantees.
+    ///
+    /// Off by default: markers with no prelude to explain them are noise in
+    /// every prompt, and the prelude is the machine owner's to write.
+    pub mark_provenance: bool,
     /// Model names, or `*`. Checked after alias resolution, so a policy cannot
     /// be dodged by asking for `default`.
     pub allowed_models: Vec<String>,
+}
+
+/// What a model costs to run, per million tokens.
+///
+/// Written down by an administrator, not discovered: no endpoint publishes a
+/// price the daemon could read, and a guessed rate is worse than none because
+/// it produces a ceiling nobody can reconcile with an invoice. A model with no
+/// entry costs nothing, which is right for a local one and is why the whole
+/// mechanism is inert on a machine that never configured a remote provider.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPrice {
+    /// Matched against the resolved model name, or `*` for a catch-all.
+    pub model: String,
+    #[serde(default)]
+    pub input_per_mtok: f64,
+    #[serde(default)]
+    pub output_per_mtok: f64,
 }
 
 /// Who may speak for an application, out of the box.
@@ -211,6 +278,12 @@ pub struct IdentityRule {
     #[serde(default)]
     pub tokens_per_minute: Option<u64>,
     #[serde(default)]
+    pub daily_spend: Option<f64>,
+    #[serde(default)]
+    pub prelude: Option<String>,
+    #[serde(default)]
+    pub mark_provenance: Option<bool>,
+    #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
 }
 
@@ -241,6 +314,9 @@ impl Default for Policy {
             max_context: 8192,
             max_sessions: 4,
             tokens_per_minute: 12_000,
+            daily_spend: 0.0,
+            prelude: String::new(),
+            mark_provenance: false,
             allowed_models: vec!["*".to_string()],
         }
     }
@@ -302,6 +378,7 @@ impl Config {
         config.backends = last_wins(std::mem::take(&mut config.backends), |b| b.name.clone());
         config.identities =
             last_wins(std::mem::take(&mut config.identities), |r| r.identity.clone());
+        config.prices = last_wins(std::mem::take(&mut config.prices), |p| p.model.clone());
         config.validate()?;
         Ok(config)
     }
@@ -403,6 +480,13 @@ impl Config {
         // without disowning the others, and replaces one that shares its name.
         self.backends.extend(other.backends);
         self.identities.extend(other.identities);
+        // Prices accumulate the same way, and for the same reason: a drop-in
+        // that costs one model must not silently discard the table the
+        // package or another drop-in already laid down. Forgetting this line
+        // is how the price table loaded as empty and every request cost
+        // nothing — a spend ceiling that never triggers looks exactly like a
+        // spend ceiling that works.
+        self.prices.extend(other.prices);
     }
 
     /// At most one rule can match, because `last_wins` has already collapsed

@@ -14,3 +14,4 @@ libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zbus.workspace = true
+sha2.workspace = true

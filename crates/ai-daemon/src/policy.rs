@@ -67,6 +67,17 @@ pub struct Limits {
     pub max_context: u32,
     pub max_sessions: u32,
     pub tokens_per_minute: u64,
+    /// Micro-units of currency per rolling day; zero means no ceiling.
+    ///
+    /// Integer micros rather than a float, because money that accumulates in
+    /// f64 accumulates error too, and a ceiling that drifts is a ceiling
+    /// nobody can reconcile against a bill. The config takes a decimal for
+    /// ergonomics and it is converted once, here.
+    pub daily_spend_micros: u64,
+    /// Text prepended to every turn that the client cannot remove.
+    pub prelude: String,
+    /// Tag each part of a prompt with where it came from.
+    pub mark_provenance: bool,
     pub allowed_models: Vec<String>,
 }
 
@@ -80,6 +91,24 @@ impl Limits {
 struct GrantFile {
     #[serde(default)]
     grants: Vec<Grant>,
+}
+
+/// A rolling day. Not a calendar day: a calendar boundary needs a timezone,
+/// and "the CI runner gets $2 a day" is a rate, not a date.
+const SPEND_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A decimal in the config becomes an integer here, once.
+fn to_micros(units: f64) -> u64 {
+    if !units.is_finite() || units <= 0.0 {
+        return 0;
+    }
+    (units * 1_000_000.0).round() as u64
+}
+
+/// Micros back to something a person reads, to three decimal places — enough
+/// for a tenth of a cent, which is the granularity these prices come in.
+pub fn render_micros(micros: u64) -> String {
+    format!("{:.3}", micros as f64 / 1_000_000.0)
 }
 
 /// Token bucket per identity. Refills continuously rather than per window, so
@@ -125,6 +154,9 @@ struct PolicyState {
     grants: HashMap<(String, String), Grant>,
     buckets: HashMap<String, Bucket>,
     sessions: HashMap<String, u32>,
+    /// What each identity has spent, and when. Pruned to the window on every
+    /// touch, so it holds a day of requests rather than a history.
+    spend: HashMap<String, Vec<(Instant, u64)>>,
 }
 
 impl PolicyEngine {
@@ -139,6 +171,7 @@ impl PolicyEngine {
                 grants,
                 buckets: HashMap::new(),
                 sessions: HashMap::new(),
+                spend: HashMap::new(),
             }),
             polkit: Mutex::new(None),
         }
@@ -184,6 +217,9 @@ impl PolicyEngine {
             max_context: defaults.max_context,
             max_sessions: defaults.max_sessions,
             tokens_per_minute: defaults.tokens_per_minute,
+            daily_spend_micros: to_micros(defaults.daily_spend),
+            prelude: defaults.prelude.clone(),
+            mark_provenance: defaults.mark_provenance,
             allowed_models: defaults.allowed_models.clone(),
         };
         if let Some(rule) = self.config.rule_for(&identity.key()) {
@@ -195,6 +231,15 @@ impl PolicyEngine {
             }
             if let Some(v) = rule.tokens_per_minute {
                 limits.tokens_per_minute = v;
+            }
+            if let Some(v) = rule.daily_spend {
+                limits.daily_spend_micros = to_micros(v);
+            }
+            if let Some(v) = &rule.prelude {
+                limits.prelude = v.clone();
+            }
+            if let Some(v) = rule.mark_provenance {
+                limits.mark_provenance = v;
             }
             if let Some(v) = &rule.allowed_models {
                 limits.allowed_models = v.clone();
@@ -379,6 +424,126 @@ impl PolicyEngine {
             .take(n)
     }
 
+    /// What a request cost, in micro-units of currency.
+    ///
+    /// Priced from the administrator's table, because nothing else can price
+    /// it: no endpoint publishes a rate the daemon could read, and a guessed
+    /// one produces a ceiling nobody can reconcile with an invoice. A model
+    /// with no entry is free, which is correct for a local one and is why this
+    /// whole mechanism is inert on a machine that never configured a remote
+    /// provider.
+    pub fn price_of(&self, model: &str, prompt_tokens: u64, completion_tokens: u64) -> u64 {
+        // An exact name beats the catch-all, so a wildcard can set a floor
+        // without overriding the one model somebody costed properly.
+        let price = self
+            .config
+            .prices
+            .iter()
+            .find(|p| p.model == model)
+            .or_else(|| self.config.prices.iter().find(|p| p.model == "*"));
+        let Some(price) = price else { return 0 };
+        let micros = |per_mtok: f64, tokens: u64| -> u64 {
+            if !per_mtok.is_finite() || per_mtok <= 0.0 {
+                return 0;
+            }
+            // Rounded up. A fractional micro is a millionth of a currency
+            // unit, and rounding it away would let a long run of small
+            // requests spend for ever against a ceiling that never moves.
+            (per_mtok * tokens as f64).ceil().max(0.0) as u64
+        };
+        micros(price.input_per_mtok, prompt_tokens)
+            .saturating_add(micros(price.output_per_mtok, completion_tokens))
+    }
+
+    /// Record what a finished request cost. Returns the day's running total.
+    ///
+    /// Charged after the fact rather than reserved before it, because the cost
+    /// is not known until the tokens exist. So a single request can carry the
+    /// total past the ceiling — it cannot be refused halfway through on a
+    /// price nobody could compute yet — and the next one is refused. The
+    /// alternative is estimating, and an estimate wrong in the permissive
+    /// direction is a ceiling that does not hold.
+    pub fn charge_spend(&self, identity: &Identity, micros: u64) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        let entry = state.spend.entry(identity.key()).or_default();
+        let now = Instant::now();
+        entry.retain(|(at, _)| now.duration_since(*at) < SPEND_WINDOW);
+        if micros > 0 {
+            entry.push((now, micros));
+        }
+        entry.iter().map(|(_, m)| *m).sum()
+    }
+
+    /// Has this identity already spent its day, on something that costs?
+    ///
+    /// The model matters, and getting that wrong is what the verification
+    /// caught: a ceiling checked without it refused a local model to an
+    /// identity that had spent its allowance on a hosted one. A spend cap is
+    /// about a bill. A local model does not send one, so refusing it is not
+    /// the spend cap's business — the token limit is what bounds local work,
+    /// and it is still there.
+    pub fn spend_permits(
+        &self,
+        identity: &Identity,
+        limits: &Limits,
+        model: &str,
+    ) -> Result<(), String> {
+        if limits.daily_spend_micros == 0 {
+            return Ok(());
+        }
+        // Priced at one token of each, to ask "does this model cost anything
+        // at all" without knowing yet how large the request will be.
+        if self.price_of(model, 1, 1) == 0 {
+            return Ok(());
+        }
+        let spent = self.spent_by(&identity.key());
+        if spent >= limits.daily_spend_micros {
+            return Err(format!(
+                "{} has spent {} of its {} daily allowance; the window is a rolling 24 hours, \
+                 so this clears as the oldest requests age out",
+                identity.key(),
+                render_micros(spent),
+                render_micros(limits.daily_spend_micros)
+            ));
+        }
+        Ok(())
+    }
+
+    /// What an identity has spent inside the window.
+    pub fn spent_by(&self, key: &str) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        let Some(entry) = state.spend.get_mut(key) else { return 0 };
+        let now = Instant::now();
+        entry.retain(|(at, _)| now.duration_since(*at) < SPEND_WINDOW);
+        entry.iter().map(|(_, m)| *m).sum()
+    }
+
+    /// Everyone who has spent anything in the window, with their ceiling.
+    ///
+    /// Reported rather than left to be discovered at the refusal: "how much
+    /// have I spent today" is the first question anybody asks after setting a
+    /// cap, and an answer that only arrives when the cap bites is not one.
+    pub fn spend_report(&self) -> Vec<(String, u64, u64)> {
+        let keys: Vec<String> = self.state.lock().unwrap().spend.keys().cloned().collect();
+        let mut rows: Vec<(String, u64, u64)> = keys
+            .into_iter()
+            .map(|key| {
+                let spent = self.spent_by(&key);
+                let ceiling = self
+                    .config
+                    .rule_for(&key)
+                    .and_then(|rule| rule.daily_spend)
+                    .map(to_micros)
+                    .unwrap_or_else(|| to_micros(self.config.policy.daily_spend));
+                (key, spent, ceiling)
+            })
+            .filter(|(_, spent, ceiling)| *spent > 0 || *ceiling > 0)
+            .collect();
+        // Biggest spender first: that is who somebody is looking for.
+        rows.sort_by_key(|row| std::cmp::Reverse(row.1));
+        rows
+    }
+
     pub fn open_session(&self, identity: &Identity, limits: &Limits) -> Result<(), String> {
         let mut state = self.state.lock().unwrap();
         let count = state.sessions.entry(identity.key()).or_insert(0);
@@ -540,6 +705,9 @@ mod tests {
             max_context: None,
             max_sessions: None,
             tokens_per_minute: None,
+            daily_spend: None,
+            prelude: None,
+            mark_provenance: None,
             allowed_models: None,
         });
         let policy = PolicyEngine::new(config, &dir);
@@ -585,6 +753,9 @@ mod tests {
             max_context: 4096,
             max_sessions: 2,
             tokens_per_minute: 100,
+            daily_spend_micros: 0,
+            prelude: String::new(),
+            mark_provenance: false,
             allowed_models: vec!["*".into()],
         };
         policy.open_session(&identity(1000), &limits).unwrap();
@@ -603,6 +774,9 @@ mod tests {
             max_context: 4096,
             max_sessions: 2,
             tokens_per_minute: 100,
+            daily_spend_micros: 0,
+            prelude: String::new(),
+            mark_provenance: false,
             allowed_models: vec!["small".into()],
         };
         assert!(limits.permits_model("small"));

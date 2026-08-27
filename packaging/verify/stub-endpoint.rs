@@ -126,6 +126,27 @@ fn serve(mut stream: TcpStream) {
         return;
     }
 
+    // What provenance markers the daemon put in the prompt, reported back as
+    // tokens. The mock backend counts characters rather than echoing them, so
+    // this stand-in is the only place in the run that can say what actually
+    // reached a backend — which is the thing worth asserting about marking.
+    let markers = format!(
+        "markers:policy={},from-app={},tool={},defanged={}",
+        body.matches("<policy nonce=").count(),
+        body.matches("<from-app nonce=").count(),
+        body.matches("<tool-output nonce=").count(),
+        body.matches("[nonce removed]").count()
+    );
+    if body.contains("report the markers") {
+        let chunk = format!("{{\"choices\":[{{\"delta\":{{\"content\":\"{markers}\"}}}}]}}");
+        let _ = send(&mut stream, &chunk);
+        let done = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\
+                    \"usage\":{\"prompt_tokens\":11,\"completion_tokens\":1}}";
+        let _ = send(&mut stream, done);
+        let _ = stream.write_all(b"data: [DONE]\n\n");
+        return;
+    }
+
     // A long answer, so the cancel check has something to interrupt. The
     // endpoint keeps sending until the transfer is torn down; if cancellation
     // does not reach the far end, this runs for a minute and the check says so.

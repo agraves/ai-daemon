@@ -60,6 +60,8 @@ fn main() {
         "revoke" => revoke(rest),
         "install" => install(rest),
         "portal" => portal(rest),
+        "spend" => spend(),
+        "audit" => audit(rest),
         "remove" => remove(rest),
         "alias" => set_alias(rest),
         "pin" => pin(rest, true),
@@ -199,6 +201,127 @@ fn sessions() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// What has been spent in the rolling day, and against what ceiling.
+fn spend() -> Result<(), String> {
+    let rows: Vec<(String, String, String)> = call("Spend", &())?;
+    if rows.is_empty() {
+        println!("nothing spent, and no ceiling set");
+        println!();
+        println!("Prices are an administrator's table in config.toml. A model with no");
+        println!("entry costs nothing, which is right for a local one — so this stays");
+        println!("empty on a machine that never configured a remote provider.");
+        return Ok(());
+    }
+    println!("{:<38} {:>12} {:>12}", "IDENTITY", "SPENT", "PER DAY");
+    for (identity, spent, ceiling) in rows {
+        println!("{identity:<38} {spent:>12} {ceiling:>12}");
+    }
+    println!();
+    println!("A rolling 24 hours, not a calendar day: the oldest requests age out.");
+    Ok(())
+}
+
+/// Check the audit log's hash chain.
+///
+/// Reads the file directly rather than asking the daemon: a log you can only
+/// verify by asking the process that wrote it is not evidence of anything.
+/// Point it at a copy, on another machine, with the daemon stopped — that is
+/// the case this is for.
+fn audit(args: &[String]) -> Result<(), String> {
+    let mut path = std::path::PathBuf::from("/var/lib/ai-daemon/audit.jsonl");
+    let mut iter = args.iter();
+    let mut verify = false;
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--verify" => verify = true,
+            "--file" => path = iter.next().map(std::path::PathBuf::from).unwrap_or(path),
+            "--help" => {
+                println!(
+                    "usage: aidctl audit --verify [--file PATH]
+
+Walks the hash chain and reports the first break: which line, and whether
+something was changed, removed or reordered. Each record carries the hash
+of the line before it, so an edit after the fact cannot leave the file
+consistent without rewriting everything after it.
+
+Tamper-evident, not tamper-proof. Somebody who owns the file can rewrite
+the chain from the point of an edit; what this costs them is the whole
+remainder rather than one line, and it makes a truncated tail visible."
+                );
+                return Ok(());
+            }
+            other => return Err(format!("unknown option {other:?}")),
+        }
+    }
+    if !verify {
+        return Err("say what to do: --verify".into());
+    }
+    match ai_daemon_audit_verify(&path) {
+        Ok(n) => {
+            println!("{} record(s) checked, chain intact", n);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The verifier, inlined rather than linked.
+///
+/// `aidctl` does not depend on the daemon crate — deliberately, so the client
+/// cannot accidentally pull the policy engine into a user-run binary — so the
+/// twenty lines that read a chain live in both places. They are duplicated on
+/// purpose and the format is the contract: a record's `prev` is the sha256 of
+/// the previous line, verbatim, which `sha256sum` will also tell you.
+fn ai_daemon_audit_verify(path: &std::path::Path) -> Result<u64, String> {
+    use sha2::{Digest, Sha256};
+    let hash_line = |line: &str| {
+        let mut hasher = Sha256::new();
+        hasher.update(line.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let mut expected: Option<String> = None;
+    let mut checked = 0u64;
+    for (index, line) in text.lines().enumerate() {
+        let number = index + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| format!("line {number} is not a record: {e}"))?;
+        let carried = record.get("prev").and_then(|p| p.as_str());
+        match (&expected, carried) {
+            (None, None) => {}
+            (None, Some(p)) => {
+                return Err(format!(
+                    "line {number} claims to follow {} but it is the first record in this \
+                     file — everything before it is missing",
+                    &p[..16.min(p.len())]
+                ))
+            }
+            (Some(_), None) => {
+                return Err(format!(
+                    "line {number} carries no link, so the chain restarts here — a record \
+                     written by something that did not know about the chain, or a splice"
+                ))
+            }
+            (Some(want), Some(got)) if want != got => {
+                return Err(format!(
+                    "line {number} follows {} but the record before it hashes to {} — \
+                     something between them was changed, removed or reordered",
+                    &got[..16.min(got.len())],
+                    &want[..16.min(want.len())]
+                ))
+            }
+            (Some(_), Some(_)) => {}
+        }
+        expected = Some(hash_line(line));
+        checked += 1;
+    }
+    Ok(checked)
 }
 
 fn grants() -> Result<(), String> {
@@ -1023,6 +1146,8 @@ administration (polkit action io.github.agraves.aidaemon.model-admin)
   remove NAME
   alias ALIAS MODEL
   pin MODEL | unpin MODEL
+  spend                       what each identity has spent today, and its ceiling
+  audit --verify              walk the audit log's hash chain and report the first break
   grant IDENTITY CAPABILITY   capabilities: generate, generate-tools, generate-media, embed, model-admin
   deny IDENTITY CAPABILITY
   revoke IDENTITY             forget every grant, and close live sessions

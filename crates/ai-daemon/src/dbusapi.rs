@@ -308,6 +308,30 @@ impl Manager {
     }
 
     /// Every remembered decision, so a user can see what they agreed to (§5).
+    /// What each identity has spent in the rolling day, and against what.
+    ///
+    /// Not admin-gated: it says how much *you* are costing, in a currency the
+    /// administrator named, and hiding that from the people it applies to
+    /// would make a budget something you can only discover by exceeding it.
+    fn spend(&self) -> Vec<(String, String, String)> {
+        self.daemon
+            .policy
+            .spend_report()
+            .into_iter()
+            .map(|(identity, spent, ceiling)| {
+                (
+                    identity,
+                    crate::policy::render_micros(spent),
+                    if ceiling == 0 {
+                        "no ceiling".to_string()
+                    } else {
+                        crate::policy::render_micros(ceiling)
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn list_grants(&self) -> Vec<(String, String, String, u64, String)> {
         self.daemon
             .policy
@@ -984,6 +1008,9 @@ mod tests {
             max_context: 1024,
             max_sessions: 1,
             tokens_per_minute: 1000,
+            daily_spend_micros: 0,
+            prelude: String::new(),
+            mark_provenance: false,
             allowed_models: vec!["*".into()],
         }
     }
