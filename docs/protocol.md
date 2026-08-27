@@ -87,7 +87,38 @@ every other caller on the machine. The first `generate` on the session is
 where consent is asked and the model is loaded.
 
 `InstallModel` options are `format` (default `gguf`, checked against the file's
-magic), `backend`, `license`, and `capabilities` (`as`).
+magic), `backend`, `license`, and `capabilities` (`as`, default
+`["generate"]`).
+
+### Capabilities
+
+A model's `capabilities` and its backend's are intersected, and both halves of
+that are enforced rather than described:
+
+* **A model cannot grant what the backend cannot do.** `InstallModel` refuses
+  a capability no configured backend serves for that format — refused, not
+  silently narrowed, because an administrator who asked for `vision` and got a
+  text model would have no way to tell.
+* **A backend cannot grant what the model is not.** A session on a model that
+  does not claim `embed` is refused it even though its backend would oblige.
+  The error names the model, lists what it does offer, and carries the remedy
+  (`aidctl install --capability embed`), because "cannot embed" alone reads as
+  a limit of the machine rather than of the model.
+
+The session's hello reports the intersection, so a client can ask once rather
+than discover it one refusal at a time.
+
+An empty list means a manifest that predates the field and is read as
+`generate` — not as "everything", because a list that means everything when
+absent is a list nobody can rely on.
+
+**This is a behaviour change for existing installs.** `aidctl install` has
+always defaulted to `["generate"]`, so a model installed before this and used
+for embeddings against a backend that embeds will now be refused. There is no
+grandfathering: every manifest has a non-empty list, so a legacy default and a
+deliberate generate-only model are indistinguishable, and exempting them would
+make the field permanently unenforceable. The break lands only where the
+documentation already promised a refusal, and the remedy is one command.
 
 ### Session
 

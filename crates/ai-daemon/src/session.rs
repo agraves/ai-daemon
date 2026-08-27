@@ -675,12 +675,44 @@ impl Worker {
         }
     }
 
+    /// What this session can be asked for.
+    ///
+    /// The intersection, not the backend's list. Reporting the backend's was
+    /// the visible half of a larger problem: the manifest's claims were
+    /// written at install, shown in `ListModels`, documented as intersected
+    /// with the backend's — and consulted nowhere, so a client that read this
+    /// list was told what the *machine* could do and then found out per
+    /// request what the *model* would do.
     fn session_capabilities(&self) -> Vec<String> {
-        let mut caps = Vec::new();
-        if let Ok(backend) = self.daemon.backends.get(&self.session.backend) {
-            caps.extend(backend.info.capabilities.iter().cloned());
+        self.session.capabilities.clone()
+    }
+
+    /// Refuse a request the model does not claim, and say how to fix it.
+    ///
+    /// The other half of the manifest's documented promise: a backend cannot
+    /// grant what the model is not. The mock backend embeds, so without this a
+    /// text-only model installed against it embeds too — the claim in its
+    /// manifest was decoration.
+    ///
+    /// The error carries the remedy because the remedy is not guessable: the
+    /// fix is an administrator re-running install with the capability named,
+    /// and a client seeing only "cannot embed" would reasonably conclude the
+    /// machine cannot.
+    fn model_serves(&self, capability: &str) -> Result<(), String> {
+        if self.session.capabilities.iter().any(|c| c == capability) {
+            return Ok(());
         }
-        caps
+        let claimed = if self.session.capabilities.is_empty() {
+            "nothing".to_string()
+        } else {
+            self.session.capabilities.join(", ")
+        };
+        Err(format!(
+            "model {} does not offer {capability} (it offers: {claimed}). If it should, \
+             an administrator can reinstall it with `aidctl install --capability \
+             {capability}`; otherwise ask for a model that does.",
+            self.session.model
+        ))
     }
 
     fn turn(&mut self, stream: bool) {
@@ -688,6 +720,13 @@ impl Worker {
         if let Err(reason) = self.daemon.policy.check(&self.session.identity, capability) {
             self.daemon.audit.denied(&self.session.identity, capability, &reason);
             self.send(&Event::error("policy-denied", reason));
+            return;
+        }
+        // Checked even though every model claims it: an embedding-only model
+        // is a legitimate install, and the alternative is that asking it for
+        // text produces whatever the backend happens to do.
+        if let Err(reason) = self.model_serves("generate") {
+            self.send(&Event::error("attachment-unsupported", reason));
             return;
         }
 
@@ -829,6 +868,13 @@ impl Worker {
                     "attachment-unsupported",
                     format!("backend {} cannot {needed}", backend.name),
                 ));
+                return;
+            }
+            // A text model loaded by a vision-capable backend is the common
+            // case, not an exotic one, and handing it pixels produces
+            // confident nonsense rather than an error.
+            if let Err(reason) = self.model_serves(needed) {
+                self.send(&Event::error("attachment-unsupported", reason));
                 return;
             }
         }
@@ -1036,6 +1082,10 @@ impl Worker {
             ));
             return;
         }
+        if let Err(reason) = self.model_serves(kind.capability()) {
+            self.send(&Event::error("attachment-unsupported", reason));
+            return;
+        }
 
         let budget = &self.daemon.config.attachments;
         let count = count.clamp(1, budget.max_per_session);
@@ -1217,6 +1267,10 @@ impl Worker {
                 "attachment-unsupported",
                 format!("backend {} does not embed", backend.name),
             ));
+            return;
+        }
+        if let Err(reason) = self.model_serves("embed") {
+            self.send(&Event::error("attachment-unsupported", reason));
             return;
         }
         let estimate: u64 = inputs.iter().map(|i| estimate_tokens(i)).sum();
@@ -1422,6 +1476,7 @@ mod tests {
             model: "none".into(),
             digest: "sha256:0".into(),
             backend: "none".into(),
+            capabilities: vec!["generate".into()],
             local: true,
             class: crate::sched::Class::Interactive,
             max_context: 1024,
