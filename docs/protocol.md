@@ -465,23 +465,29 @@ that cannot.
 ## ai-run
 
 ```
-ai-run [--socket PATH] [--keep-network] [--as NAME] -- PROGRAM [ARGS...]
+ai-run [--socket PATH] [--confine-network | --permit-network] [--as NAME]
+       -- PROGRAM [ARGS...]
 ```
 
-Runs a program in a network namespace containing one interface that is down:
-no route off the machine, no DNS, nothing listening. The shim's Unix socket is
-left reachable, and the program is told where it is via
-`AI_DAEMON_SHIM_SOCKET`. Then it execs — nothing stays resident, nothing is
-proxied, nothing is held open.
+Two jobs, and the default follows the invocation. A **bare `ai-run`
+confines**: the program runs in a network namespace containing one interface
+that is down — no route off the machine, no DNS, nothing listening — with the
+shim's Unix socket left reachable and named in `AI_DAEMON_SHIM_SOCKET`. An
+**`--as` launch identifies** and leaves the network alone: the agents worth
+naming need their git remotes and package registries, and what they come here
+for is the standing identity and the socket. Either flag overrides either
+default; `--confine-network` with `--as` is the fully-locked-down named
+launch, and the two together in opposite directions are refused. Then it
+execs — nothing stays resident, nothing is proxied, nothing is held open.
 
 This is why the shim has a socket at all. A port does not survive a network
 namespace; a filesystem object does.
 
-It checks the socket exists *before* unsharing, because inside there is no way
-to fix it and the failure would look like the program's. If unprivileged user
-namespaces are unavailable it refuses rather than running unconfined — a
-program that believes it is sandboxed and is not is worse than one that did not
-start — and `--keep-network` is how you say you meant it.
+When confining it checks the socket exists *before* unsharing, because inside
+there is no way to fix it and the failure would look like the program's. If
+unprivileged user namespaces are unavailable it refuses rather than running
+unconfined — a program that believes it is sandboxed and is not is worse than
+one that did not start — and `--permit-network` is how you say you meant it.
 
 **What it removes is the credential and the egress.** It does not stop a
 program acting badly on what a model says: if it asks for text and then runs

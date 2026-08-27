@@ -1528,18 +1528,18 @@ note "is worse than one that did not start."
 refute "it refuses rather than running the program unconfined" ai-run -- true
 contains "and says what it could not do" /tmp/airun-refuse.txt 'could not take away the network'
 contains "and where to look" /tmp/airun-refuse.txt 'unprivileged_userns_clone|max_user_namespaces'
-contains "and that --keep-network is how you say you meant it" /tmp/airun-refuse.txt 'keep-network'
+contains "and that --permit-network is how you say you meant it" /tmp/airun-refuse.txt 'permit-network'
 note "The program never ran. That is the property worth having under a"
 note "kernel that will not do what was asked."
 
-note "With --keep-network the program runs and the socket is reachable, which"
+note "With --permit-network the program runs and the socket is reachable, which"
 note "is the same wiring the confined path uses minus the namespace — so the"
 note "plumbing is exercised even where the confinement cannot be."
 note "As alice, not root: SO_PEERCRED means the caller on the socket is now"
 note "really the caller, and root is deliberately outside the ai gate. This"
 note "check ran as root once and the daemon refused it — which is the gate"
 note "doing its job on an identity that used to be invisible."
-runas alice ai-run --keep-network -- sh -c 'curl -sS --max-time 60 --unix-socket "$AI_DAEMON_SHIM_SOCKET" \
+runas alice ai-run --permit-network -- sh -c 'curl -sS --max-time 60 --unix-socket "$AI_DAEMON_SHIM_SOCKET" \
   http://localhost/v1/chat/completions -H "Content-Type: application/json" \
   -d "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":\"through ai-run\"}]}"' \
   >/tmp/airun-inference.txt 2>&1
@@ -1547,9 +1547,9 @@ run cat /tmp/airun-inference.txt
 contains "a program run under ai-run reaches the daemon over the socket" \
   /tmp/airun-inference.txt '"object":"chat.completion"'
 check "and is told where that socket is rather than having to know" \
-  bash -c "ai-run --keep-network -- sh -c 'test -n \"\$AI_DAEMON_SHIM_SOCKET\"'"
+  bash -c "ai-run --permit-network -- sh -c 'test -n \"\$AI_DAEMON_SHIM_SOCKET\"'"
 check "and the base URL to use with it" \
-  bash -c "ai-run --keep-network -- sh -c 'test -n \"\$AI_DAEMON_SHIM_URL\"'"
+  bash -c "ai-run --permit-network -- sh -c 'test -n \"\$AI_DAEMON_SHIM_URL\"'"
 
 note "It checks the socket exists before unsharing, because inside there is no"
 note "way to fix it and the failure would look like the program's."
@@ -1615,8 +1615,19 @@ note "nothing to grip until the program could claim a standing name. The box"
 note "has no user manager, so what it can prove is the failure mode: if the"
 note "scope cannot be created the program is NOT run anonymously."
 refute "with no user manager, --as refuses rather than running unnamed" \
-  ai-run --keep-network --as boxtest -- touch /tmp/airun-as-ran
+  ai-run --permit-network --as boxtest -- touch /tmp/airun-as-ran
 check "and the program never ran" test ! -e /tmp/airun-as-ran
+
+note "The default follows the invocation: a bare ai-run confines, an --as"
+note "launch keeps the network — the agents worth naming need their git"
+note "remotes, and come here for the identity and the socket. Provable even"
+note "in a box that cannot namespace: --as alone must fail at the missing"
+note "user manager, never at the unshare a bare run dies on."
+ai-run --as boxtest2 -- true >/tmp/airun-as-default.txt 2>&1 || true
+lacks "--as alone never tried to take the network away" \
+  /tmp/airun-as-default.txt 'could not take away the network'
+refute "and asking for both directions at once is refused" \
+  ai-run --confine-network --permit-network -- true
 note "The acceptance half — unit:NAME@uid in the audit log, one [[identity]]"
 note "rule holding across launches — needs a real machine, and is recorded in"
 note "notes/2026-08-27-real-machine.md beside the namespace demo. The same is"

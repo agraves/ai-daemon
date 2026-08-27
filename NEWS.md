@@ -270,6 +270,13 @@ terminal-launched agent collapsed to its bare uid and per-app policy had
 nothing to grip. If the scope cannot be created the program is not run:
 running it anonymously is what the flag exists to prevent.
 
+The network default follows the invocation: a bare `ai-run` confines — that
+is what the bare form is for — while an `--as` launch keeps the network,
+because the agents worth naming need their git remotes and registries and
+come here for the identity and the socket. `--confine-network` and
+`--permit-network` make either choice explicit, so a fully-locked-down named
+launch is `ai-run --as backfill --confine-network -- …`.
+
 The accounting grew a face. `Usage()` on the manager reports tokens and spend
 per identity over the rolling day; `aidctl meter` prints it, and
 `aidctl meter --waybar` emits the JSON a status-bar module wants

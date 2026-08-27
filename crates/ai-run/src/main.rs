@@ -19,21 +19,26 @@
 //!
 //! ## What it actually does
 //!
-//! Unshares the network namespace, so the child gets a fresh one containing
-//! only a loopback interface that is *down*. There is no route off the
-//! machine, no DNS, and nothing listening — `127.0.0.1` in there is not the
-//! `127.0.0.1` the shim is on, which is exactly why the shim grew a Unix
-//! socket: a socket is a filesystem object and survives the namespace, where a
-//! port does not.
+//! Two jobs, each the default of the invocation that wants it, either
+//! overridable with `--confine-network` / `--permit-network`:
+//!
+//! **Bare `ai-run` confines.** It unshares the network namespace, so the
+//! child gets a fresh one containing only a loopback interface that is
+//! *down*. There is no route off the machine, no DNS, and nothing
+//! listening — `127.0.0.1` in there is not the `127.0.0.1` the shim is on,
+//! which is exactly why the shim grew a Unix socket: a socket is a
+//! filesystem object and survives the namespace, where a port does not.
+//!
+//! **`ai-run --as NAME` identifies.** The program runs in a transient scope
+//! the daemon keys back to exactly NAME, so a terminal-launched agent gets a
+//! standing identity and one `[[identity]]` rule holds across every launch —
+//! see the comment at the wrapper in `main`. The network is left alone by
+//! default here, because the agents worth naming need their git remotes and
+//! package registries; what they come for is the identity and the socket.
 //!
 //! Then it execs the program. It does not stay resident, does not proxy
 //! anything, and holds nothing open: whatever the child can reach afterwards,
 //! it reached through a descriptor or a path that was there before the exec.
-//!
-//! `--as NAME` additionally runs the program in a transient scope the daemon
-//! keys back to exactly NAME, so a terminal-launched agent gets a standing
-//! identity and one `[[identity]]` rule holds across every launch — see the
-//! comment at the wrapper in `main`.
 //!
 //! ## What it does not do
 //!
@@ -55,7 +60,9 @@ const SOCKET: &str = "/run/ai-daemon-shim/shim.sock";
 
 fn main() {
     let mut socket = std::env::var("AI_DAEMON_SHIM_SOCKET").unwrap_or_else(|_| SOCKET.to_string());
-    let mut keep_network = false;
+    // None means "whichever default the invocation implies": a bare ai-run
+    // exists to confine, an --as launch exists to identify — see below.
+    let mut confine: Option<bool> = None;
     let mut as_name: Option<String> = None;
     let mut program: Vec<String> = Vec::new();
 
@@ -63,11 +70,14 @@ fn main() {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => socket = args.next().unwrap_or(socket),
-            // For showing the difference in a demo, and for debugging a
-            // program that fails under confinement so you can tell which half
-            // is at fault. Named for what it does rather than something
-            // reassuring, because it is the switch that turns this off.
-            "--keep-network" => keep_network = true,
+            "--confine-network" | "--permit-network" => {
+                let this = arg == "--confine-network";
+                if confine.is_some_and(|earlier| earlier != this) {
+                    eprintln!("ai-run: --confine-network and --permit-network contradict each other");
+                    std::process::exit(2);
+                }
+                confine = Some(this);
+            }
             "--as" => {
                 let Some(name) = args.next() else {
                     eprintln!("ai-run: --as needs a name; try --help");
@@ -117,29 +127,46 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Checked before the namespace, not after: inside there is no way to fix
-    // it and the failure would look like the program's.
-    if !std::path::Path::new(&socket).exists() {
-        eprintln!(
-            "ai-run: {socket} does not exist, so a confined program would have no way to \
-             reach the daemon at all. Is ai-daemon-shim running?"
-        );
-        std::process::exit(1);
-    }
+    // The default follows the invocation. A bare ai-run exists to confine —
+    // the name means "run with inference and nothing else", and the demo the
+    // project leads with is that the network is really gone. An --as launch
+    // exists to identify: the agents it names (Claude Code, codex) need their
+    // git remotes and package registries, and what they come here for is the
+    // standing identity and the socket. Either flag overrides either default,
+    // so both modes stay one word away.
+    let confining = confine.unwrap_or(as_name.is_none());
 
-    if !keep_network {
+    let socket_exists = std::path::Path::new(&socket).exists();
+    if confining {
+        // Checked before the namespace, not after: inside there is no way to
+        // fix it and the failure would look like the program's. Only when
+        // confining, because only then is the socket the one door left — an
+        // identified launch with the network intact may be a native D-Bus
+        // client that never wanted the shim.
+        if !socket_exists {
+            eprintln!(
+                "ai-run: {socket} does not exist, so a confined program would have no way to \
+                 reach the daemon at all. Is ai-daemon-shim running?"
+            );
+            std::process::exit(1);
+        }
         if let Err(e) = drop_network() {
             eprintln!("ai-run: {e}");
             std::process::exit(1);
         }
     }
 
-    // Told, not guessed: a program should not have to know this path, and one
-    // that does should get it from somewhere that stays true under --socket.
-    std::env::set_var("AI_DAEMON_SHIM_SOCKET", &socket);
-    // The base URL an HTTP client wants, in the form curl and most libraries
-    // accept for a Unix socket.
-    std::env::set_var("AI_DAEMON_SHIM_URL", "http://localhost");
+    if socket_exists {
+        // Told, not guessed: a program should not have to know this path, and
+        // one that does should get it from somewhere that stays true under
+        // --socket. Not set when there is no socket to point at — an
+        // environment variable naming a file that is not there is a lie a
+        // program will act on.
+        std::env::set_var("AI_DAEMON_SHIM_SOCKET", &socket);
+        // The base URL an HTTP client wants, in the form curl and most
+        // libraries accept for a Unix socket.
+        std::env::set_var("AI_DAEMON_SHIM_URL", "http://localhost");
+    }
 
     // A standing identity, so a standing policy has something to attach to.
     //
@@ -215,7 +242,7 @@ fn drop_network() -> Result<(), String> {
             "could not take away the network ({err}). Unprivileged user namespaces may be \
              disabled on this kernel — check /proc/sys/kernel/unprivileged_userns_clone and \
              /proc/sys/user/max_user_namespaces. Running the program without confinement \
-             would be worse than not running it, so this stops here; --keep-network says \
+             would be worse than not running it, so this stops here; --permit-network says \
              you meant it."
         ));
     }
@@ -269,8 +296,6 @@ usage: ai-run [options] -- PROGRAM [ARGS...]
 
   --socket PATH    the shim socket to leave reachable
                    (default {SOCKET}, or $AI_DAEMON_SHIM_SOCKET)
-  --keep-network   do not take the network away. For showing the difference,
-                   and for telling a broken program from a confined one.
   --as NAME        run the program under a standing identity: the daemon sees
                    it as exactly NAME (unit:NAME@uid, or shim:unit:NAME@uid
                    over the socket) on every launch, so one [[identity]] rule
@@ -279,13 +304,25 @@ usage: ai-run [options] -- PROGRAM [ARGS...]
                    its uid. The name is your claim, scoped to your uid; it
                    needs a systemd user session, and refuses rather than
                    running anonymously without one.
+  --confine-network
+                   take the network away, whatever else is asked.
+  --permit-network
+                   leave it alone, ditto. One of these is already the
+                   default: a bare ai-run confines — the point of the bare
+                   form is a program with inference and nothing else — and
+                   an --as launch permits, because the agents worth naming
+                   need their git remotes and package registries and come
+                   here for the identity and the socket. The flags exist so
+                   either choice is explicit when it matters, and so a
+                   confined *and* named launch is one word:
+                   ai-run --as backfill --confine-network -- ...
 
-The program runs in a network namespace containing only a loopback interface
-that is down: no route off the machine, no DNS, nothing listening. It reaches
-the daemon through the shim's Unix socket, which is a filesystem object and so
-survives the namespace where a port does not.
+Confined, the program runs in a network namespace containing only a loopback
+interface that is down: no route off the machine, no DNS, nothing listening.
+It reaches the daemon through the shim's Unix socket, which is a filesystem
+object and so survives the namespace where a port does not.
 
-The program is told where that is:
+Either way, the program is told where that is:
 
   AI_DAEMON_SHIM_SOCKET   the socket path
   AI_DAEMON_SHIM_URL      the base URL to use with it
